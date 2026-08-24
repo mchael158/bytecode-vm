@@ -13,7 +13,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Byteflow Contributors"]
 license = "MIT OR Apache-2.0"
-repository = "https://example.com/byteflow"
+repository = "https://github.com/mchael158/bytecode-vm"
 
 [profile.release]
 opt-level = 3
