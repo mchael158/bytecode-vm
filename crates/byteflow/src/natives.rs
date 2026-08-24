@@ -8,14 +8,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use byteflow_bytecode::Value;
-use byteflow_vm::{Fault, NativeTable, NativeTableBuilder};
+use crate::bytecode::Value;
+use crate::vm::{Fault, NativeTable, NativeTableBuilder};
 
 /// Name → CallNative index for documentation / host-side lookups.
 /// Kept in lockstep with [`std_native_table`].
 ///
 /// Stable indices: `print = 0`, `now_ms = 1`.
-/// Use these with [`byteflow_bytecode::ChunkBuilder::emit_call_native`].
+/// Use these with [`crate::bytecode::ChunkBuilder::emit_call_native`].
 pub fn std_native_map() -> HashMap<String, u32> {
     HashMap::from([("print".to_owned(), 0), ("now_ms".to_owned(), 1)])
 }

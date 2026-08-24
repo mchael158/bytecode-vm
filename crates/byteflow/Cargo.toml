@@ -1,13 +1,33 @@
 [package]
-name = "byteflow"
+name = "byteflow-actors"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Byteflow virtual-process runtime"
+homepage = "https://github.com/mchael158/bytecode-vm"
+documentation = "https://docs.rs/byteflow-actors"
+description = "Embeddable actor runtime: register bytecode, virtual processes, mailboxes, supervisor"
+readme = "README.md"
+keywords = ["actors", "bytecode", "vm", "erlang", "embedded"]
+categories = ["concurrency", "emulators"]
+exclude = ["/examples/*.bf"]
+
+# Library crate name is `byteflow` so dependents write `use byteflow::...`.
+# Package name on crates.io is `byteflow-actors` (`byteflow` is taken).
+[lib]
+name = "byteflow"
+path = "src/lib.rs"
+
+[[bin]]
+name = "byteflow"
+path = "src/bin/byteflow.rs"
+doc = false
 
 [dependencies]
-byteflow-bytecode = { path = "../byteflow-bytecode" }
-byteflow-vm = { path = "../byteflow-vm" }
-byteflow-scheduler = { path = "../byteflow-scheduler" }
+crossbeam-deque = "0.8"
+num_cpus = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

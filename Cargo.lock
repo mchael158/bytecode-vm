@@ -3,40 +3,11 @@
 version = 4
 
 [[package]]
-name = "byteflow"
-version = "0.1.0"
+name = "byteflow-actors"
+version = "0.2.1"
 dependencies = [
- "byteflow-bytecode",
- "byteflow-scheduler",
- "byteflow-vm",
-]
-
-[[package]]
-name = "byteflow-bytecode"
-version = "0.1.0"
-
-[[package]]
-name = "byteflow-cli"
-version = "0.1.0"
-dependencies = [
- "byteflow",
-]
-
-[[package]]
-name = "byteflow-scheduler"
-version = "0.1.0"
-dependencies = [
- "byteflow-bytecode",
- "byteflow-vm",
  "crossbeam-deque",
  "num_cpus",
-]
-
-[[package]]
-name = "byteflow-vm"
-version = "0.1.0"
-dependencies = [
- "byteflow-bytecode",
 ]
 
 [[package]]
