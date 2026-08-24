@@ -1,0 +1,12 @@
+[package]
+name = "byteflow"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Byteflow virtual-process runtime"
+
+[dependencies]
+byteflow-bytecode = { path = "../byteflow-bytecode" }
+byteflow-vm = { path = "../byteflow-vm" }
+byteflow-scheduler = { path = "../byteflow-scheduler" }

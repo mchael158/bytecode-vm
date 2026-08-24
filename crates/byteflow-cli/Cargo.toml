@@ -1,0 +1,14 @@
+[package]
+name = "byteflow-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Verify, disassemble and run Byteflow .bf modules"
+
+[[bin]]
+name = "byteflow"
+path = "src/main.rs"
+
+[dependencies]
+byteflow = { path = "../byteflow" }

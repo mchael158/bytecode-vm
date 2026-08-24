@@ -1,0 +1,13 @@
+[package]
+name = "byteflow-scheduler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Virtual processes, mailboxes and process lifecycle for Byteflow"
+
+[dependencies]
+byteflow-bytecode = { path = "../byteflow-bytecode" }
+byteflow-vm = { path = "../byteflow-vm" }
+crossbeam-deque = "0.8"
+num_cpus = "1"
