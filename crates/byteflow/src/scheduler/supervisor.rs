@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::bytecode::Value;
 
+use super::error::{report_fault, SpawnError};
 use super::handle::ProcessHandle;
 use super::process::{ProcessId, ProcessOutcome, RestartPolicy};
 use super::runtime::RuntimeSpawner;
@@ -106,9 +107,13 @@ pub(crate) struct SupervisorLink {
 
 impl SupervisorLink {
     pub(crate) fn notify(&self, id: ProcessId, outcome: ProcessOutcome) {
-        let mut events = sync_lock::lock(&self.inner.events);
-        events.push_back(ChildExit { id, outcome });
-        self.inner.cvar.notify_one();
+        match sync_lock::lock(&self.inner.events, "SupervisorLink::notify") {
+            Ok(mut events) => {
+                events.push_back(ChildExit { id, outcome });
+                self.inner.cvar.notify_one();
+            }
+            Err(e) => report_fault(e),
+        }
     }
 }
 
@@ -132,11 +137,14 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(spawner: RuntimeSpawner) -> Self {
+    pub fn new(spawner: RuntimeSpawner) -> Result<Self, SpawnError> {
         Self::with_config(spawner, SupervisorConfig::default())
     }
 
-    pub fn with_config(spawner: RuntimeSpawner, config: SupervisorConfig) -> Self {
+    /// Start the dedicated supervisor OS thread. Thread-spawn failure is
+    /// [`SpawnError::ThreadSpawnFailed`] — same category-A surface as
+    /// [`super::runtime::Runtime::new`], not a panic.
+    pub fn with_config(spawner: RuntimeSpawner, config: SupervisorConfig) -> Result<Self, SpawnError> {
         let inner = Arc::new(Inner {
             spawner,
             config,
@@ -151,22 +159,28 @@ impl Supervisor {
         let thread = std::thread::Builder::new()
             .name("byteflow-supervisor".into())
             .spawn(move || drive(drive_inner))
-            .expect("failed to spawn byteflow supervisor thread");
-        Supervisor {
+            .map_err(|e| SpawnError::ThreadSpawnFailed(e.to_string()))?;
+        Ok(Supervisor {
             inner,
             thread: Some(thread),
-        }
+        })
     }
 
     /// Spawn `spec` and start supervising it. The returned handle is for
     /// this incarnation only — a restart allocates a new Pid and a new
     /// completion channel.
-    pub fn start_child(&self, spec: ChildSpec) -> ProcessHandle {
+    pub fn start_child(&self, spec: ChildSpec) -> Result<ProcessHandle, SpawnError> {
         spawn_child(&self.inner, spec)
     }
 
     pub fn live_children(&self) -> usize {
-        sync_lock::lock(&self.inner.children).len()
+        match sync_lock::lock(&self.inner.children, "Supervisor::live_children") {
+            Ok(g) => g.len(),
+            Err(e) => {
+                report_fault(e);
+                0
+            }
+        }
     }
 
     /// `true` once more than [`SupervisorConfig::max_restarts`] respawns
@@ -188,19 +202,30 @@ impl Supervisor {
     }
 }
 
-fn spawn_child(inner: &Arc<Inner>, spec: ChildSpec) -> ProcessHandle {
+fn spawn_child(inner: &Arc<Inner>, spec: ChildSpec) -> Result<ProcessHandle, SpawnError> {
     let link = SupervisorLink {
         inner: inner.clone(),
     };
     // Hold the table across spawn so a child that faults in its first
     // quantum cannot notify us before its row exists (the drive loop
     // takes this same lock in `handle_exit`, so the event waits).
-    let mut children = sync_lock::lock(&inner.children);
-    let handle = inner
-        .spawner
-        .spawn_linked(spec.function, &spec.args, spec.restart, link);
+    let mut children = match sync_lock::lock(&inner.children, "spawn_child") {
+        Ok(c) => c,
+        Err(e) => {
+            report_fault(e);
+            return Err(SpawnError::VmInit(
+                "supervisor child table poisoned".into(),
+            ));
+        }
+    };
+    let handle = inner.spawner.spawn_linked(
+        spec.function,
+        &spec.args,
+        spec.restart,
+        link,
+    )?;
     children.insert(handle.id(), LiveChild { spec });
-    handle
+    Ok(handle)
 }
 
 fn should_restart(policy: RestartPolicy, outcome: &ProcessOutcome) -> bool {
@@ -213,7 +238,13 @@ fn should_restart(policy: RestartPolicy, outcome: &ProcessOutcome) -> bool {
 
 fn intensity_hit(inner: &Inner) -> bool {
     let now = Instant::now();
-    let mut times = sync_lock::lock(&inner.restart_times);
+    let mut times = match sync_lock::lock(&inner.restart_times, "intensity_hit") {
+        Ok(t) => t,
+        Err(e) => {
+            report_fault(e);
+            return true;
+        }
+    };
     times.push_back(now);
     let window_start = now.checked_sub(inner.config.max_period).unwrap_or(now);
     while times.front().map(|t| *t < window_start).unwrap_or(false) {
@@ -233,7 +264,13 @@ fn drive(inner: Arc<Inner>) {
             return;
         }
         let exit = {
-            let mut events = sync_lock::lock(&inner.events);
+            let mut events = match sync_lock::lock(&inner.events, "supervisor::drive") {
+                Ok(e) => e,
+                Err(e) => {
+                    report_fault(e);
+                    return;
+                }
+            };
             loop {
                 if inner.shutdown.load(Ordering::Acquire) {
                     return;
@@ -241,9 +278,18 @@ fn drive(inner: Arc<Inner>) {
                 if let Some(exit) = events.pop_front() {
                     break exit;
                 }
-                let (guard, _) =
-                    sync_lock::wait_timeout(&inner.cvar, events, Duration::from_millis(100));
-                events = guard;
+                match sync_lock::wait_timeout(
+                    &inner.cvar,
+                    events,
+                    Duration::from_millis(100),
+                    "supervisor::wait",
+                ) {
+                    Ok((guard, _)) => events = guard,
+                    Err(e) => {
+                        report_fault(e);
+                        return;
+                    }
+                }
             }
         };
         handle_exit(&inner, exit);
@@ -252,7 +298,13 @@ fn drive(inner: Arc<Inner>) {
 
 fn handle_exit(inner: &Arc<Inner>, exit: ChildExit) {
     let spec = {
-        let mut children = sync_lock::lock(&inner.children);
+        let mut children = match sync_lock::lock(&inner.children, "handle_exit") {
+            Ok(c) => c,
+            Err(e) => {
+                report_fault(e);
+                return;
+            }
+        };
         match children.remove(&exit.id) {
             Some(live) => live.spec,
             None => return,
@@ -300,6 +352,7 @@ mod tests {
                 quantum: 1_000,
             },
         )
+        .expect("runtime")
     }
 
     fn wait_until(mut pred: impl FnMut() -> bool) {
@@ -316,9 +369,10 @@ mod tests {
     #[test]
     fn on_failure_does_not_restart_a_clean_exit() {
         let rt = tiny_runtime(ok_chunk());
-        let sup = Supervisor::new(rt.spawner());
+        let sup = Supervisor::new(rt.spawner()).expect("supervisor");
         let outcome = sup
             .start_child(ChildSpec::new("main", 0).restart(RestartPolicy::OnFailure))
+            .expect("start_child")
             .join();
         wait_until(|| sup.live_children() == 0);
         let spawned = rt.metrics().processes_spawned;
@@ -337,8 +391,11 @@ mod tests {
                 max_restarts: 2,
                 max_period: Duration::from_secs(5),
             },
-        );
-        let _first = sup.start_child(ChildSpec::new("boom", 0).restart(RestartPolicy::OnFailure));
+        )
+        .expect("supervisor");
+        let _first = sup
+            .start_child(ChildSpec::new("boom", 0).restart(RestartPolicy::OnFailure))
+            .expect("start_child");
         wait_until(|| sup.intensity_exceeded() && rt.metrics().processes_failed >= 3);
         let spawned = rt.metrics().processes_spawned;
         let failed = rt.metrics().processes_failed;
@@ -358,8 +415,11 @@ mod tests {
                 max_restarts: 2,
                 max_period: Duration::from_secs(5),
             },
-        );
-        let _ = sup.start_child(ChildSpec::new("main", 0).restart(RestartPolicy::Always));
+        )
+        .expect("supervisor");
+        let _ = sup
+            .start_child(ChildSpec::new("main", 0).restart(RestartPolicy::Always))
+            .expect("start_child");
         wait_until(|| sup.intensity_exceeded() && rt.metrics().processes_completed >= 3);
         let spawned = rt.metrics().processes_spawned;
         sup.shutdown();

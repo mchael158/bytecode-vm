@@ -2,7 +2,7 @@
 //! (2 restarts in 5s) is exceeded.
 //!
 //! ```text
-//! cargo run -p byteflow --example crash_and_restart
+//! cargo run -p byteflow-actors --example crash_and_restart
 //! ```
 
 use std::thread;
@@ -13,22 +13,41 @@ use byteflow::{
 };
 
 fn main() {
-    let rt = Runtime::with_config(
+    let rt = match Runtime::with_config(
         samples::boom(),
         RuntimeConfig {
             workers: 1,
             quantum: 1_000,
         },
-    );
-    let boom = rt.function_index("boom").expect("boom");
-    let sup = Supervisor::with_config(
+    ) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    let Some(boom) = rt.function_index("boom") else {
+        eprintln!("missing boom");
+        std::process::exit(1);
+    };
+    let sup = match Supervisor::with_config(
         rt.spawner(),
         SupervisorConfig {
             max_restarts: 2,
             max_period: Duration::from_secs(5),
         },
-    );
-    let _ = sup.start_child(ChildSpec::new("boom", boom).restart(RestartPolicy::OnFailure));
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("supervisor: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = sup.start_child(ChildSpec::new("boom", boom).restart(RestartPolicy::OnFailure))
+    {
+        eprintln!("start_child: {e}");
+        std::process::exit(1);
+    }
 
     let start = std::time::Instant::now();
     while !sup.intensity_exceeded() {

@@ -108,7 +108,7 @@ pub struct Process {
 
 /// Terminal outcome of a process, delivered to whoever holds its
 /// [`super::handle::ProcessHandle`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProcessOutcome {
     Completed(crate::bytecode::Value),
     Failed(String),

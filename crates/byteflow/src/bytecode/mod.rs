@@ -16,5 +16,5 @@ pub use disasm::disassemble;
 pub use format::{decode, encode, FormatError};
 pub use instruction::Instruction;
 pub use opcode::Opcode;
-pub use value::Value;
+pub use value::{Message, Value};
 pub use verify::{verify, VerifyError};

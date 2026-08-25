@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_deque::Injector;
 
+use super::error::report_fault;
 use super::mailbox::Mailbox;
 use super::process::{Process, ProcessId};
 use super::sync_lock;
@@ -108,38 +109,66 @@ impl TimerWheel {
     }
 
     fn push(&self, entry: TimerEntry) {
-        let mut heap = sync_lock::lock(&self.heap);
-        heap.push(Reverse(entry));
-        // A new entry might now be the soonest deadline; wake the driver
-        // thread in case it's parked waiting on a later one.
-        self.cvar.notify_one();
+        match sync_lock::lock(&self.heap, "TimerWheel::push") {
+            Ok(mut heap) => {
+                heap.push(Reverse(entry));
+                self.cvar.notify_one();
+            }
+            Err(e) => report_fault(e),
+        }
     }
 
     pub fn shutdown(&self) {
-        *sync_lock::lock(&self.shutdown) = true;
+        match sync_lock::lock(&self.shutdown, "TimerWheel::shutdown") {
+            Ok(mut flag) => *flag = true,
+            Err(e) => report_fault(e),
+        }
         self.cvar.notify_all();
     }
 
     /// Runs on a single dedicated OS thread (spawned by
-    /// `byteflow-scheduler::Runtime::start`) for the life of the runtime.
+    /// [`super::runtime::Runtime`]) for the life of the runtime.
     /// Pops every entry whose deadline has passed, resolves it into a
     /// runnable process, and pushes that process onto the shared global
     /// injector queue so any idle worker can pick it up — the timer thread
     /// itself never runs process code.
+    ///
+    /// Mutex poison → [`report_fault`] and exit the drive loop (fail-closed).
     pub fn drive(self: &Arc<Self>, injector: &Injector<Box<Process>>, notify: &(Mutex<()>, Condvar)) {
         loop {
-            let mut heap = sync_lock::lock(&self.heap);
-            if *sync_lock::lock(&self.shutdown) {
+            let mut heap = match sync_lock::lock(&self.heap, "TimerWheel::drive") {
+                Ok(h) => h,
+                Err(e) => {
+                    report_fault(e);
+                    return;
+                }
+            };
+            let shutting_down = match sync_lock::lock(&self.shutdown, "TimerWheel::drive/shutdown") {
+                Ok(g) => *g,
+                Err(e) => {
+                    report_fault(e);
+                    return;
+                }
+            };
+            if shutting_down {
                 return;
             }
             match heap.peek() {
                 None => {
-                    // Nothing scheduled; sleep until woken by a new
-                    // `schedule_*` call or shutdown.
-                    let (guard, _) =
-                        sync_lock::wait_timeout(&self.cvar, heap, Duration::from_millis(250));
-                    heap = guard;
-                    drop(heap);
+                    match sync_lock::wait_timeout(
+                        &self.cvar,
+                        heap,
+                        Duration::from_millis(250),
+                        "TimerWheel::idle",
+                    ) {
+                        Ok((guard, _)) => {
+                            drop(guard);
+                        }
+                        Err(e) => {
+                            report_fault(e);
+                            return;
+                        }
+                    }
                 }
                 Some(Reverse(top)) => {
                     let now = Instant::now();
@@ -152,8 +181,18 @@ impl TimerWheel {
                         self.fire(entry, injector, notify);
                     } else {
                         let wait_for = top.deadline - now;
-                        let (guard, _) = sync_lock::wait_timeout(&self.cvar, heap, wait_for);
-                        drop(guard);
+                        match sync_lock::wait_timeout(
+                            &self.cvar,
+                            heap,
+                            wait_for,
+                            "TimerWheel::wait",
+                        ) {
+                            Ok((guard, _)) => drop(guard),
+                            Err(e) => {
+                                report_fault(e);
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -175,23 +214,30 @@ impl TimerWheel {
                 mailbox,
                 dest_reg,
             } => {
-                if let Some(mut process) = mailbox.take_parked() {
-                    debug_assert_eq!(
-                        process.id, pid,
-                        "timer fired for a mailbox owned by a different process"
-                    );
-                    // Timeout won the race against a `Send` (see
-                    // `Mailbox::take_parked`): deliver `Unit` as the
-                    // "no message arrived in time" result.
-                    let _ = process
-                        .vm
-                        .resume_with(dest_reg, crate::bytecode::Value::Unit);
-                    injector.push(process);
+                match mailbox.take_parked() {
+                    Ok(Some(mut process)) => {
+                        debug_assert_eq!(
+                            process.id, pid,
+                            "timer fired for a mailbox owned by a different process"
+                        );
+                        // Timeout won the race against a `Send` (see
+                        // `Mailbox::take_parked`): deliver `Unit` as the
+                        // "no message arrived in time" result.
+                        let _ = process
+                            .vm
+                            .resume_with(dest_reg, crate::bytecode::Value::Unit);
+                        injector.push(process);
+                    }
+                    Ok(None) => {
+                        // A `Send` already woke it; nothing to do.
+                    }
+                    Err(e) => report_fault(e),
                 }
-                // else: a `Send` already woke it; nothing to do.
             }
         }
-        let _guard = sync_lock::lock(&notify.0);
-        notify.1.notify_all();
+        match sync_lock::lock(&notify.0, "TimerWheel::fire/notify") {
+            Ok(_guard) => notify.1.notify_all(),
+            Err(e) => report_fault(e),
+        }
     }
 }

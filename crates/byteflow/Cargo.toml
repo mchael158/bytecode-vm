@@ -7,12 +7,19 @@ license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/mchael158/bytecode-vm"
 documentation = "https://docs.rs/byteflow-actors"
-description = "Embeddable actor runtime: register bytecode, virtual processes, mailboxes, supervisor"
+description = "Embeddable actor runtime: bytecode VM, M:N scheduler, mailboxes, Message envelopes, supervisor"
 readme = "README.md"
 keywords = ["actors", "bytecode", "vm", "erlang", "embedded"]
 categories = ["concurrency", "emulators"]
-exclude = ["/examples/*.bf"]
-
+include = [
+    "src/**/*",
+    "examples/**/*",
+    "docs/**/*",
+    "README.md",
+    "CHANGELOG.md",
+    "Cargo.toml",
+    "LICENSE*",
+]
 # Library crate name is `byteflow` so dependents write `use byteflow::...`.
 # Package name on crates.io is `byteflow-actors` (`byteflow` is taken).
 [lib]
@@ -27,6 +34,13 @@ doc = false
 [dependencies]
 crossbeam-deque = "0.8"
 num_cpus = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
 
 [package.metadata.docs.rs]
 all-features = true

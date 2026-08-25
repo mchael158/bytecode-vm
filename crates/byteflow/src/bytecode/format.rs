@@ -142,6 +142,14 @@ fn write_value(out: &mut Vec<u8>, value: &Value) {
             out.push(4);
             out.extend_from_slice(&p.to_le_bytes());
         }
+        Value::Message(m) => {
+            // Tag 5 — ABI v2. Fixed layout, little-endian, no length prefix.
+            out.push(5);
+            out.extend_from_slice(&m.sender.to_le_bytes());
+            out.extend_from_slice(&m.request_id.to_le_bytes());
+            out.extend_from_slice(&m.tag.to_le_bytes());
+            out.extend_from_slice(&m.payload.to_le_bytes());
+        }
     }
 }
 
@@ -177,6 +185,10 @@ impl<'a> Reader<'a> {
 
     fn read_u32(&mut self) -> Result<u32, FormatError> {
         Ok(u32::from_le_bytes(self.read_array()?))
+    }
+
+    fn read_u16(&mut self) -> Result<u16, FormatError> {
+        Ok(u16::from_le_bytes(self.read_array()?))
     }
 
     fn read_i32(&mut self) -> Result<i32, FormatError> {
@@ -222,6 +234,18 @@ impl<'a> Reader<'a> {
             2 => Ok(Value::Int(self.read_i64()?)),
             3 => Ok(Value::Float(self.read_f64()?)),
             4 => Ok(Value::Pid(self.read_u64()?)),
+            5 => {
+                let sender = self.read_u64()?;
+                let request_id = self.read_u64()?;
+                let tag = self.read_u16()?;
+                let payload = self.read_u64()?;
+                Ok(Value::Message(super::value::Message {
+                    sender,
+                    request_id,
+                    tag,
+                    payload,
+                }))
+            }
             tag => Err(FormatError::UnknownValueTag(tag)),
         }
     }
@@ -253,6 +277,23 @@ mod tests {
         assert_eq!(decoded.constants, original.constants);
         assert_eq!(decoded.code, original.code);
         assert_eq!(decoded.functions, original.functions);
+    }
+
+    #[test]
+    fn roundtrip_preserves_message_constant() {
+        use super::super::value::Message;
+        let mut b = ChunkBuilder::new("msg-const");
+        b.begin_function("main", 0, 1);
+        let k = b.const_(Value::Message(Message::new(1, 2, 3, 4)));
+        b.emit_load_const(0, k);
+        b.emit_return(0);
+        let original = b.finish();
+        let decoded = decode(&encode(&original)).expect("decode");
+        assert_eq!(decoded.constants, original.constants);
+        assert_eq!(
+            decoded.constants[0],
+            Value::Message(Message::new(1, 2, 3, 4))
+        );
     }
 
     #[test]

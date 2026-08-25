@@ -1,22 +1,38 @@
 //! Two virtual processes, one mailbox round-trip.
 //!
 //! ```text
-//! cargo run -p byteflow --example ping_pong
+//! cargo run -p byteflow-actors --example ping_pong
 //! ```
 
 use byteflow::{samples, ProcessOutcome, Runtime, RuntimeConfig, Value};
 
 fn main() {
     let chunk = samples::ping_pong();
-    let rt = Runtime::with_config(
+    let rt = match Runtime::with_config(
         chunk,
         RuntimeConfig {
             workers: 1,
             quantum: 10_000,
         },
-    );
-    let main = rt.function_index("main").expect("main");
-    let outcome = rt.spawn(main, &[]).join();
+    ) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    let Some(main) = rt.function_index("main") else {
+        eprintln!("missing main");
+        std::process::exit(1);
+    };
+    let handle = match rt.spawn(main, &[]) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("spawn: {e}");
+            std::process::exit(1);
+        }
+    };
+    let outcome = handle.join();
     let metrics = rt.metrics();
     rt.shutdown();
 

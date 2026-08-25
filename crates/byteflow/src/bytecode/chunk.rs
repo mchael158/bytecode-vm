@@ -8,7 +8,9 @@ pub const MAGIC: [u8; 4] = *b"BFV0";
 
 /// Current ABI version. Bump on any breaking change to instruction
 /// encoding, constant representation, or function-table layout.
-pub const ABI_VERSION: u32 = 1;
+///
+/// v2: adds [`super::value::Value::Message`] wire tag `5` (actor envelopes).
+pub const ABI_VERSION: u32 = 2;
 
 /// A callable entry point inside a [`Chunk`]: either bytecode-defined or a
 /// slot reserved for a native (Rust) function registered with the runtime

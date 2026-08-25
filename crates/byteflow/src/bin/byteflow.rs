@@ -21,16 +21,22 @@ fn main() -> ExitCode {
             print_help();
             Ok(())
         }
-        "verify" => cmd_verify(&args.next().expect("usage: byteflow verify <file.bf>")),
-        "disasm" => cmd_disasm(&args.next().expect("usage: byteflow disasm <file.bf>")),
-        "run" => cmd_run(
-            &args.next().expect("usage: byteflow run <file.bf> [function]"),
-            args.next().as_deref(),
-        ),
-        "pack" => cmd_pack(
-            &args.next().expect("usage: byteflow pack <demo> <out.bf>"),
-            &args.next().expect("usage: byteflow pack <demo> <out.bf>"),
-        ),
+        "verify" => match args.next() {
+            Some(path) => cmd_verify(&path),
+            None => usage("byteflow verify <file.bf>"),
+        },
+        "disasm" => match args.next() {
+            Some(path) => cmd_disasm(&path),
+            None => usage("byteflow disasm <file.bf>"),
+        },
+        "run" => match args.next() {
+            Some(path) => cmd_run(&path, args.next().as_deref()),
+            None => usage("byteflow run <file.bf> [function]"),
+        },
+        "pack" => match (args.next(), args.next()) {
+            (Some(demo), Some(out)) => cmd_pack(&demo, &out),
+            _ => usage("byteflow pack <demo> <out.bf>"),
+        },
         "demo" => {
             let demo = match args.next() {
                 Some(d) => d,
@@ -50,6 +56,11 @@ fn main() -> ExitCode {
     }
 }
 
+fn usage(msg: &str) -> Result<(), ()> {
+    eprintln!("usage: {msg}");
+    Err(())
+}
+
 fn print_help() {
     eprintln!(
         "\
@@ -62,8 +73,8 @@ USAGE:
     byteflow disasm <file.bf>
     byteflow run    <file.bf> [function]
 
-`run` attaches the std native table (print=0, now_ms=1) so modules that
-CallNative those indices work. Demos that never call natives use an empty table.
+`run` attaches the std native table (print=0, now_ms=1, make_msg=2, …) so modules
+that CallNative those indices work. Demos that never call natives use an empty table.
 "
     );
 }
@@ -158,7 +169,8 @@ fn run_chunk(
             workers: 1,
             quantum: byteflow::DEFAULT_QUANTUM,
         },
-    );
+    )
+    .map_err(|e| eprintln!("runtime: {e}"))?;
 
     let idx = match function {
         Some(name) => rt.function_index(name).ok_or_else(|| {
@@ -170,7 +182,10 @@ fn run_chunk(
             .ok_or_else(|| eprintln!("chunk has no functions"))?,
     };
 
-    let outcome = rt.spawn(idx, &[]).join();
+    let outcome = rt
+        .spawn(idx, &[])
+        .map_err(|e| eprintln!("spawn: {e}"))?
+        .join();
     let metrics = rt.metrics();
     rt.shutdown();
 

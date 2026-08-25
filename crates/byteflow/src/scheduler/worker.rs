@@ -4,9 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bytecode::Value;
+use crate::log;
 use crate::vm::VmResult;
 use crossbeam_deque::{Steal, Worker as LocalDeque};
 
+use super::error::report_fault;
 use super::mailbox::Delivery;
 use super::metrics::RuntimeMetrics;
 use super::process::{Process, ProcessId, ProcessOutcome};
@@ -55,11 +57,21 @@ fn find_work(shared: &Shared, local: &LocalDeque<Box<Process>>) -> Option<Box<Pr
 
 fn wait_for_work(shared: &Shared) {
     let (lock, cvar) = &shared.notify;
-    let guard = sync_lock::lock(lock);
+    let guard = match sync_lock::lock(lock, "worker::wait_for_work") {
+        Ok(g) => g,
+        Err(e) => {
+            report_fault(e);
+            return;
+        }
+    };
     if shared.shutdown.load(Ordering::Acquire) {
         return;
     }
-    let _ = sync_lock::wait_timeout(cvar, guard, Duration::from_millis(50));
+    if let Err(e) =
+        sync_lock::wait_timeout(cvar, guard, Duration::from_millis(50), "worker::wait_timeout")
+    {
+        report_fault(e);
+    }
 }
 
 fn drive_process(
@@ -126,7 +138,7 @@ fn drive_process(
                 args,
                 dest_reg,
             } => {
-                let child = spawn_on(
+                match spawn_on(
                     shared,
                     &process.vm.chunk_arc(),
                     &process.vm.natives_arc(),
@@ -134,10 +146,23 @@ fn drive_process(
                     &args,
                     process.restart_policy,
                     None,
-                );
-                let _ = process
-                    .vm
-                    .resume_with(dest_reg, Value::Pid(child.id().as_u64()));
+                ) {
+                    Ok(child) => {
+                        log::info(format!(
+                            "spawn parent=pid#{} child=pid#{} fn={}",
+                            process.id.as_u64(),
+                            child.id().as_u64(),
+                            function
+                        ));
+                        let _ = process
+                            .vm
+                            .resume_with(dest_reg, Value::Pid(child.id().as_u64()));
+                    }
+                    Err(e) => {
+                        finish_failed(shared, *process, e.to_string());
+                        return;
+                    }
+                }
             }
             VmResult::Send { target, message } => {
                 RuntimeMetrics::inc(&shared.metrics.messages_sent);
@@ -145,19 +170,42 @@ fn drive_process(
                     .metrics
                     .messages_sent
                     .fetch_add(1, Ordering::Relaxed);
+                log::info(format!(
+                    "send from=pid#{} to=pid#{} msg={}",
+                    process.id.as_u64(),
+                    target,
+                    message
+                ));
                 deliver(shared, local, pid_from_u64(target), message);
             }
             VmResult::Receive { dest_reg, timeout } => {
                 process.last_receive_dest = Some(dest_reg);
-                if let Some(msg) = process.mailbox.try_pop() {
-                    process
-                        .metrics
-                        .messages_received
-                        .fetch_add(1, Ordering::Relaxed);
-                    let _ = process.vm.resume_with(dest_reg, msg);
-                } else {
-                    park_on_mailbox(shared, process, dest_reg, timeout);
-                    return;
+                match process.mailbox.try_pop() {
+                    Ok(Some(msg)) => {
+                        process
+                            .metrics
+                            .messages_received
+                            .fetch_add(1, Ordering::Relaxed);
+                        log::info(format!(
+                            "recv pid#{} msg={}",
+                            process.id.as_u64(),
+                            msg
+                        ));
+                        let _ = process.vm.resume_with(dest_reg, msg);
+                    }
+                    Ok(None) => {
+                        log::debug(format!(
+                            "park pid#{} waiting mailbox (timeout={:?})",
+                            process.id.as_u64(),
+                            timeout
+                        ));
+                        park_on_mailbox(shared, process, dest_reg, timeout);
+                        return;
+                    }
+                    Err(e) => {
+                        report_fault(e);
+                        return;
+                    }
                 }
             }
         }
@@ -170,12 +218,24 @@ fn deliver(
     target: ProcessId,
     message: Value,
 ) {
-    let Some(mailbox) = shared.directory.lookup(target) else {
-        return;
+    let mailbox = match shared.directory.lookup(target) {
+        Ok(Some(m)) => m,
+        Ok(None) => return,
+        Err(e) => {
+            report_fault(e);
+            return;
+        }
     };
     match mailbox.push(message.clone()) {
-        Delivery::Queued => {}
-        Delivery::Handoff(mut process) => {
+        Ok(Delivery::Queued) => {
+            log::debug(format!("deliver queued → pid#{target} msg={message}"));
+        }
+        Ok(Delivery::Handoff(mut process)) => {
+            log::debug(format!(
+                "deliver handoff → pid#{} msg={}",
+                process.id.as_u64(),
+                message
+            ));
             if let Some(dest) = process.last_receive_dest {
                 let _ = process.vm.resume_with(dest, message);
                 process
@@ -186,6 +246,7 @@ fn deliver(
             local.push(process);
             wake_workers(shared);
         }
+        Err(e) => report_fault(e),
     }
 }
 
@@ -199,14 +260,14 @@ fn park_on_mailbox(
     let pid = process.id;
 
     match mailbox.park(process) {
-        Ok(()) => {
+        Ok(Ok(())) => {
             if let Some(delay) = timeout {
                 shared
                     .timer
                     .schedule_receive_timeout(delay, pid, mailbox, dest_reg);
             }
         }
-        Err(mut process) => {
+        Ok(Err(mut process)) => {
             if let Some(msg) = process.pending_message.take() {
                 let _ = process.vm.resume_with(dest_reg, msg);
                 process
@@ -217,6 +278,7 @@ fn park_on_mailbox(
             shared.injector.push(process);
             wake_workers(shared);
         }
+        Err(e) => report_fault(e),
     }
 }
 
@@ -229,7 +291,13 @@ fn finish_failed(shared: &Shared, process: Process, msg: String) {
 }
 
 fn finish(shared: &Shared, mut process: Process, outcome: ProcessOutcome, completed: bool) {
-    shared.directory.unregister(process.id);
+    log::info(format!(
+        "finish pid#{} completed={completed} outcome={outcome:?}",
+        process.id.as_u64()
+    ));
+    if let Err(e) = shared.directory.unregister(process.id) {
+        report_fault(e);
+    }
     if completed {
         RuntimeMetrics::inc(&shared.metrics.processes_completed);
     } else {

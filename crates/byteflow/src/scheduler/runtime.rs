@@ -7,13 +7,13 @@ use crate::vm::{NativeTable, Vm};
 use crossbeam_deque::{Injector, Stealer, Worker as LocalDeque};
 
 use super::directory::Directory;
+use super::error::SpawnError;
 use super::handle::ProcessHandle;
 use super::mailbox::{Delivery, Mailbox};
 use super::metrics::{RuntimeMetrics, RuntimeMetricsSnapshot};
 use super::process::{Process, ProcessId, RestartPolicy};
 use super::supervisor::SupervisorLink;
 use super::timer::TimerWheel;
-use super::sync_lock;
 use super::worker;
 
 /// Default instruction budget per scheduling turn (design notes §10).
@@ -79,33 +79,42 @@ impl Runtime {
     /// Convenience constructor for chunks that never call out through
     /// `Opcode::CallNative`. Equivalent to
     /// `Runtime::with_natives(chunk, NativeTable::empty())`.
-    pub fn new(chunk: Chunk) -> Self {
+    ///
+    /// Returns [`SpawnError`] instead of panicking: verify failures and OS
+    /// thread-spawn refusals are category-A errors (see
+    /// [`super::error`]).
+    pub fn new(chunk: Chunk) -> Result<Self, SpawnError> {
         Self::with_config(chunk, RuntimeConfig::default())
     }
 
     /// Construct a runtime whose processes can call into `natives` via
     /// `Opcode::CallNative` — the real FFI boundary (design notes §30-31).
-    pub fn with_natives(chunk: Chunk, natives: Arc<NativeTable>) -> Self {
+    pub fn with_natives(chunk: Chunk, natives: Arc<NativeTable>) -> Result<Self, SpawnError> {
         Self::with_natives_and_config(chunk, natives, RuntimeConfig::default())
     }
 
-    pub fn with_config(chunk: Chunk, config: RuntimeConfig) -> Self {
+    pub fn with_config(chunk: Chunk, config: RuntimeConfig) -> Result<Self, SpawnError> {
         Self::with_natives_and_config(chunk, NativeTable::empty(), config)
     }
 
+    /// Verify `chunk`, spawn the worker pool + timer thread, and return a
+    /// live [`Runtime`].
+    ///
+    /// Failures here mean the runtime was **never** started (no orphan
+    /// threads): either the bytecode is invalid
+    /// ([`SpawnError::VerifyFailed`]) or the OS refused a thread
+    /// ([`SpawnError::ThreadSpawnFailed`]).
     pub fn with_natives_and_config(
         chunk: Chunk,
         natives: Arc<NativeTable>,
         config: RuntimeConfig,
-    ) -> Self {
-        crate::bytecode::verify(&chunk).expect(
-            "Runtime::new requires a verified chunk; call crate::bytecode::verify() yourself \
-             first if you want to handle a verification failure gracefully instead of panicking",
-        );
+    ) -> Result<Self, SpawnError> {
+        crate::bytecode::verify(&chunk).map_err(|e| SpawnError::VerifyFailed(e.to_string()))?;
         let chunk = Arc::new(chunk);
         let workers_n = config.workers.max(1);
 
-        let locals: Vec<LocalDeque<Box<Process>>> = (0..workers_n).map(|_| LocalDeque::new_fifo()).collect();
+        let locals: Vec<LocalDeque<Box<Process>>> =
+            (0..workers_n).map(|_| LocalDeque::new_fifo()).collect();
         let stealers: Vec<Stealer<Box<Process>>> = locals.iter().map(|l| l.stealer()).collect();
 
         let shared = Arc::new(Shared {
@@ -122,34 +131,38 @@ impl Runtime {
         let mut workers = Vec::with_capacity(workers_n);
         for local in locals {
             let shared = shared.clone();
-            workers.push(std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name("byteflow-worker".into())
                 .spawn(move || worker::run_worker(shared, local))
-                .expect("failed to spawn byteflow worker thread"));
+                .map_err(|e| SpawnError::ThreadSpawnFailed(e.to_string()))?;
+            workers.push(handle);
         }
 
-        let timer_thread = {
-            let shared = shared.clone();
-            Some(
-                std::thread::Builder::new()
-                    .name("byteflow-timer".into())
-                    .spawn(move || shared.timer.clone().drive(&shared.injector, &shared.notify))
-                    .expect("failed to spawn byteflow timer thread"),
-            )
-        };
+        let shared_timer = shared.clone();
+        let timer_thread = std::thread::Builder::new()
+            .name("byteflow-timer".into())
+            .spawn(move || {
+                shared_timer
+                    .timer
+                    .clone()
+                    .drive(&shared_timer.injector, &shared_timer.notify)
+            })
+            .map_err(|e| SpawnError::ThreadSpawnFailed(e.to_string()))?;
 
-        Runtime { shared, chunk, natives, workers, timer_thread }
+        Ok(Runtime {
+            shared,
+            chunk,
+            natives,
+            workers,
+            timer_thread: Some(timer_thread),
+        })
     }
 
     /// Spawn a top-level process starting at `function` in this runtime's
     /// chunk, returning a [`ProcessHandle`] the caller can `.join()`.
     ///
-    /// Panics if `function` is out of range for the chunk — this mirrors
-    /// `Opcode::Spawn`'s own behavior of trusting a chunk that already
-    /// passed [`crate::bytecode::verify`] (`Runtime::new` already ran it
-    /// once for the whole chunk; a bad top-level `function` index here is a
-    /// caller bug, not a runtime fault to recover from).
-    pub fn spawn(&self, function: u32, args: &[Value]) -> ProcessHandle {
+    /// Returns [`SpawnError::BadFunction`] if `function` is out of range.
+    pub fn spawn(&self, function: u32, args: &[Value]) -> Result<ProcessHandle, SpawnError> {
         spawn_on(
             &self.shared,
             &self.chunk,
@@ -170,7 +183,7 @@ impl Runtime {
 
     /// A [`super::supervisor::Supervisor`] bound to this runtime, ready to
     /// take supervised children (design notes §15).
-    pub fn supervisor(&self) -> super::supervisor::Supervisor {
+    pub fn supervisor(&self) -> Result<super::supervisor::Supervisor, SpawnError> {
         super::supervisor::Supervisor::new(self.spawner())
     }
 
@@ -198,18 +211,27 @@ impl Runtime {
 
     /// Deliver `message` to `target` from the embedder (not from bytecode).
     pub fn send(&self, target: ProcessId, message: Value) -> Result<(), SendError> {
-        let Some(mailbox) = self.shared.directory.lookup(target) else {
-            return Err(SendError::NoSuchProcess(target));
+        let mailbox = match self.shared.directory.lookup(target) {
+            Ok(Some(m)) => m,
+            Ok(None) => return Err(SendError::NoSuchProcess(target)),
+            Err(e) => {
+                super::error::report_fault(e);
+                return Err(SendError::NoSuchProcess(target));
+            }
         };
         match mailbox.push(message.clone()) {
-            Delivery::Queued => Ok(()),
-            Delivery::Handoff(mut process) => {
+            Ok(Delivery::Queued) => Ok(()),
+            Ok(Delivery::Handoff(mut process)) => {
                 if let Some(dest) = process.last_receive_dest {
                     let _ = process.vm.resume_with(dest, message);
                 }
                 self.shared.injector.push(process);
                 wake_workers(&self.shared);
                 Ok(())
+            }
+            Err(e) => {
+                super::error::report_fault(e);
+                Err(SendError::NoSuchProcess(target))
             }
         }
     }
@@ -225,8 +247,10 @@ impl Runtime {
         self.shared.timer.shutdown();
         {
             let (lock, cvar) = &self.shared.notify;
-            let _g = sync_lock::lock(lock);
-            cvar.notify_all();
+            match super::sync_lock::lock(lock, "Runtime::shutdown") {
+                Ok(_g) => cvar.notify_all(),
+                Err(e) => super::error::report_fault(e),
+            }
         }
         for w in self.workers.drain(..) {
             let _ = w.join();
@@ -264,6 +288,10 @@ impl std::error::Error for SendError {}
 /// (and, transitively, `Supervisor`): build a fresh `Process` (VM +
 /// mailbox + completion channel), register it in the directory, and push
 /// it onto the global injector for any worker to pick up.
+///
+/// Returns [`SpawnError`] on bad function index / VM init / directory
+/// poison — never panics. Bytecode `Opcode::Spawn` that fails here turns
+/// into `ProcessOutcome::Failed` for the *parent* (see `worker`).
 pub(crate) fn spawn_on(
     shared: &Arc<Shared>,
     chunk: &Arc<Chunk>,
@@ -272,25 +300,31 @@ pub(crate) fn spawn_on(
     args: &[Value],
     restart_policy: RestartPolicy,
     supervisor: Option<SupervisorLink>,
-) -> ProcessHandle {
+) -> Result<ProcessHandle, SpawnError> {
     let id = super::process::next_process_id();
-    let vm = Vm::new(chunk.clone(), natives.clone(), function, args)
-        .expect("spawn: function index out of range for this runtime's chunk");
+    let vm = Vm::new(chunk.clone(), natives.clone(), function, args)?;
     let mailbox = Arc::new(Mailbox::new());
-    shared.directory.register(id, mailbox.clone());
+    if let Err(e) = shared.directory.register(id, mailbox.clone()) {
+        super::error::report_fault(e);
+        return Err(SpawnError::VmInit(
+            "directory register failed (poisoned lock)".into(),
+        ));
+    }
     let (tx, rx) = super::oneshot::channel();
     let mut process = Box::new(Process::new(id, vm, mailbox, restart_policy, tx));
     process.supervisor = supervisor;
     RuntimeMetrics::inc(&shared.metrics.processes_spawned);
     shared.injector.push(process);
     wake_workers(shared);
-    ProcessHandle { id, receiver: rx }
+    Ok(ProcessHandle { id, receiver: rx })
 }
 
 pub(crate) fn wake_workers(shared: &Shared) {
     let (lock, cvar) = &shared.notify;
-    let _g = super::sync_lock::lock(lock);
-    cvar.notify_one();
+    match super::sync_lock::lock(lock, "wake_workers") {
+        Ok(_g) => cvar.notify_one(),
+        Err(e) => super::error::report_fault(e),
+    }
 }
 
 /// A `Send + Sync`, freely cloneable capability to spawn processes into a
@@ -311,7 +345,7 @@ impl RuntimeSpawner {
         function: u32,
         args: &[Value],
         restart_policy: RestartPolicy,
-    ) -> ProcessHandle {
+    ) -> Result<ProcessHandle, SpawnError> {
         spawn_on(
             &self.shared,
             &self.chunk,
@@ -329,7 +363,7 @@ impl RuntimeSpawner {
         args: &[Value],
         restart_policy: RestartPolicy,
         supervisor: SupervisorLink,
-    ) -> ProcessHandle {
+    ) -> Result<ProcessHandle, SpawnError> {
         spawn_on(
             &self.shared,
             &self.chunk,
@@ -370,8 +404,9 @@ mod tests {
                 workers: 1,
                 quantum: 1_000,
             },
-        );
-        let outcome = rt.spawn(0, &[]).join();
+        )
+        .expect("runtime");
+        let outcome = rt.spawn(0, &[]).expect("spawn").join();
         rt.shutdown();
         match outcome {
             ProcessOutcome::Completed(Value::Int(42)) => {}

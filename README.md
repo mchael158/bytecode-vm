@@ -10,7 +10,7 @@ Embeddable **Erlang-style** concurrency for Rust: register bytecode, virtual pro
 
 ```toml
 [dependencies]
-byteflow-actors = "0.2"
+byteflow-actors = "0.3"
 ```
 
 ```rust
@@ -26,5 +26,7 @@ cargo install byteflow-actors
 ```
 
 **Not** a Tokio replacement / not distributed OTP. Host Rust owns I/O; Byteflow owns cheap actors.
+
+Atomic request-reply (`Value::Message`): `cargo run -p byteflow-actors --example atomic_actors` — see `crates/byteflow/docs/atomic-actors.md`. Set `BYTEFLOW_LOG=info` for scheduler stderr logs.
 
 License: MIT OR Apache-2.0 · [github.com/mchael158/bytecode-vm](https://github.com/mchael158/bytecode-vm)

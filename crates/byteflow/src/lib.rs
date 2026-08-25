@@ -12,6 +12,7 @@
 //! # Quick example
 //!
 //! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use byteflow::{ChunkBuilder, Opcode, ProcessOutcome, Runtime, Value};
 //!
 //! let mut b = ChunkBuilder::new("demo");
@@ -21,16 +22,21 @@
 //! b.emit_binop(Opcode::Add, 0, 0, 1);
 //! b.emit_return(0);
 //!
-//! let rt = Runtime::new(b.finish());
-//! let outcome = rt.spawn(0, &[]).join();
+//! let rt = Runtime::new(b.finish())?;
+//! let outcome = rt.spawn(0, &[])?.join();
 //! rt.shutdown();
 //! assert!(matches!(outcome, ProcessOutcome::Completed(Value::Int(42))));
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! Host owns I/O. Byteflow owns cheap concurrency.
 #![forbid(unsafe_code)]
+// Tests may use unwrap/expect for brevity; production paths must not.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod bytecode;
+pub mod log;
 pub mod natives;
 pub mod samples;
 pub mod scheduler;
@@ -38,18 +44,18 @@ pub mod vm;
 
 pub use bytecode::{
     decode, disassemble, encode, verify, Chunk, ChunkBuilder, FormatError, FunctionDef,
-    Instruction, Label, Opcode, Value, VerifyError, ABI_VERSION, MAGIC,
+    Instruction, Label, Message, Opcode, Value, VerifyError, ABI_VERSION, MAGIC,
 };
 pub use natives::{std_native_map, std_native_table, std_natives};
 pub use scheduler::{
-    next_process_id, pid_from_u64, ChildSpec, Delivery, Mailbox, Process, ProcessHandle,
-    ProcessId, ProcessMetrics, ProcessOutcome, ProcessState, RestartPolicy, Runtime,
-    RuntimeConfig, RuntimeMetrics, RuntimeMetricsSnapshot, RuntimeSpawner, SendError,
-    Supervisor, SupervisorConfig, DEFAULT_QUANTUM,
+    fault_count, next_process_id, pid_from_u64, report_fault, ChildSpec, Delivery, Mailbox,
+    Process, ProcessHandle, ProcessId, ProcessMetrics, ProcessOutcome, ProcessState, RestartPolicy,
+    Runtime, RuntimeConfig, RuntimeError, RuntimeMetrics, RuntimeMetricsSnapshot, RuntimeSpawner,
+    SendError, SpawnError, Supervisor, SupervisorConfig, DEFAULT_QUANTUM,
 };
 pub use vm::{
-    expect_arg, expect_int, Fault, NativeFn, NativeResult, NativeTable, NativeTableBuilder, Vm,
-    VmResult, MAX_CALL_DEPTH,
+    expect_arg, expect_bool, expect_int, expect_message, expect_u64, Fault, NativeFn,
+    NativeResult, NativeTable, NativeTableBuilder, Vm, VmResult, MAX_CALL_DEPTH,
 };
 
 #[cfg(test)]
@@ -61,6 +67,8 @@ mod tests {
         let map = std_native_map();
         assert_eq!(map["print"], 0);
         assert_eq!(map["now_ms"], 1);
+        assert_eq!(map["make_msg"], 2);
+        assert_eq!(map["msg_payload"], 6);
     }
 
     #[test]
@@ -75,8 +83,8 @@ mod tests {
         let chunk = b.finish();
         verify(&chunk).expect("verify");
 
-        let rt = Runtime::with_natives(chunk, std_native_table());
-        let outcome = rt.spawn(0, &[]).join();
+        let rt = Runtime::with_natives(chunk, std_native_table()).expect("runtime");
+        let outcome = rt.spawn(0, &[]).expect("spawn").join();
         rt.shutdown();
 
         match outcome {

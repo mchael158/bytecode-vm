@@ -35,6 +35,9 @@ pub enum Fault {
     NativeError(String),
     /// Explicit `Trap` opcode, e.g. an assertion emitted by a compiler.
     Explicit(i32),
+    /// Broken VM invariant (e.g. empty frame stack while running). Category D
+    /// in the error model — surfaced as a process fault, never as `unwrap`.
+    Invariant(&'static str),
 }
 
 impl fmt::Display for Fault {
@@ -60,6 +63,7 @@ impl fmt::Display for Fault {
             }
             Fault::NativeError(msg) => write!(f, "native function error: {msg}"),
             Fault::Explicit(code) => write!(f, "explicit trap (code {code})"),
+            Fault::Invariant(msg) => write!(f, "vm invariant broken: {msg}"),
         }
     }
 }

@@ -3,6 +3,7 @@ use std::sync::Mutex;
 
 use crate::bytecode::Value;
 
+use super::error::RuntimeError;
 use super::process::Process;
 use super::sync_lock;
 
@@ -47,9 +48,8 @@ struct MailboxInner {
 
 /// Outcome of pushing a message: either it was queued for later, or it
 /// immediately handed off to a process that was parked waiting for it — in
-/// which case the caller (see `byteflow-scheduler::worker::deliver`) is
-/// responsible for feeding the value back into that process's VM and
-/// re-enqueuing it as `Ready`.
+/// which case the caller (see `worker::deliver`) is responsible for feeding
+/// the value back into that process's VM and re-enqueuing it as `Ready`.
 pub enum Delivery {
     Queued,
     Handoff(Box<Process>),
@@ -67,52 +67,53 @@ impl Mailbox {
     /// [`Delivery::Handoff`] instead of the message being queued — the
     /// caller must resume that process with `value`, not read it back out
     /// of the mailbox.
-    pub fn push(&self, value: Value) -> Delivery {
-        let mut inner = sync_lock::lock(&self.inner);
-        match inner.parked.take() {
+    ///
+    /// Mutex poison → [`RuntimeError`] (fail-closed; do not continue on
+    /// inconsistent shared state).
+    pub fn push(&self, value: Value) -> Result<Delivery, RuntimeError> {
+        let mut inner = sync_lock::lock(&self.inner, "Mailbox::push")?;
+        Ok(match inner.parked.take() {
             Some(process) => Delivery::Handoff(process),
             None => {
                 inner.queue.push_back(value);
                 Delivery::Queued
             }
-        }
+        })
     }
 
     /// Non-blocking pop, used by a worker that is *currently running* this
     /// mailbox's owning process (i.e. is about to decide whether it can
     /// satisfy a `Receive` immediately or must park).
-    pub fn try_pop(&self) -> Option<Value> {
-        let mut inner = sync_lock::lock(&self.inner);
-        inner.queue.pop_front()
+    pub fn try_pop(&self) -> Result<Option<Value>, RuntimeError> {
+        let mut inner = sync_lock::lock(&self.inner, "Mailbox::try_pop")?;
+        Ok(inner.queue.pop_front())
     }
 
     /// Atomically re-check the queue and, if still empty, store `process`
-    /// as parked. Returns `Err(process)` (handing ownership straight back
-    /// to the caller) if a message arrived in the tiny window between the
-    /// worker's `try_pop` and calling this — in which case the caller
-    /// should resume the process immediately rather than losing the
-    /// wakeup.
-    pub fn park(&self, process: Box<Process>) -> Result<(), Box<Process>> {
-        let mut inner = sync_lock::lock(&self.inner);
+    /// as parked.
+    ///
+    /// Outer `Result` is infrastructure (mutex poison). Inner `Result` is
+    /// the lost-wakeup race: `Err(process)` means a message arrived between
+    /// the worker's `try_pop` and this call — resume immediately with the
+    /// stashed pending message rather than parking forever.
+    pub fn park(&self, process: Box<Process>) -> Result<Result<(), Box<Process>>, RuntimeError> {
+        let mut inner = sync_lock::lock(&self.inner, "Mailbox::park")?;
         if let Some(value) = inner.queue.pop_front() {
             drop(inner);
             // A message beat us here; hand it straight back via a
-            // one-off queue-of-one so the caller can resume with it.
-            // We push it back to the front conceptually by returning the
-            // process for the caller to resume directly with this value.
-            return Err(with_pending(process, value));
+            // one-off out-of-band so the caller can resume with it.
+            return Ok(Err(with_pending(process, value)));
         }
         inner.parked = Some(process);
-        Ok(())
+        Ok(Ok(()))
     }
 
-    /// Attempt to take a specific timed-out parked process back out, used
-    /// by the timer wheel when a `ReceiveTimeout` deadline fires. Returns
-    /// `None` if the process was already woken by a `Send` in the
-    /// meantime (it will have been removed from `parked` already).
-    pub fn take_parked(&self) -> Option<Box<Process>> {
-        let mut inner = sync_lock::lock(&self.inner);
-        inner.parked.take()
+    /// Attempt to take a timed-out parked process back out, used by the
+    /// timer wheel when a `ReceiveTimeout` deadline fires. Returns `None`
+    /// if the process was already woken by a `Send` in the meantime.
+    pub fn take_parked(&self) -> Result<Option<Box<Process>>, RuntimeError> {
+        let mut inner = sync_lock::lock(&self.inner, "Mailbox::take_parked")?;
+        Ok(inner.parked.take())
     }
 }
 

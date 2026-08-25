@@ -26,6 +26,9 @@ impl ProcessHandle {
     /// embedder's `main` waiting on a top-level computation, mirroring
     /// `std::thread::JoinHandle::join`.
     pub fn join(self) -> ProcessOutcome {
-        self.receiver.join()
+        match self.receiver.join() {
+            Ok(outcome) => outcome,
+            Err(e) => ProcessOutcome::Failed(e.to_string()),
+        }
     }
 }

@@ -9,7 +9,7 @@ Concorrência estilo **Erlang** embutível em Rust: bytecode, processos virtuais
 
 ```toml
 [dependencies]
-byteflow-actors = "0.2"
+byteflow-actors = "0.3"
 ```
 
 ```rust
@@ -24,5 +24,7 @@ cargo install byteflow-actors
 ```
 
 **Não** substitui Tokio / **não** é OTP distribuído. O Rust hospedeiro fica com o I/O.
+
+Request-reply atômico (`Value::Message`): `cargo run -p byteflow-actors --example atomic_actors` — ver `crates/byteflow/docs/atomic-actors.md`. Use `BYTEFLOW_LOG=info` para logs do scheduler no stderr.
 
 Licença: MIT OR Apache-2.0 · [github.com/mchael158/bytecode-vm](https://github.com/mchael158/bytecode-vm)

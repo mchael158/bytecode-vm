@@ -1,6 +1,7 @@
 //! M:N processes, mailboxes, timer, supervisor and [`Runtime`].
 
 mod directory;
+mod error;
 mod handle;
 mod mailbox;
 mod metrics;
@@ -12,6 +13,7 @@ mod sync_lock;
 mod timer;
 mod worker;
 
+pub use error::{fault_count, report_fault, RuntimeError, SpawnError};
 pub use handle::ProcessHandle;
 pub use mailbox::{Delivery, Mailbox};
 pub use metrics::{RuntimeMetrics, RuntimeMetricsSnapshot};

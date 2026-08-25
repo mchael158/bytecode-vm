@@ -1,9 +1,7 @@
-//! Measured demo for posts: spawn N trivial processes and join the last one
-//! after a short barrier via mailboxes is overkill — here each process just
-//! returns, and we join them all from the host.
+//! Measured demo for posts: spawn N trivial processes and join them all.
 //!
 //! ```text
-//! cargo run -p byteflow --example throughput --release
+//! cargo run -p byteflow-actors --example throughput --release
 //! ```
 
 use std::time::Instant;
@@ -28,19 +26,34 @@ fn main() {
         .map(|p| p.get())
         .unwrap_or(1);
 
-    let rt = Runtime::with_config(
+    let rt = match Runtime::with_config(
         trivial_chunk(),
         RuntimeConfig {
             workers,
             quantum: 10_000,
         },
-    );
-    let worker_fn = rt.function_index("worker").expect("worker");
+    ) {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    let Some(worker_fn) = rt.function_index("worker") else {
+        eprintln!("missing worker");
+        std::process::exit(1);
+    };
 
     let start = Instant::now();
     let mut handles = Vec::with_capacity(n as usize);
     for _ in 0..n {
-        handles.push(rt.spawn(worker_fn, &[]));
+        match rt.spawn(worker_fn, &[]) {
+            Ok(h) => handles.push(h),
+            Err(e) => {
+                eprintln!("spawn: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     let mut ok = 0u32;
     for h in handles {

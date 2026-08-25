@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use super::error::{report_fault, RuntimeError};
 use super::mailbox::Mailbox;
 use super::process::ProcessId;
 use super::sync_lock;
@@ -42,24 +43,41 @@ impl Directory {
         &self.shards[(id.as_u64() as usize) % SHARDS]
     }
 
-    pub fn register(&self, id: ProcessId, mailbox: Arc<Mailbox>) {
-        sync_lock::lock(self.shard_for(id)).insert(id, mailbox);
+    pub fn register(&self, id: ProcessId, mailbox: Arc<Mailbox>) -> Result<(), RuntimeError> {
+        sync_lock::lock(self.shard_for(id), "Directory::register")?.insert(id, mailbox);
+        Ok(())
     }
 
-    pub fn unregister(&self, id: ProcessId) {
-        sync_lock::lock(self.shard_for(id)).remove(&id);
+    pub fn unregister(&self, id: ProcessId) -> Result<(), RuntimeError> {
+        sync_lock::lock(self.shard_for(id), "Directory::unregister")?.remove(&id);
+        Ok(())
     }
 
-    pub fn lookup(&self, id: ProcessId) -> Option<Arc<Mailbox>> {
-        sync_lock::lock(self.shard_for(id)).get(&id).cloned()
+    pub fn lookup(&self, id: ProcessId) -> Result<Option<Arc<Mailbox>>, RuntimeError> {
+        Ok(sync_lock::lock(self.shard_for(id), "Directory::lookup")?
+            .get(&id)
+            .cloned())
     }
 
     /// Approximate live-process count, for `runtime.metrics()`. "Approximate"
     /// because it's a sum across shards taken without a global snapshot lock
     /// — exactly right for a dashboard counter, not for anything requiring
     /// linearizability.
+    ///
+    /// On mutex poison, reports the fault and returns the partial sum so far
+    /// (fail-closed for that shard, still useful as a lower bound).
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|s| sync_lock::lock(s).len()).sum()
+        let mut n = 0;
+        for s in &self.shards {
+            match sync_lock::lock(s, "Directory::len") {
+                Ok(g) => n += g.len(),
+                Err(e) => {
+                    report_fault(e);
+                    return n;
+                }
+            }
+        }
+        n
     }
 }
 

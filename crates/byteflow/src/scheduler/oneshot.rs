@@ -1,5 +1,6 @@
 use std::sync::{Arc, Condvar, Mutex};
 
+use super::error::{report_fault, RuntimeError};
 use super::sync_lock;
 
 /// A single-value, single-producer/single-consumer handoff, used to deliver
@@ -40,10 +41,17 @@ impl<T> Sender<T> {
     /// Deliver the value. Consumes `self`: a `Sender` can only send once,
     /// enforced at the type level rather than by a runtime "already sent"
     /// check.
+    ///
+    /// Mutex poison → [`report_fault`] and drop the value (rare; join may
+    /// hang — infrastructure failure, not a process fault).
     pub fn send(self, value: T) {
-        let mut slot = sync_lock::lock(&self.inner.slot);
-        *slot = Some(value);
-        self.inner.cvar.notify_one();
+        match sync_lock::lock(&self.inner.slot, "oneshot::send") {
+            Ok(mut slot) => {
+                *slot = Some(value);
+                self.inner.cvar.notify_one();
+            }
+            Err(e) => report_fault(e),
+        }
     }
 }
 
@@ -52,13 +60,15 @@ impl<T> Receiver<T> {
     /// Only ever called from an embedder's own thread (e.g. `main`) waiting
     /// on a top-level process — never from inside a worker thread, which
     /// must never block on anything but its own park/steal loop.
-    pub fn join(self) -> T {
-        let mut slot = sync_lock::lock(&self.inner.slot);
+    ///
+    /// Returns [`RuntimeError`] if the oneshot mutex is poisoned.
+    pub fn join(self) -> Result<T, RuntimeError> {
+        let mut slot = sync_lock::lock(&self.inner.slot, "oneshot::join")?;
         loop {
             if let Some(v) = slot.take() {
-                return v;
+                return Ok(v);
             }
-            slot = sync_lock::wait(&self.inner.cvar, slot);
+            slot = sync_lock::wait(&self.inner.cvar, slot, "oneshot::wait")?;
         }
     }
 }

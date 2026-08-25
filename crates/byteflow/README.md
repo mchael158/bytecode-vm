@@ -29,7 +29,7 @@ It is **not** a Tokio replacement, not a distributed cluster, and not a JVM.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.2"
+byteflow-actors = "0.3"
 ```
 
 ```rust
@@ -50,7 +50,7 @@ byteflow demo ping-pong
 ```rust
 use byteflow::{ChunkBuilder, Opcode, ProcessOutcome, Runtime, Value};
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut b = ChunkBuilder::new("demo");
     b.begin_function("main", 0, 2);
     b.emit_load_imm(0, 41);
@@ -58,41 +58,57 @@ fn main() {
     b.emit_binop(Opcode::Add, 0, 0, 1);
     b.emit_return(0);
 
-    let rt = Runtime::new(b.finish());
-    let outcome = rt.spawn(0, &[]).join();
+    let rt = Runtime::new(b.finish())?;
+    let outcome = rt.spawn(0, &[])?.join();
     rt.shutdown();
 
     assert!(matches!(outcome, ProcessOutcome::Completed(Value::Int(42))));
+    Ok(())
 }
 ```
 
-### Std natives (`print`, `now_ms`)
+### Std natives (`print`, `now_ms`, `make_msg`, …)
 
-Stable indices: **`print = 0`**, **`now_ms = 1`**.
+Stable indices: **`print = 0`**, **`now_ms = 1`**, **`make_msg = 2`**, **`msg_*` = 3–6**.
 
 ```rust
 use byteflow::{std_native_table, ChunkBuilder, Runtime};
 
-let mut b = ChunkBuilder::new("clock");
-b.begin_function("main", 0, 2);
-b.emit_load_imm(0, 42);
-b.emit_call_native(0, 0, 1); // print(r0)
-b.emit_call_native(1, 1, 0); // r1 = now_ms()
-b.emit_return(1);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut b = ChunkBuilder::new("clock");
+    b.begin_function("main", 0, 2);
+    b.emit_load_imm(0, 42);
+    b.emit_call_native(0, 0, 1); // print(r0)
+    b.emit_call_native(1, 1, 0); // r1 = now_ms()
+    b.emit_return(1);
 
-let rt = Runtime::with_natives(b.finish(), std_native_table());
+    let rt = Runtime::with_natives(b.finish(), std_native_table())?;
+    let _ = rt.spawn(0, &[])?.join();
+    rt.shutdown();
+    Ok(())
+}
 ```
 
 Or `std_natives()` → `(NativeTable, HashMap<name, index>)` so host registration stays aligned with bytecode.
 
-### Messaging (ping-pong)
+### Messaging
+
+Scalar ping-pong (two mailbox values):
 
 ```text
 cargo run --example ping_pong
-# pong replied 2
 ```
 
-Built-in samples: `byteflow::samples::{ping_pong, add_forty_two, boom}`.
+Atomic request-reply (`Value::Message` — one envelope per hop):
+
+```text
+cargo run --example atomic_actors
+# optional scheduler logs on stderr:
+# BYTEFLOW_LOG=info cargo run --example atomic_actors
+```
+
+See [`docs/atomic-actors.md`](docs/atomic-actors.md). Built-in samples:
+`byteflow::samples::{ping_pong, atomic_request_reply, add_forty_two, boom}`.
 
 ---
 
@@ -129,29 +145,32 @@ byteflow disasm <file.bf>
 byteflow run    <file.bf> [function]
 ```
 
-`run` attaches the std native table so modules that `CallNative` indices 0/1 work.
+`run` attaches the std native table (`print`, `now_ms`, `make_msg`, `msg_*`) so modules that `CallNative` those indices work.
 
 ---
 
 ## Safety & design notes
 
-- `#![forbid(unsafe_code)]`  
-- Process panics are caught at the worker boundary so one bad process cannot kill the OS thread.  
-- Native functions must **not block** — they run inline on a worker.  
-- Values today: `Unit | Bool | Int | Float | Pid` (no strings yet).
+- `#![forbid(unsafe_code)]`
+- Process panics are caught at the worker boundary so one bad process cannot kill the OS thread.
+- Native functions must **not block** — they run inline on a worker.
+- Host APIs return `Result` (`SpawnError` / `RuntimeError`) — no `unwrap`/`expect` on production paths (see [`docs/error-model.md`](docs/error-model.md)).
+- Values today: `Unit | Bool | Int | Float | Pid | Message` (no strings/bytes yet).
 
 ---
 
-## Status (v0.2)
+## Status (v0.3)
 
-**Included:** register ISA + assembler, BFV0, verifier, per-process VM, M:N scheduler, mailboxes, supervisor, std natives, CLI, examples.
+**Included:** register ISA + assembler, BFV0 (ABI v2 / `Message`), verifier, per-process VM, M:N scheduler, mailboxes, atomic envelopes, supervisor, std natives, CLI, examples, fail-closed error model.
 
 **Not yet:** strings/bytes in `Value`, bounded mailboxes, Criterion benches, timing wheel, JIT, distribution.
+
+See [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
 ## Links
 
-- Repository: [github.com/mchael158/bytecode-vm](https://github.com/mchael158/bytecode-vm)  
-- Docs: [docs.rs/byteflow-actors](https://docs.rs/byteflow-actors)  
+- Repository: [github.com/mchael158/bytecode-vm](https://github.com/mchael158/bytecode-vm)
+- Docs: [docs.rs/byteflow-actors](https://docs.rs/byteflow-actors)
 - License: **MIT OR Apache-2.0**
