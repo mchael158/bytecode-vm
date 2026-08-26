@@ -12,7 +12,7 @@ pub struct Frame {
     pub registers: Vec<Value>,
     /// Register index in the *caller's* frame that will receive this
     /// frame's return value. `None` for the outermost frame, whose return
-    /// value completes the process instead.
+    /// value completes the Flow instead.
     pub dest_reg: Option<u8>,
 }
 

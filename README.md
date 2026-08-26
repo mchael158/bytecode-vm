@@ -6,11 +6,11 @@
 
 [English](README.md) · [Português (Brasil)](README.pt-BR.md)
 
-Embeddable **Erlang-style** concurrency for Rust: register bytecode, virtual processes, mailboxes, and a supervisor — **one crate**.
+Embeddable concurrency for Rust: register bytecode, **flows**, mailboxes, **Atomic Hop** (`Value::Message` only on `Send`), and a supervisor — **one crate**.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.3"
+byteflow-actors = "0.5"
 ```
 
 ```rust
@@ -25,8 +25,8 @@ cargo run -p byteflow-actors --bin byteflow -- demo ping-pong
 cargo install byteflow-actors
 ```
 
-**Not** a Tokio replacement / not distributed OTP. Host Rust owns I/O; Byteflow owns cheap actors.
+**Not** a Tokio replacement / not distributed OTP. Host Rust owns I/O; Byteflow owns cheap flows.
 
-Atomic request-reply (`Value::Message`): `cargo run -p byteflow-actors --example atomic_actors` — see `crates/byteflow/docs/atomic-actors.md`. Set `BYTEFLOW_LOG=info` for scheduler stderr logs.
+Atomic Hop (`Value::Message`): `cargo run -p byteflow-actors --example atomic_actors` — see `crates/byteflow/docs/atomic-hop.md`. Set `BYTEFLOW_LOG=info` for scheduler stderr logs.
 
 License: MIT OR Apache-2.0 · [github.com/mchael158/bytecode-vm](https://github.com/mchael158/bytecode-vm)

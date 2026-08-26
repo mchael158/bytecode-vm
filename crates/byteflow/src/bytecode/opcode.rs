@@ -21,7 +21,7 @@
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Opcode {
-    /// Stop the current process's VM loop. Terminal state.
+    /// Stop the current Flow's VM loop. Terminal state.
     Halt = 0x00,
 
     // ---- data movement ----------------------------------------------------
@@ -62,49 +62,70 @@ pub enum Opcode {
     /// `r[a..a+nc]`, result written back into `r[a]`.
     Call = 0x30,
     /// `Return ra` → return `r[a]` to the caller frame (or complete the
-    /// process if this is the outermost frame).
+    /// Flow if this is the outermost frame).
     Return = 0x31,
     /// `CallNative ra, fb, nc` → like `Call` but `fb` indexes the native
     /// function table instead of the bytecode function table.
     CallNative = 0x32,
 
-    // ---- process model --------------------------------------------------
-    /// `Spawn ra, fb, nc` → create a new virtual process starting at
+    // ---- Flow model --------------------------------------------------
+    /// `Spawn ra, fb, nc` → create a new virtual Flow starting at
     /// function `fb`, passing `nc` arguments taken from `r[a+1..a+1+nc]`
     /// (deliberately *not* overlapping `r[a]` itself, which is where the
-    /// new process's `Value::Pid` is written once the scheduler has
-    /// created it — see `byteflow_vm::VmResult::Spawn`).
+    /// scheduler writes a **Cap** to the child once created — FlowCap;
+    /// see [`crate::VmResult::Spawn`]).
     Spawn = 0x40,
     /// `Yield` → cooperative yield. Control returns to the scheduler, the
-    /// process is re-enqueued as `Ready` and may resume on any worker.
+    /// Flow is re-enqueued as `Ready` and may resume on any worker.
     Yield = 0x41,
     /// `Sleep ra` → suspend until `r[a]` (interpreted as milliseconds,
     /// Value::Int) has elapsed. Registered on the timer wheel.
     Sleep = 0x42,
-    /// `Exit ra` → terminate the process, `r[a]` is delivered to `.join()`.
+    /// `Exit ra` → terminate the Flow, `r[a]` is delivered to `.join()`.
     Exit = 0x43,
-    /// `SelfPid ra` → `r[a] =` the running process's `Value::Pid`.
+    /// `SelfPid ra` → `r[a] =` a **self Cap** (`SEND|ASK`) for this flow.
+    /// (Opcode name kept for ABI; the value is `Value::Cap`, not Pid.)
     /// The VM does not store its own id (it has no scheduler state); this
     /// is a scheduler effect, same class as `Spawn`/`Receive`.
     SelfPid = 0x44,
 
     // ---- messaging --------------------------------------------------------
-    /// `Send ra, rb` → send `r[b]` to the mailbox of the process whose Pid is
-    /// in `r[a]`. Never blocks (mailboxes are unbounded by default, see
-    /// `ProcessLimits::max_mailbox` for the bounded variant).
+    /// `Send ra, rb` → Atomic Hop: deliver `r[b]` (`Message`) to the Cap in
+    /// `r[a]`. Never blocks (mailboxes are unbounded by default).
+    ///
+    /// VM requires Cap + Message; worker resolves Cap (SEND), stamps sender
+    /// + `reply_cap`, then pushes to the resolved mailbox.
     Send = 0x50,
     /// `Receive ra` → pop the next message into `r[a]`; if the mailbox is
-    /// empty, suspends the process in `Waiting` state until a message
+    /// empty, suspends the Flow in `Waiting` state until a message
     /// arrives.
     Receive = 0x51,
     /// `ReceiveTimeout ra, rb` → like `Receive` but gives up after `r[b]`
     /// milliseconds, writing `Value::Unit` into `r[a]` on timeout.
     ReceiveTimeout = 0x52,
+    /// `ReceiveMatch ra, rb` → **Atomic Hop selective receive**: block until
+    /// a [`crate::Value::Message`] with `tag == r[b]` (as `u16`) is available.
+    /// Non-matching hops stay in the mailbox in FIFO order (skip, don't drop).
+    ReceiveMatch = 0x53,
+    /// `ReceiveMatchImm ra, imm` → like `ReceiveMatch` with an immediate tag
+    /// (`imm` must fit in `u16`).
+    ReceiveMatchImm = 0x54,
+    /// `Ask ra, rb, rc` → **atomic request/reply hop**.
+    ///
+    /// 1. Validate `r[b]` as Cap and `r[c]` as Message (VM).
+    /// 2. Scheduler resolves Cap (ASK), stamps `sender` + mints `reply_cap`.
+    /// 3. Deliver the request to the resolved FlowId (like `Send`).
+    /// 4. Suspend until a reply hop matches
+    ///    `request_id == request.request_id && sender == resolved_FlowId`.
+    /// 5. Write the reply `Message` into `r[a]`.
+    ///
+    /// Append-only ABI slot (`0x55`). No timeout variant in this revision.
+    Ask = 0x55,
 
     // ---- diagnostics / safety ------------------------------------------
     /// `Trap imm` → deliberate fault (assertion failure, div-by-zero, bad
     /// opcode encountered by a corrupt/foreign module, capability
-    /// violation). Propagates to the process supervisor as `ProcessState::Failed`.
+    /// violation). Propagates to the Flow supervisor as `FlowState::Failed`.
     Trap = 0x60,
     /// `Nop` → no-op, used by the assembler to pad jump targets.
     Nop = 0x61,
@@ -145,6 +166,9 @@ impl Opcode {
             0x50 => Send,
             0x51 => Receive,
             0x52 => ReceiveTimeout,
+            0x53 => ReceiveMatch,
+            0x54 => ReceiveMatchImm,
+            0x55 => Ask,
             0x60 => Trap,
             0x61 => Nop,
             _ => return None,
@@ -186,6 +210,9 @@ impl std::fmt::Display for Opcode {
             Opcode::Send => "Send",
             Opcode::Receive => "Receive",
             Opcode::ReceiveTimeout => "ReceiveTimeout",
+            Opcode::ReceiveMatch => "ReceiveMatch",
+            Opcode::ReceiveMatchImm => "ReceiveMatchImm",
+            Opcode::Ask => "Ask",
             Opcode::Trap => "Trap",
             Opcode::Nop => "Nop",
         };

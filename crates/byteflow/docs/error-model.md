@@ -7,7 +7,7 @@
 | Kind | Example | Surface |
 |------|---------|---------|
 | **A — user / API** | `spawn` bad function index | `Result<T, SpawnError>` |
-| **B — process** | `HwError`, native fault | `ProcessOutcome::Failed` → Supervisor |
+| **B — flow** | native fault, bad Atomic Hop | `FlowOutcome::Failed` → Supervisor |
 | **C — infrastructure** | mutex poison | `RuntimeError` + fail-closed (`report_fault`) |
 | **D — invariant** | empty VM frame stack | types / `debug_assert` — never `unwrap` to hide design |
 

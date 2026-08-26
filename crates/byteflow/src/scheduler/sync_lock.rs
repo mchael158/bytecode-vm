@@ -12,7 +12,7 @@
 //! (fail closed) is to abort the operation with a loud diagnostic so the
 //! fault cannot cascade as silent corruption.
 //!
-//! Process-level panics are already isolated by `catch_unwind` around
+//! flow-level panics are already isolated by `catch_unwind` around
 //! `Vm::run` and never hold these locks across that boundary. Poison here
 //! therefore implies a **scheduler / host bug**, not a buggy actor.
 //!

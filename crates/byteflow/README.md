@@ -4,7 +4,7 @@
 [![docs.rs](https://docs.rs/byteflow-actors/badge.svg)](https://docs.rs/byteflow-actors)
 [![license](https://img.shields.io/crates/l/byteflow-actors.svg)](https://github.com/mchael158/bytecode-vm)
 
-**Byteflow** is a small, embeddable actor runtime for Rust: register-based bytecode, lightweight virtual processes, mailboxes, cooperative scheduling, and a one-for-one supervisor — without a separate scripting language.
+**Byteflow** is a small, embeddable **flow** runtime for Rust: register-based bytecode, lightweight flows, **Atomic Hop** messaging (`Value::Message` only on `Send`), cooperative scheduling, and a one-for-one supervisor — without a separate scripting language.
 
 You assemble programs with `ChunkBuilder` in host Rust. The host owns I/O; Byteflow owns cheap concurrency.
 
@@ -29,11 +29,11 @@ It is **not** a Tokio replacement, not a distributed cluster, and not a JVM.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.3"
+byteflow-actors = "0.5"
 ```
 
 ```rust
-use byteflow::{ChunkBuilder, Opcode, ProcessOutcome, Runtime, Value};
+use byteflow::{ChunkBuilder, Opcode, FlowOutcome, Runtime, Value};
 ```
 
 CLI (same package):
@@ -48,7 +48,7 @@ byteflow demo ping-pong
 ## Quick start
 
 ```rust
-use byteflow::{ChunkBuilder, Opcode, ProcessOutcome, Runtime, Value};
+use byteflow::{ChunkBuilder, Opcode, FlowOutcome, Runtime, Value};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut b = ChunkBuilder::new("demo");
@@ -62,14 +62,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let outcome = rt.spawn(0, &[])?.join();
     rt.shutdown();
 
-    assert!(matches!(outcome, ProcessOutcome::Completed(Value::Int(42))));
+    assert!(matches!(outcome, FlowOutcome::Completed(Value::Int(42))));
     Ok(())
 }
 ```
 
 ### Std natives (`print`, `now_ms`, `make_msg`, …)
 
-Stable indices: **`print = 0`**, **`now_ms = 1`**, **`make_msg = 2`**, **`msg_*` = 3–6**.
+Stable indices: **`print = 0`**, **`now_ms = 1`**, **`make_msg = 2`**, **`msg_*` = 3–6**, **`msg_reply_cap = 7`**.
 
 ```rust
 use byteflow::{std_native_table, ChunkBuilder, Runtime};
@@ -91,23 +91,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Or `std_natives()` → `(NativeTable, HashMap<name, index>)` so host registration stays aligned with bytecode.
 
-### Messaging
+### Messaging (Atomic Hop)
 
-Scalar ping-pong (two mailbox values):
+Every `Send` carries one `Value::Message` envelope (scalars trap):
 
 ```text
 cargo run --example ping_pong
-```
-
-Atomic request-reply (`Value::Message` — one envelope per hop):
-
-```text
 cargo run --example atomic_actors
 # optional scheduler logs on stderr:
 # BYTEFLOW_LOG=info cargo run --example atomic_actors
 ```
 
-See [`docs/atomic-actors.md`](docs/atomic-actors.md). Built-in samples:
+See [`docs/atomic-hop.md`](docs/atomic-hop.md). Built-in samples:
 `byteflow::samples::{ping_pong, atomic_request_reply, add_forty_two, boom}`.
 
 ---
@@ -117,17 +112,17 @@ See [`docs/atomic-actors.md`](docs/atomic-actors.md). Built-in samples:
 | Layer | Responsibility |
 |---|---|
 | **Bytecode** | ISA, `ChunkBuilder`, BFV0 (`.bf`) encode/decode, static `verify` |
-| **VM** | One process: registers, call stack, cooperative quantum, `CallNative` |
+| **VM** | One flow: registers, call stack, cooperative quantum, `CallNative` |
 | **Scheduler** | M:N workers, FIFO mailboxes (park/wake), timer, supervisor |
 | **Facade** | Public API + std natives + samples + `byteflow` CLI |
 
-**Process lifecycle (sketch):**
+**Flow lifecycle (sketch):**
 
 1. Worker runs at most `quantum` instructions (default 10 000).  
 2. `Yield` / budget → run queue (stealable).  
 3. `Sleep` → timer thread → injector.  
-4. Empty `Receive` → process parks **inside its mailbox**; the next `Send` wakes under the same lock (no lost wakeup).  
-5. `Fault` / `Trap` → `ProcessState::Failed` → supervisor (`Always` / `OnFailure` / `Never`; default intensity 3 / 5s).
+4. Empty `Receive` → flow parks **inside its mailbox**; the next Atomic Hop wakes under the same lock (no lost wakeup).  
+5. `Fault` / `Trap` → `FlowState::Failed` → supervisor (`Always` / `OnFailure` / `Never`; default intensity 3 / 5s).
 
 `join()` is for the embedder’s native thread only — workers never block on it.
 
@@ -138,32 +133,35 @@ Untrusted `.bf` files go through `Opcode::from_u8` + `verify` before execution.
 ## CLI
 
 ```text
-byteflow demo [ping-pong|add]
+byteflow demo [ping-pong|atomic|add]
 byteflow pack  <demo> <out.bf>
 byteflow verify <file.bf>
 byteflow disasm <file.bf>
 byteflow run    <file.bf> [function]
 ```
 
-`run` attaches the std native table (`print`, `now_ms`, `make_msg`, `msg_*`) so modules that `CallNative` those indices work.
+`run` and hop demos attach the std native table (`print`, `now_ms`, `make_msg`, `msg_*`).
 
 ---
 
 ## Safety & design notes
 
 - `#![forbid(unsafe_code)]`
-- Process panics are caught at the worker boundary so one bad process cannot kill the OS thread.
+- Flow panics are caught at the worker boundary so one bad flow cannot kill the OS thread.
 - Native functions must **not block** — they run inline on a worker.
 - Host APIs return `Result` (`SpawnError` / `RuntimeError`) — no `unwrap`/`expect` on production paths (see [`docs/error-model.md`](docs/error-model.md)).
-- Values today: `Unit | Bool | Int | Float | Pid | Message` (no strings/bytes yet).
+- Values today: `Unit | Bool | Int | Float | Pid | Message | Cap | Str | Bytes`.
+- **Atomic Hop:** only `Value::Message` may cross `Send`.
+- **FlowCap:** bytecode `Send`/`Ask` targets are `Value::Cap`; replies use `msg_reply_cap`.
+- **Security:** authenticated hop sender + FlowCap — see [`docs/security.md`](docs/security.md).
 
 ---
 
-## Status (v0.3)
+## Status (v0.5)
 
-**Included:** register ISA + assembler, BFV0 (ABI v2 / `Message`), verifier, per-process VM, M:N scheduler, mailboxes, atomic envelopes, supervisor, std natives, CLI, examples, fail-closed error model.
+**Included:** register ISA + assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, mailboxes, Atomic Hop, FlowCap, supervisor, std natives, CLI, examples, fail-closed error model.
 
-**Not yet:** strings/bytes in `Value`, bounded mailboxes, Criterion benches, timing wheel, JIT, distribution.
+**Not yet:** bounded mailboxes, Criterion benches, timing wheel, JIT, distribution.
 
 See [`CHANGELOG.md`](CHANGELOG.md).
 

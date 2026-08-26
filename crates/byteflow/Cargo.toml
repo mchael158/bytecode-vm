@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 homepage = "https://github.com/mchael158/bytecode-vm"
 documentation = "https://docs.rs/byteflow-actors"
-description = "Embeddable actor runtime: bytecode VM, M:N scheduler, mailboxes, Message envelopes, supervisor"
+description = "Embeddable flow runtime: bytecode VM, M:N scheduler, Atomic Hop + FlowCap, supervisor"
 readme = "README.md"
-keywords = ["actors", "bytecode", "vm", "erlang", "embedded"]
+keywords = ["flows", "bytecode", "vm", "concurrency", "embedded"]
 categories = ["concurrency", "emulators"]
 include = [
     "src/**/*",

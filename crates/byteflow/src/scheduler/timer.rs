@@ -7,22 +7,22 @@ use crossbeam_deque::Injector;
 
 use super::error::report_fault;
 use super::mailbox::Mailbox;
-use super::process::{Process, ProcessId};
+use super::process::{Flow, FlowId};
 use super::sync_lock;
 
 /// What to do when a timer entry's deadline is reached.
 enum TimerPayload {
-    /// A `Sleep`-suspended process: just make it runnable again. Its `pc`
+    /// A `Sleep`-suspended flow: just make it runnable again. Its `pc`
     /// already points past the `Sleep` instruction, so no register
     /// writeback is needed.
-    WakeSleeper(Box<Process>),
-    /// A `ReceiveTimeout`-suspended process, parked *inside its own
+    WakeSleeper(Box<Flow>),
+    /// A `ReceiveTimeout`-suspended flow, parked *inside its own
     /// mailbox* rather than held here directly (see
     /// [`super::mailbox::Mailbox`]'s doc comment). We only hold enough to
     /// find it again: its id (for logging/metrics) and a handle to the
     /// mailbox to attempt the take.
     WakeReceiver {
-        pid: ProcessId,
+        pid: FlowId,
         mailbox: Arc<Mailbox>,
         dest_reg: u8,
     },
@@ -82,10 +82,10 @@ impl TimerWheel {
         })
     }
 
-    pub fn schedule_sleep(&self, delay: Duration, process: Box<Process>) {
+    pub fn schedule_sleep(&self, delay: Duration, flow: Box<Flow>) {
         let entry = TimerEntry {
             deadline: Instant::now() + delay,
-            payload: TimerPayload::WakeSleeper(process),
+            payload: TimerPayload::WakeSleeper(flow),
         };
         self.push(entry);
     }
@@ -93,7 +93,7 @@ impl TimerWheel {
     pub fn schedule_receive_timeout(
         &self,
         delay: Duration,
-        pid: ProcessId,
+        pid: FlowId,
         mailbox: Arc<Mailbox>,
         dest_reg: u8,
     ) {
@@ -129,12 +129,12 @@ impl TimerWheel {
     /// Runs on a single dedicated OS thread (spawned by
     /// [`super::runtime::Runtime`]) for the life of the runtime.
     /// Pops every entry whose deadline has passed, resolves it into a
-    /// runnable process, and pushes that process onto the shared global
+    /// runnable flow, and pushes that flow onto the shared global
     /// injector queue so any idle worker can pick it up — the timer thread
-    /// itself never runs process code.
+    /// itself never runs flow code.
     ///
     /// Mutex poison → [`report_fault`] and exit the drive loop (fail-closed).
-    pub fn drive(self: &Arc<Self>, injector: &Injector<Box<Process>>, notify: &(Mutex<()>, Condvar)) {
+    pub fn drive(self: &Arc<Self>, injector: &Injector<Box<Flow>>, notify: &(Mutex<()>, Condvar)) {
         loop {
             let mut heap = match sync_lock::lock(&self.heap, "TimerWheel::drive") {
                 Ok(h) => h,
@@ -202,12 +202,12 @@ impl TimerWheel {
     fn fire(
         &self,
         entry: TimerEntry,
-        injector: &Injector<Box<Process>>,
+        injector: &Injector<Box<Flow>>,
         notify: &(Mutex<()>, Condvar),
     ) {
         match entry.payload {
-            TimerPayload::WakeSleeper(process) => {
-                injector.push(process);
+            TimerPayload::WakeSleeper(flow) => {
+                injector.push(flow);
             }
             TimerPayload::WakeReceiver {
                 pid,
@@ -215,18 +215,18 @@ impl TimerWheel {
                 dest_reg,
             } => {
                 match mailbox.take_parked() {
-                    Ok(Some(mut process)) => {
+                    Ok(Some(mut flow)) => {
                         debug_assert_eq!(
-                            process.id, pid,
-                            "timer fired for a mailbox owned by a different process"
+                            flow.id, pid,
+                            "timer fired for a mailbox owned by a different flow"
                         );
                         // Timeout won the race against a `Send` (see
                         // `Mailbox::take_parked`): deliver `Unit` as the
                         // "no message arrived in time" result.
-                        let _ = process
+                        let _ = flow
                             .vm
                             .resume_with(dest_reg, crate::bytecode::Value::Unit);
-                        injector.push(process);
+                        injector.push(flow);
                     }
                     Ok(None) => {
                         // A `Send` already woke it; nothing to do.

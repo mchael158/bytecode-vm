@@ -5,6 +5,8 @@ use super::value::Value;
 
 const MAX_NAME: u32 = 64 * 1024;
 const MAX_ITEMS: u32 = 1_000_000;
+/// Max length for [`Value::Str`] / [`Value::Bytes`] constant payloads.
+const MAX_BLOB: u32 = 1_048_576;
 
 /// Why a `.bf` buffer failed to decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,14 +145,32 @@ fn write_value(out: &mut Vec<u8>, value: &Value) {
             out.extend_from_slice(&p.to_le_bytes());
         }
         Value::Message(m) => {
-            // Tag 5 — ABI v2. Fixed layout, little-endian, no length prefix.
+            // Tag 5 — ABI v3 layout (includes reply_cap).
             out.push(5);
             out.extend_from_slice(&m.sender.to_le_bytes());
+            out.extend_from_slice(&m.reply_cap.to_le_bytes());
             out.extend_from_slice(&m.request_id.to_le_bytes());
             out.extend_from_slice(&m.tag.to_le_bytes());
             out.extend_from_slice(&m.payload.to_le_bytes());
         }
+        Value::Cap(c) => {
+            out.push(6);
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        Value::Str(s) => {
+            out.push(7);
+            write_blob(out, s.as_bytes());
+        }
+        Value::Bytes(b) => {
+            out.push(8);
+            write_blob(out, b);
+        }
     }
+}
+
+fn write_blob(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
 }
 
 struct Reader<'a> {
@@ -236,18 +256,35 @@ impl<'a> Reader<'a> {
             4 => Ok(Value::Pid(self.read_u64()?)),
             5 => {
                 let sender = self.read_u64()?;
+                let reply_cap = self.read_u64()?;
                 let request_id = self.read_u64()?;
                 let tag = self.read_u16()?;
                 let payload = self.read_u64()?;
                 Ok(Value::Message(super::value::Message {
                     sender,
+                    reply_cap,
                     request_id,
                     tag,
                     payload,
                 }))
             }
+            6 => Ok(Value::Cap(self.read_u64()?)),
+            7 => {
+                let bytes = self.read_blob("str")?;
+                let s = std::str::from_utf8(bytes).map_err(|_| FormatError::BadUtf8)?;
+                Ok(Value::str(s))
+            }
+            8 => Ok(Value::bytes(self.read_blob("bytes")?)),
             tag => Err(FormatError::UnknownValueTag(tag)),
         }
+    }
+
+    fn read_blob(&mut self, what: &'static str) -> Result<&'a [u8], FormatError> {
+        let len = self.read_u32()?;
+        if len > MAX_BLOB {
+            return Err(FormatError::LimitExceeded { what, got: len });
+        }
+        self.take(len as usize)
     }
 }
 
@@ -294,6 +331,22 @@ mod tests {
             decoded.constants[0],
             Value::Message(Message::new(1, 2, 3, 4))
         );
+    }
+
+    #[test]
+    fn roundtrip_preserves_str_and_bytes_constants() {
+        let mut b = ChunkBuilder::new("blob-const");
+        b.begin_function("main", 0, 2);
+        let ks = b.const_(Value::str("olá"));
+        let kb = b.const_(Value::bytes([0u8, 255, 7]));
+        b.emit_load_const(0, ks);
+        b.emit_load_const(1, kb);
+        b.emit_return(0);
+        let original = b.finish();
+        let decoded = decode(&encode(&original)).expect("decode");
+        assert_eq!(decoded.constants, original.constants);
+        assert_eq!(decoded.constants[0].as_str(), Some("olá"));
+        assert_eq!(decoded.constants[1].as_bytes(), Some(&[0, 255, 7][..]));
     }
 
     #[test]

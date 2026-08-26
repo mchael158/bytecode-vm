@@ -1,15 +1,16 @@
-//! Two virtual processes, one mailbox round-trip.
+//! Two flows, one Atomic Hop round-trip (`Value::Message`).
 //!
 //! ```text
 //! cargo run -p byteflow-actors --example ping_pong
 //! ```
 
-use byteflow::{samples, ProcessOutcome, Runtime, RuntimeConfig, Value};
+use byteflow::{samples, std_native_table, FlowOutcome, Runtime, RuntimeConfig, Value};
 
 fn main() {
     let chunk = samples::ping_pong();
-    let rt = match Runtime::with_config(
+    let rt = match Runtime::with_natives_and_config(
         chunk,
+        std_native_table(),
         RuntimeConfig {
             workers: 1,
             quantum: 10_000,
@@ -37,8 +38,8 @@ fn main() {
     rt.shutdown();
 
     match outcome {
-        ProcessOutcome::Completed(Value::Int(2)) => {
-            println!("pong replied 2");
+        FlowOutcome::Completed(Value::Int(2)) => {
+            println!("pong replied 2 (Atomic Hop)");
             println!("{metrics}");
         }
         other => {

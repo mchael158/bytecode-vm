@@ -12,43 +12,41 @@ use super::fault::Fault;
 /// or exhausts its instruction budget — then hands one of these back and
 /// stops. That separation is what lets `byteflow-scheduler` move a suspended
 /// `Vm` between worker threads freely: it's just a value sitting in a
-/// `Process`.
+/// `Flow`.
 #[derive(Debug)]
 pub enum VmResult {
-    /// The outermost frame returned/exited. The process should terminate
-    /// with this value delivered to `ProcessHandle::join`.
+    /// The outermost frame returned/exited. The Flow should terminate
+    /// with this value delivered to `FlowHandle::join`.
     Complete(Value),
     /// Cooperative yield or instruction-budget exhaustion. Re-enqueue as
     /// `Ready` on any worker; resuming picks up at the saved `pc` with no
     /// register writeback needed.
     Yield,
-    /// `Sleep` opcode. Register the process on the timer wheel; resume with
+    /// `Sleep` opcode. Register the Flow on the timer wheel; resume with
     /// a plain `run()` call (no writeback) once it elapses.
     Sleep(Duration),
-    /// `Spawn` opcode. The scheduler creates a new `Process` from
-    /// `function` with `args` in the same chunk and must call
-    /// [`crate::Vm::resume_with`]`(dest_reg, Value::Pid(new_id))` before the
-    /// next `run()`.
+    /// `Spawn` — create a child flow; parent receives a **Cap** (`SEND|ASK`).
     Spawn {
         function: u32,
         args: Vec<Value>,
         dest_reg: u8,
     },
-    /// `SelfPid` opcode. The scheduler writes this process's Pid into
-    /// `dest_reg` via [`crate::Vm::resume_with`] and continues.
+    /// `SelfPid` — write a **self Cap** (`SEND|ASK`) into `dest_reg`.
     SelfPid { dest_reg: u8 },
-    /// `Send` opcode; fire-and-forget. The scheduler delivers `message` to
-    /// `target`'s mailbox (waking it if it was `Waiting` on `Receive`) and
-    /// then simply calls `run()` again — no writeback.
-    Send { target: u64, message: Value },
-    /// `Receive`/`ReceiveTimeout` opcode. If the process's mailbox has a
-    /// message, the scheduler must call `resume_with(dest_reg, message)`. If
-    /// not, it transitions the process to `Waiting` (optionally also
-    /// registering `timeout` on the timer wheel) until a `Send` arrives.
+    /// `Send` — Atomic Hop to a **capability** target (requires SEND).
+    Send { target_cap: u64, message: Value },
+    /// `Receive` / `ReceiveTimeout` / `ReceiveMatch` / `ReceiveMatchImm`.
     Receive {
         dest_reg: u8,
         timeout: Option<Duration>,
+        match_tag: Option<u16>,
     },
-    /// A fault occurred; the process fails. See [`Fault`].
+    /// `Ask` — RPC hop to a **capability** target (requires ASK).
+    Ask {
+        dest_reg: u8,
+        target_cap: u64,
+        request: Value,
+    },
+    /// A fault occurred; the Flow fails. See [`Fault`].
     Trap(Fault),
 }

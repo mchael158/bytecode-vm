@@ -129,12 +129,14 @@ impl ChunkBuilder {
         self.emit(Instruction::abc(Opcode::Exit, reg, 0, 0));
     }
 
+    /// Write a **self Cap** (`SEND|ASK`) into `dst` (opcode still named `SelfPid`).
     pub fn emit_self_pid(&mut self, dst: u8) {
         self.emit(Instruction::abc(Opcode::SelfPid, dst, 0, 0));
     }
 
-    pub fn emit_send(&mut self, target_pid_reg: u8, msg_reg: u8) {
-        self.emit(Instruction::abc(Opcode::Send, target_pid_reg, msg_reg, 0));
+    /// Fire-and-forget Atomic Hop: `r[target_cap_reg]` must be Cap; `r[msg_reg]` Message.
+    pub fn emit_send(&mut self, target_cap_reg: u8, msg_reg: u8) {
+        self.emit(Instruction::abc(Opcode::Send, target_cap_reg, msg_reg, 0));
     }
 
     pub fn emit_receive(&mut self, dst: u8) {
@@ -143,6 +145,27 @@ impl ChunkBuilder {
 
     pub fn emit_receive_timeout(&mut self, dst: u8, millis_reg: u8) {
         self.emit(Instruction::abc(Opcode::ReceiveTimeout, dst, millis_reg, 0));
+    }
+
+    /// Selective Atomic Hop: wait for `Message` with `tag == r[tag_reg]`.
+    pub fn emit_receive_match(&mut self, dst: u8, tag_reg: u8) {
+        self.emit(Instruction::abc(Opcode::ReceiveMatch, dst, tag_reg, 0));
+    }
+
+    /// Selective Atomic Hop with an immediate `u16` tag.
+    pub fn emit_receive_match_imm(&mut self, dst: u8, tag: u16) {
+        self.emit(Instruction::a_imm(Opcode::ReceiveMatchImm, dst, i32::from(tag)));
+    }
+
+    /// Atomic request/reply hop: deliver `r[msg_reg]` to `r[target_cap_reg]` (Cap),
+    /// then wait for a correlated reply into `dst`.
+    ///
+    /// Encoding: `Ask ra, rb, rc` → `a=dest`, `b=target Cap`, `c=request Message`.
+    ///
+    /// The worker authenticates the request (`sender` + `reply_cap`) before delivery
+    /// and completes only when the reply’s `sender` equals the **resolved FlowId**.
+    pub fn emit_ask(&mut self, dest: u8, target_cap_reg: u8, msg_reg: u8) {
+        self.emit(Instruction::abc(Opcode::Ask, dest, target_cap_reg, msg_reg));
     }
 
     pub fn emit_trap(&mut self, code: i32) {
@@ -155,12 +178,53 @@ impl ChunkBuilder {
 
     /// Emit a call through the runtime's native (FFI) function table
     /// (design notes §30-31). `native_index` is resolved by name against a
-    /// `byteflow_vm::NativeTable` at the call site — this crate has no
+    /// [`crate::NativeTable`] at the call site — the assembler has no
     /// knowledge of what natives exist, on purpose (see
-    /// [`crate::verify::verify`]'s note on why `CallNative` targets aren't
+    /// [`crate::verify`]'s note on why `CallNative` targets aren't
     /// range-checked statically).
     pub fn emit_call_native(&mut self, dst: u8, native_index: u32, argc: u8) {
-        self.emit(Instruction::new(Opcode::CallNative, dst, argc, 0, native_index as i32));
+        self.emit(Instruction::new(
+            Opcode::CallNative,
+            dst,
+            argc,
+            0,
+            native_index as i32,
+        ));
+    }
+
+    /// Move `src` into `dst`, then `CallNative(dst, native_index, 1)`.
+    ///
+    /// # The contract this exists to protect: `CallNative` clobbers its argument
+    ///
+    /// `Opcode::CallNative ra, fb, nc` reads `nc` arguments from
+    /// `r[a..a+nc]` and writes the result back into `r[a]`. For `nc == 1`
+    /// the argument and result are the same slot — calling a one-arg native
+    /// straight on a register you still need destroys it.
+    ///
+    /// The textbook case is unpacking several fields from one `Message` in
+    /// `r0` (`msg_sender`, `msg_tag`, …). `emit_native1_from` always operates
+    /// on a **copy** (`dst`), so `src` survives:
+    ///
+    /// ```text
+    /// b.emit_native1_from(1, 0, native_msg_sender);   // r1 = sender(r0)
+    /// b.emit_native1_from(2, 0, native_msg_request_id);
+    /// ```
+    ///
+    /// If you don't need `src` afterwards, call `emit_call_native` directly —
+    /// the `Move` would be pure overhead. See [`crate::emit_native1_from`] for
+    /// the macro-sugar form that forwards here.
+    pub fn emit_native1_from(&mut self, dst: u8, src: u8, native_index: u32) {
+        self.emit_move(dst, src);
+        self.emit_call_native(dst, native_index, 1);
+    }
+
+    /// `CallNative(base, native_index, argc)` when `argc` args are **already**
+    /// contiguous at `r[base..base+argc]`.
+    ///
+    /// No behavior beyond [`Self::emit_call_native`] — exists so the call site
+    /// reads as "args already packed". See [`crate::emit_native_n`].
+    pub fn emit_native_n(&mut self, base: u8, native_index: u32, argc: u8) {
+        self.emit_call_native(base, native_index, argc);
     }
 
     pub fn emit_return(&mut self, reg: u8) {
@@ -222,5 +286,61 @@ impl ChunkBuilder {
             code: self.code,
             functions: self.functions,
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emit_native1_from_never_clobbers_source_register() {
+        let mut b = ChunkBuilder::new("clobber-test");
+        b.begin_function("main", 0, 8);
+        b.emit_native1_from(1, 0, 10);
+        b.emit_native1_from(2, 0, 11);
+        b.emit_native1_from(3, 0, 12);
+        let chunk = b.finish();
+
+        assert_eq!(chunk.code.len(), 6);
+        for (move_idx, call_idx, expected_native) in
+            [(0usize, 1usize, 10i32), (2, 3, 11), (4, 5, 12)]
+        {
+            assert_eq!(chunk.code[move_idx].op, Opcode::Move);
+            assert_eq!(chunk.code[move_idx].b, 0);
+            assert_eq!(chunk.code[call_idx].op, Opcode::CallNative);
+            assert_ne!(chunk.code[call_idx].a, 0);
+            assert_eq!(chunk.code[call_idx].imm, expected_native);
+        }
+    }
+
+    #[test]
+    fn emit_native_n_is_a_plain_call_native_with_no_extra_instructions() {
+        let mut b = ChunkBuilder::new("native-n-test");
+        b.begin_function("main", 0, 8);
+        b.emit_load_imm(1, 7);
+        b.emit_load_imm(2, 1);
+        b.emit_native_n(1, 99, 2);
+        let chunk = b.finish();
+
+        assert_eq!(chunk.code.len(), 3);
+        assert_eq!(chunk.code[2].op, Opcode::CallNative);
+        assert_eq!(chunk.code[2].a, 1);
+        assert_eq!(chunk.code[2].b, 2);
+        assert_eq!(chunk.code[2].imm, 99);
+    }
+
+    #[test]
+    fn macro_forms_produce_identical_bytecode_to_the_methods() {
+        let mut via_method = ChunkBuilder::new("via-method");
+        via_method.begin_function("main", 0, 8);
+        via_method.emit_native1_from(1, 0, 10);
+        via_method.emit_native_n(1, 99, 2);
+
+        let mut via_macro = ChunkBuilder::new("via-macro");
+        via_macro.begin_function("main", 0, 8);
+        crate::emit_native1_from!(via_macro, 1, 0, 10);
+        crate::emit_native_n!(via_macro, 1, 99, 2);
+
+        assert_eq!(via_method.finish().code, via_macro.finish().code);
     }
 }

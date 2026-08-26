@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use byteflow::samples::{self, add_forty_two, ping_pong};
 use byteflow::{
-    decode, disassemble, encode, std_native_table, verify, NativeTable, ProcessOutcome, Runtime,
+    decode, disassemble, encode, std_native_table, verify, NativeTable, FlowOutcome, Runtime,
     RuntimeConfig,
 };
 
@@ -67,14 +67,14 @@ fn print_help() {
 byteflow — verify, disassemble and run .bf modules (assembled via ChunkBuilder)
 
 USAGE:
-    byteflow demo [ping-pong|add]
-    byteflow pack  <ping-pong|add> <out.bf>
+    byteflow demo [ping-pong|atomic|selective|ask|add]
+    byteflow pack  <ping-pong|atomic|add> <out.bf>
     byteflow verify <file.bf>
     byteflow disasm <file.bf>
     byteflow run    <file.bf> [function]
 
-`run` attaches the std native table (print=0, now_ms=1, make_msg=2, …) so modules
-that CallNative those indices work. Demos that never call natives use an empty table.
+`run` and hop demos attach the std native table (print=0, now_ms=1, make_msg=2, …, msg_reply_cap=7).
+Every `Send` is an Atomic Hop (`Value::Message` only).
 "
     );
 }
@@ -137,16 +137,25 @@ fn cmd_pack(demo: &str, out: &str) -> Result<(), ()> {
 
 fn cmd_demo(name: &str) -> Result<(), ()> {
     let chunk = demo_chunk(name)?;
-    run_chunk(&chunk, Some("main"), NativeTable::empty())
+    // Atomic Hop demos (`ping-pong`) need make_msg / msg_*; `add` does not.
+    let natives = match name {
+        "ping-pong" | "ping_pong" | "atomic" | "atomic-request-reply"
+        | "selective" | "selective-receive" | "ask" | "ask-reply" => std_native_table(),
+        _ => NativeTable::empty(),
+    };
+    run_chunk(&chunk, Some("main"), natives)
 }
 
 fn demo_chunk(name: &str) -> Result<byteflow::Chunk, ()> {
     match name {
         "ping-pong" | "ping_pong" => Ok(ping_pong()),
+        "atomic" | "atomic-request-reply" => Ok(samples::atomic_request_reply()),
+        "selective" | "selective-receive" => Ok(samples::selective_receive()),
+        "ask" | "ask-reply" => Ok(samples::ask_reply()),
         "add" | "add-forty-two" | "42" => Ok(add_forty_two()),
         "boom" => Ok(samples::boom()),
         other => {
-            eprintln!("unknown demo {other:?} (try ping-pong, add)");
+            eprintln!("unknown demo {other:?} (try ping-pong, atomic, selective, ask, add)");
             Err(())
         }
     }
@@ -190,9 +199,9 @@ fn run_chunk(
     rt.shutdown();
 
     match outcome {
-        ProcessOutcome::Completed(v) => println!("{v}"),
-        ProcessOutcome::Failed(err) => {
-            eprintln!("process failed: {err}");
+        FlowOutcome::Completed(v) => println!("{v}"),
+        FlowOutcome::Failed(err) => {
+            eprintln!("Flow failed: {err}");
             eprintln!("{metrics}");
             return Err(());
         }

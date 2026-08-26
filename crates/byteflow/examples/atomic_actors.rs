@@ -1,7 +1,7 @@
-//! Atomic actors: one [`byteflow::Value::Message`] per request/reply hop.
+//! Atomic Hop: one [`byteflow::Value::Message`] per request/reply hop.
 //!
 //! This is the runnable counterpart of `samples::atomic_request_reply` and
-//! `docs/atomic-actors.md`. It wires the std native table (needed for
+//! `docs/atomic-hop.md`. It wires the std native table (needed for
 //! `make_msg` / `msg_*` / `print`) and joins until the client returns
 //! payload `42`.
 //!
@@ -16,7 +16,7 @@
 //! Failures from `Runtime::…` / `spawn` are printed and exit non-zero —
 //! matching the fail-closed host API (no `.expect` on the happy path).
 
-use byteflow::{samples, std_native_table, ProcessOutcome, Runtime, RuntimeConfig, Value};
+use byteflow::{samples, std_native_table, FlowOutcome, Runtime, RuntimeConfig, Value};
 
 fn main() {
     let chunk = samples::atomic_request_reply();
@@ -50,7 +50,7 @@ fn main() {
     rt.shutdown();
 
     match outcome {
-        ProcessOutcome::Completed(Value::Int(42)) => {
+        FlowOutcome::Completed(Value::Int(42)) => {
             println!("atomic request-reply ok: payload=42");
             println!("{metrics}");
         }

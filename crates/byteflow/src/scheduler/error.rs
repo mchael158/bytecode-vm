@@ -5,7 +5,7 @@
 //! | Kind | Example | Surface |
 //! |------|---------|---------|
 //! | A — user / API | `spawn` bad function index | `Result<_, SpawnError>` |
-//! | B — process | `HwError`, native fault | `ProcessOutcome::Failed` → Supervisor |
+//! | B — flow | `HwError`, native fault | `FlowOutcome::Failed` → Supervisor |
 //! | C — infrastructure | mutex poison, dead worker | [`RuntimeError`] + fail-closed |
 //! | D — invariant | empty frame stack while running | types / `debug_assert` — not `unwrap` |
 //!
@@ -15,10 +15,10 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Count of infrastructure faults observed since process start (Relaxed).
+/// Count of infrastructure faults observed since flow start (Relaxed).
 static FAULTS: AtomicU64 = AtomicU64::new(0);
 
-/// Scheduler / host infrastructure error — not a bytecode process fault.
+/// Scheduler / host infrastructure error — not a bytecode flow fault.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
     /// A `Mutex` was poisoned: another thread panicked while holding it.

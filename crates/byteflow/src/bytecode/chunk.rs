@@ -9,8 +9,10 @@ pub const MAGIC: [u8; 4] = *b"BFV0";
 /// Current ABI version. Bump on any breaking change to instruction
 /// encoding, constant representation, or function-table layout.
 ///
-/// v2: adds [`super::value::Value::Message`] wire tag `5` (actor envelopes).
-pub const ABI_VERSION: u32 = 2;
+/// v2: [`Value::Message`] wire tag `5`.
+/// v3: `Message.reply_cap`; [`Value::Cap`] wire tag `6` (FlowCap).
+/// v4: [`Value::Str`] tag `7`, [`Value::Bytes`] tag `8`.
+pub const ABI_VERSION: u32 = 4;
 
 /// A callable entry point inside a [`Chunk`]: either bytecode-defined or a
 /// slot reserved for a native (Rust) function registered with the runtime
@@ -30,7 +32,7 @@ pub struct FunctionDef {
 /// A compiled unit of Byteflow bytecode: code, constants and the function
 /// table. One `Chunk` can back many concurrently-running processes — it is
 /// immutable after construction, so it is shared behind an `Arc` rather than
-/// copied per process (see `byteflow-vm::Vm::chunk`).
+/// copied per Flow (see `byteflow-vm::Vm::chunk`).
 #[derive(Clone, Debug, Default)]
 pub struct Chunk {
     pub name: String,

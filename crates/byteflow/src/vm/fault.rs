@@ -1,14 +1,14 @@
 use std::fmt;
 
-/// Anything that can go wrong *inside* a running process's VM.
+/// Anything that can go wrong *inside* a running Flow's VM.
 ///
 /// A `Fault` is never a Rust panic — panics are reserved for genuine host
 /// bugs and are caught at the worker boundary (see
-/// `byteflow-scheduler::worker::run_worker`) precisely so that one process's
+/// `byteflow-scheduler::worker::run_worker`) precisely so that one Flow's
 /// bug (division by zero, a corrupt jump target that slipped past the
 /// verifier, an out-of-range register) can never take down a worker thread,
 /// let alone the whole runtime. A `Fault` instead becomes
-/// `ProcessState::Failed` and is handed to the process's supervisor, which
+/// `FlowState::Failed` and is handed to the Flow's supervisor, which
 /// decides whether to restart it (design notes §15-16).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Fault {
@@ -36,7 +36,7 @@ pub enum Fault {
     /// Explicit `Trap` opcode, e.g. an assertion emitted by a compiler.
     Explicit(i32),
     /// Broken VM invariant (e.g. empty frame stack while running). Category D
-    /// in the error model — surfaced as a process fault, never as `unwrap`.
+    /// in the error model — surfaced as a Flow fault, never as `unwrap`.
     Invariant(&'static str),
 }
 

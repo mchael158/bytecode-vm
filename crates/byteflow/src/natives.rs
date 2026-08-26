@@ -21,11 +21,12 @@
 //! |------:|------|------|
 //! | 0 | `print` | host stdout log line (actor-visible) |
 //! | 1 | `now_ms` | wall-clock millis as `Value::Int` |
-//! | 2 | `make_msg` | build [`crate::Message`] from four scalars |
-//! | 3 | `msg_sender` | extract `sender` → `Value::Pid` |
+//! | 2 | `make_msg` | build [`crate::Message`] from four scalars (**untrusted** `sender`) |
+//! | 3 | `msg_sender` | extract `sender` → `Value::Pid` (authenticated **after** delivery) |
 //! | 4 | `msg_request_id` | extract `request_id` → `Value::Int` |
 //! | 5 | `msg_tag` | extract `tag` → `Value::Int` |
 //! | 6 | `msg_payload` | extract `payload` → `Value::Int` |
+//! | 7 | `msg_reply_cap` | extract `reply_cap` → `Value::Cap` (SEND grant) |
 //!
 //! # `CallNative` argument layout
 //!
@@ -56,6 +57,7 @@ pub fn std_native_map() -> HashMap<String, u32> {
         ("msg_request_id".to_owned(), 4),
         ("msg_tag".to_owned(), 5),
         ("msg_payload".to_owned(), 6),
+        ("msg_reply_cap".to_owned(), 7),
     ])
 }
 
@@ -91,8 +93,24 @@ pub fn std_native_table() -> Arc<NativeTable> {
             Ok(Value::Int(millis))
         })
         .register("make_msg", |args| {
-            // Args: sender, request_id, tag, payload — each Int≥0, Pid, or Bool.
+            // Args: sender, request_id, tag, payload — each Int≥0, Pid, Cap, or Bool.
             // Tag must fit `u16` (protocol discriminator width on the wire).
+            //
+            // # Security (crates.io contract)
+            //
+            // The first argument is retained so existing `.bf` modules and
+            // samples keep a stable CallNative layout (indices 0–6 frozen;
+            // 7 = msg_reply_cap appended). It is **not** an authentication
+            // primitive:
+            //
+            // - Before `Send` / `Ask`, `sender` is ordinary register data.
+            // - At delivery, the worker stamps `Message.sender` and mints
+            //   `reply_cap` (`Message::authenticate`).
+            // - After a hop is received, `msg_sender` / `msg_reply_cap`
+            //   reflect runtime identity and the SEND grant (S1 + FlowCap).
+            //
+            // Host code that only builds messages in memory (never sends)
+            // still sees the constructed field unchanged.
             let sender = expect_u64(args, 0, "make_msg")?;
             let request_id = expect_u64(args, 1, "make_msg")?;
             let tag = expect_u64(args, 2, "make_msg")?;
@@ -103,7 +121,8 @@ pub fn std_native_table() -> Arc<NativeTable> {
             Ok(Value::Message(Message::new(sender, request_id, tag, payload)))
         })
         .register("msg_sender", |args| {
-            // Return Pid so the next `Send` can use the register directly.
+            // After mailbox delivery this is the runtime-stamped origin.
+            // Identity only — not a Send/Ask address (use `msg_reply_cap`).
             Ok(Value::Pid(expect_message(args, 0, "msg_sender")?.sender))
         })
         .register("msg_request_id", |args| {
@@ -119,6 +138,11 @@ pub fn std_native_table() -> Arc<NativeTable> {
         .register("msg_payload", |args| {
             Ok(Value::Int(
                 expect_message(args, 0, "msg_payload")?.payload as i64,
+            ))
+        })
+        .register("msg_reply_cap", |args| {
+            Ok(Value::Cap(
+                expect_message(args, 0, "msg_reply_cap")?.reply_cap,
             ))
         })
         .build()
@@ -152,12 +176,13 @@ mod tests {
         assert_eq!(map["msg_request_id"], 4);
         assert_eq!(map["msg_tag"], 5);
         assert_eq!(map["msg_payload"], 6);
+        assert_eq!(map["msg_reply_cap"], 7);
     }
 
     #[test]
     fn std_native_table_matches_map() {
         let (table, map) = std_natives();
-        assert_eq!(table.len(), 7);
+        assert_eq!(table.len(), 8);
         for (name, idx) in &map {
             assert_eq!(table.index_of(name), Some(*idx));
         }
@@ -199,6 +224,10 @@ mod tests {
             table.get(6).unwrap()(std::slice::from_ref(&msg)).unwrap(),
             Value::Int(42)
         );
+        assert_eq!(
+            table.get(7).unwrap()(std::slice::from_ref(&msg)).unwrap(),
+            Value::Cap(0)
+        );
     }
 
     #[test]
@@ -212,6 +241,9 @@ mod tests {
             Value::Float(1.5),
             Value::Pid(7),
             Value::Message(Message::new(1, 2, 3, 4)),
+            Value::Cap(9),
+            Value::str("hello"),
+            Value::bytes([1u8, 2, 3]),
         ];
         assert_eq!(print(&values).unwrap(), Value::Unit);
     }

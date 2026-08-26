@@ -64,7 +64,15 @@ impl fmt::Display for Instruction {
                 self.op, self.a, self.imm, self.b
             ),
             Opcode::Send => write!(f, "{} r{}, r{}", self.op, self.a, self.b),
-            Opcode::ReceiveTimeout => write!(f, "{} r{}, r{}", self.op, self.a, self.b),
+            Opcode::ReceiveTimeout | Opcode::ReceiveMatch => {
+                write!(f, "{} r{}, r{}", self.op, self.a, self.b)
+            }
+            Opcode::ReceiveMatchImm => write!(f, "{} r{}, tag={}", self.op, self.a, self.imm),
+            Opcode::Ask => write!(
+                f,
+                "{} r{}, r{}, r{}",
+                self.op, self.a, self.b, self.c
+            ),
             Opcode::Trap => write!(f, "{} {}", self.op, self.imm),
         }
     }

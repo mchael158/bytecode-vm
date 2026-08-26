@@ -1,4 +1,4 @@
-//! Register-based interpreter for one virtual process.
+//! Register-based interpreter for one virtual Flow.
 //! Scheduler effects return as [`VmResult`].
 
 mod fault;

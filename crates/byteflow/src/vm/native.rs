@@ -3,8 +3,8 @@
 //! # The one rule: never block
 //!
 //! `CallNative` runs **inline** on the worker thread. A native that blocks
-//! stalls every other process on that worker. Slow I/O belongs in a dedicated
-//! process (`Send`/`Receive`), not here.
+//! stalls every other Flow on that worker. Slow I/O belongs in a dedicated
+//! Flow (`Send`/`Receive`), not here.
 
 use std::sync::Arc;
 
@@ -172,7 +172,7 @@ pub fn expect_bool(args: &[Value], index: usize, fn_name: &str) -> Result<bool, 
 /// Require `args[index]` to be a [`crate::Message`].
 ///
 /// Used by the std `msg_*` natives. A wrong type becomes
-/// [`Fault::NativeError`] (category B — process fault), not a host panic.
+/// [`Fault::NativeError`] (category B — Flow fault), not a host panic.
 pub fn expect_message(
     args: &[Value],
     index: usize,
@@ -185,18 +185,19 @@ pub fn expect_message(
         })
 }
 
-/// Coerce `args[index]` to `u64` from `Int` (≥ 0), `Pid`, or `Bool`.
+/// Coerce `args[index]` to `u64` from `Int` (≥ 0), `Pid`, `Cap`, or `Bool`.
 ///
-/// `make_msg` accepts any of these so bytecode can pass a `SelfPid` result
-/// (a `Pid`) or a `LoadImm` (an `Int`) without an extra conversion opcode.
+/// `make_msg` accepts these so bytecode can pass a `SelfPid` / Spawn Cap
+/// result, a `Pid` identity, or a `LoadImm` without an extra conversion.
 /// Negative ints are rejected — envelope fields are unsigned on the wire.
 pub fn expect_u64(args: &[Value], index: usize, fn_name: &str) -> Result<u64, Fault> {
     match expect_arg(args, index, fn_name)? {
         Value::Pid(p) => Ok(*p),
+        Value::Cap(c) => Ok(*c),
         Value::Int(i) if *i >= 0 => Ok(*i as u64),
         Value::Bool(b) => Ok(u64::from(*b)),
         other => Err(Fault::NativeError(format!(
-            "{fn_name}: argument {index} is not a non-negative int/pid (got {})",
+            "{fn_name}: argument {index} is not a non-negative int/pid/cap (got {})",
             other.type_name()
         ))),
     }

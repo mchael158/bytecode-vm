@@ -1,39 +1,83 @@
+//! Worker threads: drive flows, apply scheduler effects, enforce hop identity
+//! and **FlowCap** resolution.
+//!
+//! # Authenticated Atomic Hop + capabilities
+//!
+//! Before mailbox delivery, outgoing hops are stamped (`Message.sender`) and
+//! granted a **SEND**-only `reply_cap`. `Send` / `Ask` resolve
+//! [`Value::Cap`] through [`CapTable`](super::capability::CapTable); raw
+//! [`Value::Pid`] is not an address.
+
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bytecode::Value;
+use crate::bytecode::{Message, Value};
 use crate::log;
 use crate::vm::VmResult;
 use crossbeam_deque::{Steal, Worker as LocalDeque};
 
+use super::capability::{CapId, CapRights};
 use super::error::report_fault;
-use super::mailbox::Delivery;
+use super::mailbox::{Delivery, WaitFilter};
 use super::metrics::RuntimeMetrics;
-use super::process::{Process, ProcessId, ProcessOutcome};
-use super::runtime::{pid_from_u64, spawn_on, wake_workers, Shared};
+use super::process::{Flow, FlowId, FlowOutcome};
+use super::runtime::{spawn_on, wake_workers, Shared};
 use super::sync_lock;
 
-/// Worker main loop. Panics inside a process are caught here so one
-/// process's bug cannot take the OS thread down (see `Fault` docs).
-pub fn run_worker(shared: Arc<Shared>, local: LocalDeque<Box<Process>>) {
+/// S1 + reply grant: single choke-point before mailbox `push` on bytecode hops.
+///
+/// `Message.sender` / `reply_cap` are register/native data until this call.
+/// The scheduler owns the executing flow’s identity and **assigns** both:
+/// it does not “check equality” against forgeable fields (wrong security
+/// primitive). Every future opcode that delivers a [`Message`] must call
+/// this (or equivalent); do not duplicate ad-hoc stamp assignments elsewhere.
+fn authenticate_outgoing_message(
+    shared: &Shared,
+    current_flow: FlowId,
+    message: Message,
+) -> Result<Message, String> {
+    let reply = shared
+        .caps
+        .mint(current_flow, CapRights::SEND)
+        .map_err(|e| e.to_string())?;
+    Ok(message.authenticate(current_flow.as_u64(), reply.as_u64()))
+}
+
+/// Resolve `CapId` and require `need` rights. Returns target [`FlowId`].
+///
+/// Fail-closed: unknown Cap, revoked Cap, or insufficient rights → error
+/// string (worker finishes the flow). Never treat CapId as FlowId.
+fn resolve_cap(shared: &Shared, raw: u64, need: CapRights) -> Result<FlowId, String> {
+    let id = CapId(raw);
+    match shared.caps.resolve(id) {
+        Ok(Some(entry)) if entry.rights.contains(need) => Ok(entry.flow),
+        Ok(Some(_)) => Err(format!("capability {id} lacks required rights")),
+        Ok(None) => Err(format!("unknown or revoked capability {id}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Worker main loop. Panics inside a flow are caught here so one
+/// flow's bug cannot take the OS thread down (see `Fault` docs).
+pub fn run_worker(shared: Arc<Shared>, local: LocalDeque<Box<Flow>>) {
     while !shared.shutdown.load(Ordering::Acquire) {
         match find_work(&shared, &local) {
-            Some(process) => drive_process(&shared, &local, process),
+            Some(flow) => drive_process(&shared, &local, flow),
             None => wait_for_work(&shared),
         }
     }
 }
 
-fn find_work(shared: &Shared, local: &LocalDeque<Box<Process>>) -> Option<Box<Process>> {
-    if let Some(process) = local.pop() {
-        return Some(process);
+fn find_work(shared: &Shared, local: &LocalDeque<Box<Flow>>) -> Option<Box<Flow>> {
+    if let Some(flow) = local.pop() {
+        return Some(flow);
     }
 
     loop {
         match shared.injector.steal() {
-            Steal::Success(process) => return Some(process),
+            Steal::Success(flow) => return Some(flow),
             Steal::Empty => break,
             Steal::Retry => continue,
         }
@@ -42,9 +86,9 @@ fn find_work(shared: &Shared, local: &LocalDeque<Box<Process>>) -> Option<Box<Pr
     for stealer in &shared.stealers {
         loop {
             match stealer.steal() {
-                Steal::Success(process) => {
+                Steal::Success(flow) => {
                     RuntimeMetrics::inc(&shared.metrics.steals);
-                    return Some(process);
+                    return Some(flow);
                 }
                 Steal::Empty => break,
                 Steal::Retry => continue,
@@ -76,13 +120,13 @@ fn wait_for_work(shared: &Shared) {
 
 fn drive_process(
     shared: &Arc<Shared>,
-    local: &LocalDeque<Box<Process>>,
-    mut process: Box<Process>,
+    local: &LocalDeque<Box<Flow>>,
+    mut flow: Box<Flow>,
 ) {
-    if let Some(msg) = process.pending_message.take() {
-        if let Some(dest) = process.last_receive_dest {
-            let _ = process.vm.resume_with(dest, msg);
-            process
+    if let Some(msg) = flow.pending_message.take() {
+        if let Some(dest) = flow.last_receive_dest {
+            let _ = flow.vm.resume_with(dest, msg);
+            flow
                 .metrics
                 .messages_received
                 .fetch_add(1, Ordering::Relaxed);
@@ -91,47 +135,53 @@ fn drive_process(
 
     loop {
         if shared.shutdown.load(Ordering::Acquire) {
-            local.push(process);
+            local.push(flow);
             return;
         }
 
-        let ran = panic::catch_unwind(AssertUnwindSafe(|| process.vm.run(shared.quantum)));
-        process
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| flow.vm.run(shared.quantum)));
+        flow
             .metrics
             .instructions
-            .store(process.vm.instructions_executed(), Ordering::Relaxed);
+            .store(flow.vm.instructions_executed(), Ordering::Relaxed);
 
         let result = match ran {
             Ok(r) => r,
             Err(_) => {
-                finish_failed(shared, *process, "process panicked".into());
+                finish_failed(shared, *flow, "flow panicked".into());
                 return;
             }
         };
 
         match result {
             VmResult::Complete(value) => {
-                finish_ok(shared, *process, value);
+                finish_ok(shared, *flow, value);
                 return;
             }
             VmResult::Trap(fault) => {
-                finish_failed(shared, *process, fault.to_string());
+                finish_failed(shared, *flow, fault.to_string());
                 return;
             }
             VmResult::Yield => {
                 RuntimeMetrics::inc(&shared.metrics.reschedules);
-                process.metrics.reschedules.fetch_add(1, Ordering::Relaxed);
-                local.push(process);
+                flow.metrics.reschedules.fetch_add(1, Ordering::Relaxed);
+                local.push(flow);
                 return;
             }
             VmResult::Sleep(delay) => {
-                shared.timer.schedule_sleep(delay, process);
+                shared.timer.schedule_sleep(delay, flow);
                 return;
             }
             VmResult::SelfPid { dest_reg } => {
-                let _ = process
-                    .vm
-                    .resume_with(dest_reg, Value::Pid(process.id.as_u64()));
+                match shared.caps.mint(flow.id, CapRights::SEND_ASK) {
+                    Ok(cap) => {
+                        let _ = flow.vm.resume_with(dest_reg, Value::Cap(cap.as_u64()));
+                    }
+                    Err(e) => {
+                        finish_failed(shared, *flow, e.to_string());
+                        return;
+                    }
+                }
             }
             VmResult::Spawn {
                 function,
@@ -140,66 +190,180 @@ fn drive_process(
             } => {
                 match spawn_on(
                     shared,
-                    &process.vm.chunk_arc(),
-                    &process.vm.natives_arc(),
+                    &flow.vm.chunk_arc(),
+                    &flow.vm.natives_arc(),
                     function,
                     &args,
-                    process.restart_policy,
+                    flow.restart_policy,
                     None,
                 ) {
                     Ok(child) => {
+                        let child_id = child.id();
                         log::info(format!(
-                            "spawn parent=pid#{} child=pid#{} fn={}",
-                            process.id.as_u64(),
-                            child.id().as_u64(),
+                            "spawn parent=flow#{} child=flow#{} fn={}",
+                            flow.id.as_u64(),
+                            child_id.as_u64(),
                             function
                         ));
-                        let _ = process
-                            .vm
-                            .resume_with(dest_reg, Value::Pid(child.id().as_u64()));
+                        match shared.caps.mint(child_id, CapRights::SEND_ASK) {
+                            Ok(cap) => {
+                                let _ = flow.vm.resume_with(dest_reg, Value::Cap(cap.as_u64()));
+                            }
+                            Err(e) => {
+                                finish_failed(shared, *flow, e.to_string());
+                                return;
+                            }
+                        }
                     }
                     Err(e) => {
-                        finish_failed(shared, *process, e.to_string());
+                        finish_failed(shared, *flow, e.to_string());
                         return;
                     }
                 }
             }
-            VmResult::Send { target, message } => {
+            VmResult::Send {
+                target_cap,
+                message,
+            } => {
+                let Some(msg) = message.as_message() else {
+                    finish_failed(
+                        shared,
+                        *flow,
+                        "Send invariant broken: hop is not Value::Message".into(),
+                    );
+                    return;
+                };
+                let target = match resolve_cap(shared, target_cap, CapRights::SEND) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        finish_failed(shared, *flow, e);
+                        return;
+                    }
+                };
+                let stamped = match authenticate_outgoing_message(shared, flow.id, msg) {
+                    Ok(m) => Value::Message(m),
+                    Err(e) => {
+                        finish_failed(shared, *flow, e);
+                        return;
+                    }
+                };
                 RuntimeMetrics::inc(&shared.metrics.messages_sent);
-                process
-                    .metrics
+                flow.metrics
                     .messages_sent
                     .fetch_add(1, Ordering::Relaxed);
                 log::info(format!(
-                    "send from=pid#{} to=pid#{} msg={}",
-                    process.id.as_u64(),
-                    target,
-                    message
+                    "send from=flow#{} to=flow#{} via=cap#{} msg={}",
+                    flow.id.as_u64(),
+                    target.as_u64(),
+                    target_cap,
+                    stamped
                 ));
-                deliver(shared, local, pid_from_u64(target), message);
+                deliver(shared, local, target, stamped);
             }
-            VmResult::Receive { dest_reg, timeout } => {
-                process.last_receive_dest = Some(dest_reg);
-                match process.mailbox.try_pop() {
+            VmResult::Receive {
+                dest_reg,
+                timeout,
+                match_tag,
+            } => {
+                flow.last_receive_dest = Some(dest_reg);
+                let filter = match match_tag {
+                    None => WaitFilter::Any,
+                    Some(tag) => WaitFilter::Tag(tag),
+                };
+                match flow.mailbox.try_pop_filter(filter) {
                     Ok(Some(msg)) => {
-                        process
-                            .metrics
+                        flow.metrics
                             .messages_received
                             .fetch_add(1, Ordering::Relaxed);
                         log::info(format!(
-                            "recv pid#{} msg={}",
-                            process.id.as_u64(),
+                            "recv flow#{} filter={filter:?} msg={}",
+                            flow.id.as_u64(),
                             msg
                         ));
-                        let _ = process.vm.resume_with(dest_reg, msg);
+                        let _ = flow.vm.resume_with(dest_reg, msg);
                     }
                     Ok(None) => {
                         log::debug(format!(
-                            "park pid#{} waiting mailbox (timeout={:?})",
-                            process.id.as_u64(),
-                            timeout
+                            "park flow#{} waiting mailbox filter={filter:?} timeout={timeout:?}",
+                            flow.id.as_u64(),
                         ));
-                        park_on_mailbox(shared, process, dest_reg, timeout);
+                        park_on_mailbox(shared, flow, dest_reg, timeout, filter);
+                        return;
+                    }
+                    Err(e) => {
+                        report_fault(e);
+                        return;
+                    }
+                }
+            }
+            VmResult::Ask {
+                dest_reg,
+                target_cap,
+                request,
+            } => {
+                let Some(req_msg) = request.as_message() else {
+                    finish_failed(
+                        shared,
+                        *flow,
+                        "Ask invariant broken: request is not Value::Message".into(),
+                    );
+                    return;
+                };
+                let target = match resolve_cap(shared, target_cap, CapRights::ASK) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        finish_failed(shared, *flow, e);
+                        return;
+                    }
+                };
+                let stamped_msg = match authenticate_outgoing_message(shared, flow.id, req_msg) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        finish_failed(shared, *flow, e);
+                        return;
+                    }
+                };
+                let request_id = stamped_msg.request_id;
+                let stamped = Value::Message(stamped_msg);
+                // S2: expect FlowId of the Cap target (not CapId).
+                let filter = WaitFilter::Correlation {
+                    expect_request_id: request_id,
+                    expect_sender: Some(target.as_u64()),
+                };
+                flow.last_receive_dest = Some(dest_reg);
+                RuntimeMetrics::inc(&shared.metrics.messages_sent);
+                flow.metrics
+                    .messages_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                log::info(format!(
+                    "ask from=flow#{} to=flow#{} via=cap#{} req={} wait={filter:?}",
+                    flow.id.as_u64(),
+                    target.as_u64(),
+                    target_cap,
+                    stamped
+                ));
+                // Order: deliver request to *target*, then wait on *our*
+                // mailbox. park_filter re-checks under the same mutex if the
+                // reply raced ahead (anti lost-wakeup on the caller's inbox).
+                deliver(shared, local, target, stamped);
+                match flow.mailbox.try_pop_filter(filter) {
+                    Ok(Some(reply)) => {
+                        flow.metrics
+                            .messages_received
+                            .fetch_add(1, Ordering::Relaxed);
+                        log::info(format!(
+                            "ask-reply ready flow#{} msg={}",
+                            flow.id.as_u64(),
+                            reply
+                        ));
+                        let _ = flow.vm.resume_with(dest_reg, reply);
+                    }
+                    Ok(None) => {
+                        log::debug(format!(
+                            "ask park flow#{} filter={filter:?}",
+                            flow.id.as_u64()
+                        ));
+                        park_on_mailbox(shared, flow, dest_reg, None, filter);
                         return;
                     }
                     Err(e) => {
@@ -214,8 +378,8 @@ fn drive_process(
 
 fn deliver(
     shared: &Arc<Shared>,
-    local: &LocalDeque<Box<Process>>,
-    target: ProcessId,
+    local: &LocalDeque<Box<Flow>>,
+    target: FlowId,
     message: Value,
 ) {
     let mailbox = match shared.directory.lookup(target) {
@@ -228,22 +392,22 @@ fn deliver(
     };
     match mailbox.push(message.clone()) {
         Ok(Delivery::Queued) => {
-            log::debug(format!("deliver queued → pid#{target} msg={message}"));
+            log::debug(format!("deliver queued → flow#{target} msg={message}"));
         }
-        Ok(Delivery::Handoff(mut process)) => {
+        Ok(Delivery::Handoff(mut flow)) => {
             log::debug(format!(
-                "deliver handoff → pid#{} msg={}",
-                process.id.as_u64(),
+                "deliver handoff → flow#{} msg={}",
+                flow.id.as_u64(),
                 message
             ));
-            if let Some(dest) = process.last_receive_dest {
-                let _ = process.vm.resume_with(dest, message);
-                process
+            if let Some(dest) = flow.last_receive_dest {
+                let _ = flow.vm.resume_with(dest, message);
+                flow
                     .metrics
                     .messages_received
                     .fetch_add(1, Ordering::Relaxed);
             }
-            local.push(process);
+            local.push(flow);
             wake_workers(shared);
         }
         Err(e) => report_fault(e),
@@ -252,14 +416,15 @@ fn deliver(
 
 fn park_on_mailbox(
     shared: &Arc<Shared>,
-    process: Box<Process>,
+    flow: Box<Flow>,
     dest_reg: u8,
     timeout: Option<Duration>,
+    filter: WaitFilter,
 ) {
-    let mailbox = process.mailbox.clone();
-    let pid = process.id;
+    let mailbox = flow.mailbox.clone();
+    let pid = flow.id;
 
-    match mailbox.park(process) {
+    match mailbox.park_filter(flow, filter) {
         Ok(Ok(())) => {
             if let Some(delay) = timeout {
                 shared
@@ -267,35 +432,37 @@ fn park_on_mailbox(
                     .schedule_receive_timeout(delay, pid, mailbox, dest_reg);
             }
         }
-        Ok(Err(mut process)) => {
-            if let Some(msg) = process.pending_message.take() {
-                let _ = process.vm.resume_with(dest_reg, msg);
-                process
-                    .metrics
+        Ok(Err(mut flow)) => {
+            if let Some(msg) = flow.pending_message.take() {
+                let _ = flow.vm.resume_with(dest_reg, msg);
+                flow.metrics
                     .messages_received
                     .fetch_add(1, Ordering::Relaxed);
             }
-            shared.injector.push(process);
+            shared.injector.push(flow);
             wake_workers(shared);
         }
         Err(e) => report_fault(e),
     }
 }
 
-fn finish_ok(shared: &Shared, process: Process, value: Value) {
-    finish(shared, process, ProcessOutcome::Completed(value), true);
+fn finish_ok(shared: &Shared, flow: Flow, value: Value) {
+    finish(shared, flow, FlowOutcome::Completed(value), true);
 }
 
-fn finish_failed(shared: &Shared, process: Process, msg: String) {
-    finish(shared, process, ProcessOutcome::Failed(msg), false);
+fn finish_failed(shared: &Shared, flow: Flow, msg: String) {
+    finish(shared, flow, FlowOutcome::Failed(msg), false);
 }
 
-fn finish(shared: &Shared, mut process: Process, outcome: ProcessOutcome, completed: bool) {
+fn finish(shared: &Shared, mut flow: Flow, outcome: FlowOutcome, completed: bool) {
     log::info(format!(
-        "finish pid#{} completed={completed} outcome={outcome:?}",
-        process.id.as_u64()
+        "finish flow#{} completed={completed} outcome={outcome:?}",
+        flow.id.as_u64()
     ));
-    if let Err(e) = shared.directory.unregister(process.id) {
+    if let Err(e) = shared.caps.revoke_target(flow.id) {
+        report_fault(e);
+    }
+    if let Err(e) = shared.directory.unregister(flow.id) {
         report_fault(e);
     }
     if completed {
@@ -303,8 +470,8 @@ fn finish(shared: &Shared, mut process: Process, outcome: ProcessOutcome, comple
     } else {
         RuntimeMetrics::inc(&shared.metrics.processes_failed);
     }
-    if let Some(link) = process.supervisor.take() {
-        link.notify(process.id, outcome.clone());
+    if let Some(link) = flow.supervisor.take() {
+        link.notify(flow.id, outcome.clone());
     }
-    process.complete(outcome);
+    flow.complete(outcome);
 }

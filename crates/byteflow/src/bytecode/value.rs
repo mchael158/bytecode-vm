@@ -1,47 +1,57 @@
 use std::fmt;
+use std::sync::Arc;
 
-/// Fixed-size actor envelope carried in mailboxes and registers.
+/// Fixed-size envelope carried in mailboxes and registers (**Atomic Hop**).
 ///
 /// # Why this exists (request-reply / typed protocols)
 ///
 /// `Receive` delivers a single [`Value`] — not `{sender, Value}`. Without an
-/// envelope, a server process cannot learn who sent a request, and two clients
-/// cannot safely share a `request_id` space. Packing that into one `i64` would
-/// artificially cap PIDs and payloads; a heap-backed blob would force
-/// allocation on every message in a runtime meant for hundreds of thousands
-/// of cheap processes.
+/// envelope, a server flow cannot learn who sent a request, and two clients
+/// cannot safely share a `request_id` space.
 ///
-/// So the core grows **one** generic protocol-agnostic variant:
-/// [`Value::Message`]. Satellite crates (or host code) interpret `tag` /
-/// `payload`; the VM/scheduler never do.
+/// # Security
 ///
-/// Layout is fixed and `Copy` so cloning a register file stays cheap and the
-/// eventual `no_std` MCU path does not need an allocator for messaging.
+/// - **`sender`**: FlowId stamped by the scheduler on bytecode `Send` / `Ask`
+///   (invariant **S1**). Not a capability.
+/// - **`reply_cap`**: CapId minted at the same boundary with **SEND**-only
+///   rights so the recipient can answer without ambient Pid addressing
+///   (phase 2). Zero means “no reply grant” (host-injected hops may omit it).
+///
+/// See `docs/security.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Message {
-    /// Originating process id (`ProcessId` as `u64`), or `0` for host-injected
-    /// events (e.g. a future IRQ pump that is not itself a bytecode process).
+    /// Authenticated origin FlowId (`0` = trusted host / non-flow).
     pub sender: u64,
-    /// Client-chosen correlation token. Unique per outstanding request *for
-    /// that sender*; the server echoes it on the reply.
+    /// Capability granting **SEND** back to [`Self::sender`], or `0`.
+    pub reply_cap: u64,
+    /// Client correlation token; echoed on replies (`Ask` / **S2**).
     pub request_id: u64,
-    /// Protocol discriminator. Core treats this as opaque; the application
-    /// (or a satellite crate) owns the registry of tag meanings.
+    /// Protocol discriminator (opaque to the VM).
     pub tag: u16,
-    /// Protocol payload (ids, flags, small readings, error codes, …).
-    /// Wide enough for a `u64` Pid or a packed small struct; not a substitute
-    /// for large blobs (those stay out of v0).
+    /// Small protocol payload.
     pub payload: u64,
 }
 
 impl Message {
+    /// Build an envelope. `sender` / `reply_cap` are placeholders until a
+    /// bytecode hop is authenticated by the scheduler (`reply_cap` typically
+    /// `0` here).
     pub const fn new(sender: u64, request_id: u64, tag: u16, payload: u64) -> Self {
         Self {
             sender,
+            reply_cap: 0,
             request_id,
             tag,
             payload,
         }
+    }
+
+    /// Stamp origin FlowId and attach a reply capability (scheduler only).
+    #[inline]
+    pub(crate) fn authenticate(mut self, sender: u64, reply_cap: u64) -> Self {
+        self.sender = sender;
+        self.reply_cap = reply_cap;
+        self
     }
 }
 
@@ -49,39 +59,61 @@ impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "msg{{from=pid#{}, id={}, tag={}, payload={}}}",
-            self.sender, self.request_id, self.tag, self.payload
+            "msg{{from=flow#{}, reply=cap#{}, id={}, tag={}, payload={}}}",
+            self.sender, self.reply_cap, self.request_id, self.tag, self.payload
         )
     }
 }
 
 /// A dynamically-tagged runtime value.
 ///
-/// Historically scalar-only (`Unit`/`Bool`/`Int`/`Float`/`Pid`) so a
-/// 32-register frame stayed small. [`Value::Message`] adds a fixed 24-byte
-/// envelope (plus discriminant/padding) — still no heap, still `Clone` by
-/// bitwise copy of the fields. That trade is intentional: device-actor
-/// request/reply needs correlation without packing into `i64`.
+/// [`Value::Cap`] is an unforgeable address for `Send` / `Ask` (phase 2).
+/// [`Value::Pid`] remains for **identity** inside authenticated messages
+/// (`Message.sender` / `msg_sender`), not for ambient addressing.
+///
+/// [`Value::Str`] / [`Value::Bytes`] are heap payloads shared via [`Arc`] so
+/// register moves and mailbox hops clone the handle, not the buffer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Unit,
     Bool(bool),
     Int(i64),
     Float(f64),
-    /// A process identifier, as produced by `Opcode::Spawn`.
+    /// Internal / message identity (FlowId as `u64`). **Not** a Send target.
     Pid(u64),
-    /// Actor mailbox / request-reply envelope. See [`Message`].
+    /// Atomic Hop envelope. See [`Message`].
     Message(Message),
+    /// Unforgeable capability (`CapId` as `u64`). Required for `Send` / `Ask`.
+    Cap(u64),
+    /// UTF-8 text (constant pool, natives, host).
+    Str(Arc<str>),
+    /// Opaque byte buffer (constant pool, natives, host).
+    Bytes(Arc<[u8]>),
 }
 
 impl Value {
-    /// Truthiness used by `Opcode::Branch`: everything is truthy except
-    /// `Unit`, `Bool(false)` and `Int(0)`. Matches the "zero/nil is falsy"
-    /// convention shared by Lua and Erlang guards, which the ISA otherwise
-    /// takes cues from.
+    /// Build a [`Value::Str`] from anything string-like.
+    #[inline]
+    pub fn str(s: impl AsRef<str>) -> Self {
+        Value::Str(Arc::from(s.as_ref()))
+    }
+
+    /// Build a [`Value::Bytes`] from a byte slice.
+    #[inline]
+    pub fn bytes(b: impl AsRef<[u8]>) -> Self {
+        Value::Bytes(Arc::from(b.as_ref()))
+    }
+
+    /// Truthiness used by `Opcode::Branch`: falsy are `Unit`, `Bool(false)`,
+    /// `Int(0)`, empty [`Value::Str`], and empty [`Value::Bytes`].
     #[inline]
     pub fn is_truthy(&self) -> bool {
-        !matches!(self, Value::Unit | Value::Bool(false) | Value::Int(0))
+        match self {
+            Value::Unit | Value::Bool(false) | Value::Int(0) => false,
+            Value::Str(s) if s.is_empty() => false,
+            Value::Bytes(b) if b.is_empty() => false,
+            _ => true,
+        }
     }
 
     #[inline]
@@ -102,9 +134,34 @@ impl Value {
     }
 
     #[inline]
+    pub fn as_cap(&self) -> Option<u64> {
+        match self {
+            Value::Cap(c) => Some(*c),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn as_message(&self) -> Option<Message> {
         match self {
             Value::Message(m) => Some(*m),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s.as_ref()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Value::Bytes(b) => Some(b.as_ref()),
+            Value::Str(s) => Some(s.as_bytes()),
             _ => None,
         }
     }
@@ -117,6 +174,9 @@ impl Value {
             Value::Float(_) => "float",
             Value::Pid(_) => "pid",
             Value::Message(_) => "message",
+            Value::Cap(_) => "cap",
+            Value::Str(_) => "str",
+            Value::Bytes(_) => "bytes",
         }
     }
 }
@@ -128,8 +188,11 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Int(i) => write!(f, "{i}"),
             Value::Float(x) => write!(f, "{x}"),
-            Value::Pid(p) => write!(f, "pid#{p}"),
+            Value::Pid(p) => write!(f, "flow#{p}"),
             Value::Message(m) => write!(f, "{m}"),
+            Value::Cap(c) => write!(f, "cap#{c}"),
+            Value::Str(s) => write!(f, "{s}"),
+            Value::Bytes(b) => write!(f, "bytes[{}]", b.len()),
         }
     }
 }
@@ -154,6 +217,26 @@ impl From<Message> for Value {
         Value::Message(m)
     }
 }
+impl From<&str> for Value {
+    fn from(s: &str) -> Self {
+        Value::str(s)
+    }
+}
+impl From<String> for Value {
+    fn from(s: String) -> Self {
+        Value::Str(Arc::from(s))
+    }
+}
+impl From<&[u8]> for Value {
+    fn from(b: &[u8]) -> Self {
+        Value::bytes(b)
+    }
+}
+impl From<Vec<u8>> for Value {
+    fn from(b: Vec<u8>) -> Self {
+        Value::Bytes(Arc::from(b))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -166,5 +249,44 @@ mod tests {
         assert!(v.is_truthy());
         assert_eq!(v.as_message(), Some(m));
         assert_eq!(v.type_name(), "message");
+    }
+
+    #[test]
+    fn authenticate_stamps_sender_and_reply_cap() {
+        let m = Message::new(999, 1, 2, 3).authenticate(42, 7);
+        assert_eq!(m.sender, 42);
+        assert_eq!(m.reply_cap, 7);
+        assert_eq!(m.request_id, 1);
+    }
+
+    #[test]
+    fn cap_is_truthy() {
+        assert!(Value::Cap(1).is_truthy());
+        assert_eq!(Value::Cap(3).as_cap(), Some(3));
+    }
+
+    #[test]
+    fn str_and_bytes_helpers() {
+        let s = Value::str("hi");
+        assert_eq!(s.as_str(), Some("hi"));
+        assert_eq!(s.type_name(), "str");
+        assert!(s.is_truthy());
+        assert!(!Value::str("").is_truthy());
+
+        let b = Value::bytes([1u8, 2, 3]);
+        assert_eq!(b.as_bytes(), Some(&[1, 2, 3][..]));
+        assert_eq!(b.type_name(), "bytes");
+        assert!(b.is_truthy());
+        assert!(!Value::bytes([]).is_truthy());
+
+        // Str also exposes UTF-8 bytes via as_bytes.
+        assert_eq!(s.as_bytes(), Some(b"hi".as_slice()));
+    }
+
+    #[test]
+    fn str_eq_compares_content() {
+        assert_eq!(Value::str("a"), Value::from("a".to_owned()));
+        assert_ne!(Value::str("a"), Value::str("b"));
+        assert_eq!(Value::bytes([9]), Value::from(vec![9u8]));
     }
 }

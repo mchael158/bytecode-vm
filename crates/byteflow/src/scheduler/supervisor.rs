@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use crate::bytecode::Value;
 
 use super::error::{report_fault, SpawnError};
-use super::handle::ProcessHandle;
-use super::process::{ProcessId, ProcessOutcome, RestartPolicy};
+use super::handle::FlowHandle;
+use super::process::{FlowId, FlowOutcome, RestartPolicy};
 use super::runtime::RuntimeSpawner;
 use super::sync_lock;
 
@@ -78,8 +78,8 @@ impl Default for SupervisorConfig {
 }
 
 struct ChildExit {
-    id: ProcessId,
-    outcome: ProcessOutcome,
+    id: FlowId,
+    outcome: FlowOutcome,
 }
 
 struct LiveChild {
@@ -91,7 +91,7 @@ struct Inner {
     config: SupervisorConfig,
     events: Mutex<VecDeque<ChildExit>>,
     cvar: Condvar,
-    children: Mutex<HashMap<ProcessId, LiveChild>>,
+    children: Mutex<HashMap<FlowId, LiveChild>>,
     restart_times: Mutex<VecDeque<Instant>>,
     intensity_exceeded: AtomicBool,
     shutdown: AtomicBool,
@@ -106,7 +106,7 @@ pub(crate) struct SupervisorLink {
 }
 
 impl SupervisorLink {
-    pub(crate) fn notify(&self, id: ProcessId, outcome: ProcessOutcome) {
+    pub(crate) fn notify(&self, id: FlowId, outcome: FlowOutcome) {
         match sync_lock::lock(&self.inner.events, "SupervisorLink::notify") {
             Ok(mut events) => {
                 events.push_back(ChildExit { id, outcome });
@@ -119,15 +119,15 @@ impl SupervisorLink {
 
 /// Host-side child restarter (design notes §15-16).
 ///
-/// A `Supervisor` is **not** a bytecode process. It is a dedicated OS
-/// thread plus a table of [`ChildSpec`]s. When a supervised process
-/// becomes `ProcessState::Failed` (or completes, under
+/// A `Supervisor` is **not** a bytecode Flow. It is a dedicated OS
+/// thread plus a table of [`ChildSpec`]s. When a supervised flow
+/// becomes `FlowState::Failed` (or completes, under
 /// [`RestartPolicy::Always`]), the worker delivers the
-/// [`ProcessOutcome`] here instead of letting the fault take anything
+/// [`FlowOutcome`] here instead of letting the fault take anything
 /// else down. The supervisor then consults the child's
 /// [`RestartPolicy`] and, if intensity allows, respawns it under a
-/// fresh [`ProcessId`] — Pids are never reused (see
-/// [`super::process::ProcessId`]).
+/// fresh [`FlowId`] — Pids are never reused (see
+/// [`super::process::FlowId`]).
 ///
 /// Constructed from a [`RuntimeSpawner`] so it does not have to own the
 /// runtime's worker `JoinHandle`s.
@@ -169,7 +169,7 @@ impl Supervisor {
     /// Spawn `spec` and start supervising it. The returned handle is for
     /// this incarnation only — a restart allocates a new Pid and a new
     /// completion channel.
-    pub fn start_child(&self, spec: ChildSpec) -> Result<ProcessHandle, SpawnError> {
+    pub fn start_child(&self, spec: ChildSpec) -> Result<FlowHandle, SpawnError> {
         spawn_child(&self.inner, spec)
     }
 
@@ -186,7 +186,7 @@ impl Supervisor {
     /// `true` once more than [`SupervisorConfig::max_restarts`] respawns
     /// landed inside the intensity window. Remaining children keep
     /// running; we just stop bringing them back (no safe abort of a
-    /// mid-quantum process).
+    /// mid-quantum flow).
     pub fn intensity_exceeded(&self) -> bool {
         self.inner.intensity_exceeded.load(Ordering::Acquire)
     }
@@ -202,7 +202,7 @@ impl Supervisor {
     }
 }
 
-fn spawn_child(inner: &Arc<Inner>, spec: ChildSpec) -> Result<ProcessHandle, SpawnError> {
+fn spawn_child(inner: &Arc<Inner>, spec: ChildSpec) -> Result<FlowHandle, SpawnError> {
     let link = SupervisorLink {
         inner: inner.clone(),
     };
@@ -228,10 +228,10 @@ fn spawn_child(inner: &Arc<Inner>, spec: ChildSpec) -> Result<ProcessHandle, Spa
     Ok(handle)
 }
 
-fn should_restart(policy: RestartPolicy, outcome: &ProcessOutcome) -> bool {
+fn should_restart(policy: RestartPolicy, outcome: &FlowOutcome) -> bool {
     match policy {
         RestartPolicy::Always => true,
-        RestartPolicy::OnFailure => matches!(outcome, ProcessOutcome::Failed(_)),
+        RestartPolicy::OnFailure => matches!(outcome, FlowOutcome::Failed(_)),
         RestartPolicy::Never => false,
     }
 }
@@ -378,7 +378,7 @@ mod tests {
         let spawned = rt.metrics().processes_spawned;
         sup.shutdown();
         rt.shutdown();
-        assert!(matches!(outcome, ProcessOutcome::Completed(_)));
+        assert!(matches!(outcome, FlowOutcome::Completed(_)));
         assert_eq!(spawned, 1);
     }
 
@@ -429,8 +429,8 @@ mod tests {
 
     #[test]
     fn policy_table() {
-        let ok = ProcessOutcome::Completed(Value::Unit);
-        let fail = ProcessOutcome::Failed("boom".into());
+        let ok = FlowOutcome::Completed(Value::Unit);
+        let fail = FlowOutcome::Failed("boom".into());
         assert!(should_restart(RestartPolicy::Always, &ok));
         assert!(should_restart(RestartPolicy::Always, &fail));
         assert!(!should_restart(RestartPolicy::OnFailure, &ok));

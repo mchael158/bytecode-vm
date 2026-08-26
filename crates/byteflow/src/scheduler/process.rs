@@ -6,46 +6,46 @@ use crate::vm::Vm;
 use super::mailbox::Mailbox;
 use super::oneshot;
 
-/// A process identifier.
+/// Identifier of a **flow** — Byteflow's unit of concurrent work.
 ///
-/// Backed by a single global, wait-free `AtomicU64` counter
-/// (`fetch_add(1, Relaxed)`) rather than anything derived from memory
-/// addresses or slot indices: identifiers must stay valid and unique for
-/// the lifetime of the whole runtime (a `Send` can be issued long after the
-/// sender last held a reference to the target), and must never be reused,
-/// or a stale `Pid` in someone's registers could end up addressing a
-/// *different*, later process — a classic ABA bug in actor systems.
+/// Host APIs and the directory key on this type. Inside messages it appears
+/// as [`crate::Value::Pid`] (`Message.sender` / `msg_sender`) for **identity**.
+/// Bytecode addressing uses [`crate::Value::Cap`] (FlowCap) — a Pid is not a
+/// Send/Ask authority token.
+///
+/// Backed by a single global, wait-free `AtomicU64` counter rather than
+/// anything derived from memory addresses: ids must stay unique for the
+/// lifetime of the runtime and must **never** be reused, or a stale id in
+/// someone's registers could address a *different* later flow (ABA) via the
+/// host/`Directory` path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ProcessId(pub(crate) u64);
+pub struct FlowId(pub(crate) u64);
 
-impl ProcessId {
+impl FlowId {
     pub fn as_u64(self) -> u64 {
         self.0
     }
 }
 
-impl std::fmt::Display for ProcessId {
+impl std::fmt::Display for FlowId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "pid#{}", self.0)
+        write!(f, "flow#{}", self.0)
     }
 }
 
-static NEXT_PID: AtomicU64 = AtomicU64::new(1);
+static NEXT_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 
-pub fn next_process_id() -> ProcessId {
-    ProcessId(NEXT_PID.fetch_add(1, Ordering::Relaxed))
+pub fn next_flow_id() -> FlowId {
+    FlowId(NEXT_FLOW_ID.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Where a process currently sits in its lifecycle (design notes §4).
+/// Where a flow currently sits in its lifecycle.
 ///
-/// This is metrics/introspection state (what `byteflow debug` or
-/// `runtime.metrics()` would report, design notes §26-27) — the scheduler's
-/// actual control flow is driven by *where the `Process` object physically
-/// lives* (a worker's local deque, the global injector, the timer wheel, or
-/// parked inside its own mailbox), not by this enum. Keeping the two in
-/// sync is the worker loop's job (`byteflow-scheduler::worker`).
+/// Metrics/introspection only — the scheduler's control flow is driven by
+/// *where the [`Flow`] object physically lives* (worker deque, injector,
+/// timer wheel, or parked inside its mailbox).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProcessState {
+pub enum FlowState {
     Ready,
     Running,
     Waiting,
@@ -54,8 +54,8 @@ pub enum ProcessState {
     Failed,
 }
 
-/// Restart policy consulted by a [`super::supervisor::Supervisor`] when one
-/// of its children terminates abnormally (design notes §15).
+/// Restart policy consulted by a [`super::supervisor::Supervisor`] when a
+/// supervised flow terminates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestartPolicy {
     Always,
@@ -63,70 +63,59 @@ pub enum RestartPolicy {
     Never,
 }
 
-/// Live counters for one process, updated only by the worker thread
-/// currently executing it (no contention: a process runs on one worker at a
-/// time by construction) and read by anyone holding a clone of the `Arc`
-/// for `runtime.metrics()` / a debugger attach (design notes §26-27).
+/// Live counters for one flow (updated only by the worker currently
+/// running it).
 #[derive(Debug, Default)]
-pub struct ProcessMetrics {
+pub struct FlowMetrics {
     pub instructions: AtomicU64,
+    /// Atomic hops sent (`Send` of [`crate::Value::Message`]).
     pub messages_sent: AtomicU64,
     pub messages_received: AtomicU64,
     pub reschedules: AtomicU64,
 }
 
-/// A single virtual process: its interpreter state, mailbox, and
-/// bookkeeping. This is the unit of work moved around by the scheduler —
-/// pushed onto worker-local deques, stolen, parked inside a `Mailbox`, or
-/// held by the timer wheel while sleeping.
-pub struct Process {
-    pub id: ProcessId,
+/// A single **flow**: VM state, mailbox, and bookkeeping.
+///
+/// This is the unit of work moved by the scheduler — pushed onto worker
+/// deques, stolen, parked inside a [`Mailbox`] on `Receive`, or held by
+/// the timer wheel while sleeping. Flows talk only via **Atomic Hops**
+/// ([`crate::Value::Message`] on `Send`).
+pub struct Flow {
+    pub id: FlowId,
     pub vm: Vm,
     pub mailbox: Arc<Mailbox>,
-    pub metrics: Arc<ProcessMetrics>,
+    pub metrics: Arc<FlowMetrics>,
     pub restart_policy: RestartPolicy,
-    /// Completion channel consumed by `ProcessHandle::join`.
-    pub(crate) completion: oneshot::Sender<ProcessOutcome>,
-    /// Set by [`super::mailbox::Mailbox::park`] when a message wins a race
-    /// against this process trying to park on `Receive` — see that
-    /// function's doc comment for the race it closes. The worker loop
-    /// checks this immediately after a failed `park` instead of looping
-    /// back into the mailbox.
+    /// Completion channel consumed by [`super::handle::FlowHandle::join`].
+    pub(crate) completion: oneshot::Sender<FlowOutcome>,
+    /// Set by [`Mailbox::park`] when a hop wins the park race.
     pub pending_message: Option<crate::bytecode::Value>,
-    /// The destination register of the most recent `Receive`/
-    /// `ReceiveTimeout` this process issued. Recorded the moment we decide
-    /// to park (see `worker::park_on_mailbox`) because by the time a
-    /// `Send` or timeout hands the value back, the original [`VmResult`]
-    /// that carried this register is long gone — the process object itself
-    /// is the only place left to remember it.
+    /// Destination register of the most recent `Receive` / `ReceiveTimeout`.
     pub last_receive_dest: Option<u8>,
-    /// Set when this process was started by a [`super::supervisor::Supervisor`].
-    /// The worker delivers the terminal outcome here so the supervisor can
-    /// apply [`RestartPolicy`] without joining on a worker thread.
     pub(crate) supervisor: Option<super::supervisor::SupervisorLink>,
 }
 
-/// Terminal outcome of a process, delivered to whoever holds its
-/// [`super::handle::ProcessHandle`].
+/// Terminal outcome of a flow, delivered to whoever holds its
+/// [`super::handle::FlowHandle`].
 #[derive(Clone, Debug, PartialEq)]
-pub enum ProcessOutcome {
+pub enum FlowOutcome {
     Completed(crate::bytecode::Value),
     Failed(String),
 }
 
-impl Process {
+impl Flow {
     pub fn new(
-        id: ProcessId,
+        id: FlowId,
         vm: Vm,
         mailbox: Arc<Mailbox>,
         restart_policy: RestartPolicy,
-        completion: oneshot::Sender<ProcessOutcome>,
+        completion: oneshot::Sender<FlowOutcome>,
     ) -> Self {
-        Process {
+        Self {
             id,
             vm,
             mailbox,
-            metrics: Arc::new(ProcessMetrics::default()),
+            metrics: Arc::new(FlowMetrics::default()),
             restart_policy,
             completion,
             pending_message: None,
@@ -135,11 +124,7 @@ impl Process {
         }
     }
 
-    pub(crate) fn complete(self, outcome: ProcessOutcome) {
+    pub(crate) fn complete(self, outcome: FlowOutcome) {
         self.completion.send(outcome);
     }
 }
-
-// Timer-wheel entry types live in `crate::timer` — they need to reference
-// both `Process` (for plain `Sleep`) and `Mailbox` (for `ReceiveTimeout`),
-// so they're defined next to the wheel itself rather than here.

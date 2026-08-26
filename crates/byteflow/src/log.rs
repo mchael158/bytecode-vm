@@ -6,7 +6,7 @@
 //! of the program's observable behaviour — samples and demos use it to show
 //! envelopes crossing the mailbox. Scheduler diagnostics (spawn / send /
 //! park / finish) are an **operator** concern: they must not pollute stdout
-//! when an embedder pipes process output, and they must stay off by default
+//! when an embedder pipes Flow output, and they must stay off by default
 //! so a production run is silent unless asked.
 //!
 //! ```text

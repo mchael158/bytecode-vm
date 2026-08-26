@@ -8,10 +8,10 @@ use crossbeam_deque::{Injector, Stealer, Worker as LocalDeque};
 
 use super::directory::Directory;
 use super::error::SpawnError;
-use super::handle::ProcessHandle;
+use super::handle::FlowHandle;
 use super::mailbox::{Delivery, Mailbox};
 use super::metrics::{RuntimeMetrics, RuntimeMetricsSnapshot};
-use super::process::{Process, ProcessId, RestartPolicy};
+use super::process::{Flow, FlowId, RestartPolicy};
 use super::supervisor::SupervisorLink;
 use super::timer::TimerWheel;
 use super::worker;
@@ -19,10 +19,10 @@ use super::worker;
 /// Default instruction budget per scheduling turn (design notes §10).
 /// Chosen as a middle ground: large enough that the per-yield bookkeeping
 /// cost is amortized over meaningful work, small enough that a
-/// pathological `loop {}` in one process can't visibly stall the others —
+/// pathological `loop {}` in one flow can't visibly stall the others —
 /// at 10k simple instructions/turn and even a conservative tens-of-millions
 /// of instructions/sec per core, worst-case added latency for a sibling
-/// process is sub-millisecond.
+/// flow is sub-millisecond.
 pub const DEFAULT_QUANTUM: u32 = 10_000;
 
 /// Tunables for [`Runtime::new`]. Everything has a sensible default via
@@ -34,7 +34,7 @@ pub struct RuntimeConfig {
     /// M:N scheduler; embedders running alongside other CPU-heavy work on
     /// the same machine may want fewer.
     pub workers: usize,
-    /// Instructions a process runs before being preempted back to the
+    /// Instructions a flow runs before being preempted back to the
     /// scheduler even if it never hits `Yield`.
     pub quantum: u32,
 }
@@ -47,14 +47,17 @@ impl Default for RuntimeConfig {
 
 /// State shared by every worker thread and the timer thread. Everything in
 /// here is either internally synchronized (`Injector`, `Directory`,
-/// `TimerWheel`, the `RuntimeMetrics` atomics) or immutable after
+/// `CapTable`, `TimerWheel`, the `RuntimeMetrics` atomics) or immutable after
 /// construction (`stealers`, `quantum`) — there is no top-level lock
 /// covering the whole runtime, by design: a global lock is exactly what an
 /// M:N scheduler exists to avoid.
 pub struct Shared {
-    pub(crate) injector: Injector<Box<Process>>,
-    pub(crate) stealers: Vec<Stealer<Box<Process>>>,
+    pub(crate) injector: Injector<Box<Flow>>,
+    pub(crate) stealers: Vec<Stealer<Box<Flow>>>,
+    /// FlowId → mailbox (delivery after Cap resolution).
     pub(crate) directory: Directory,
+    /// CapId → { FlowId, rights } (bytecode Send/Ask addressing — FlowCap).
+    pub(crate) caps: super::capability::CapTable,
     pub(crate) timer: Arc<TimerWheel>,
     pub(crate) notify: (Mutex<()>, Condvar),
     pub(crate) metrics: RuntimeMetrics,
@@ -63,10 +66,10 @@ pub struct Shared {
 }
 
 /// A running Byteflow runtime: a fixed pool of worker threads plus one
-/// timer thread, all operating on processes compiled from a single shared
-/// [`Chunk`] (design notes' Phase 1-3 milestone: VM + M:N scheduler +
-/// spawn/yield/sleep/mailboxes — see the crate-level docs for what's
-/// intentionally *not* here yet: JIT, FFI, capabilities, distribution).
+/// timer thread, all operating on flows compiled from a single shared
+/// [`Chunk`] (VM + M:N scheduler + spawn/yield/sleep/mailboxes + FlowCap —
+/// see the crate-level docs for what's intentionally *not* here yet: JIT,
+/// native quotas, distribution).
 pub struct Runtime {
     shared: Arc<Shared>,
     chunk: Arc<Chunk>,
@@ -113,14 +116,15 @@ impl Runtime {
         let chunk = Arc::new(chunk);
         let workers_n = config.workers.max(1);
 
-        let locals: Vec<LocalDeque<Box<Process>>> =
+        let locals: Vec<LocalDeque<Box<Flow>>> =
             (0..workers_n).map(|_| LocalDeque::new_fifo()).collect();
-        let stealers: Vec<Stealer<Box<Process>>> = locals.iter().map(|l| l.stealer()).collect();
+        let stealers: Vec<Stealer<Box<Flow>>> = locals.iter().map(|l| l.stealer()).collect();
 
         let shared = Arc::new(Shared {
             injector: Injector::new(),
             stealers,
             directory: Directory::new(),
+            caps: super::capability::CapTable::new(),
             timer: TimerWheel::new(),
             notify: (Mutex::new(()), Condvar::new()),
             metrics: RuntimeMetrics::default(),
@@ -158,11 +162,11 @@ impl Runtime {
         })
     }
 
-    /// Spawn a top-level process starting at `function` in this runtime's
-    /// chunk, returning a [`ProcessHandle`] the caller can `.join()`.
+    /// Spawn a top-level flow starting at `function` in this runtime's
+    /// chunk, returning a [`FlowHandle`] the caller can `.join()`.
     ///
     /// Returns [`SpawnError::BadFunction`] if `function` is out of range.
-    pub fn spawn(&self, function: u32, args: &[Value]) -> Result<ProcessHandle, SpawnError> {
+    pub fn spawn(&self, function: u32, args: &[Value]) -> Result<FlowHandle, SpawnError> {
         spawn_on(
             &self.shared,
             &self.chunk,
@@ -198,10 +202,10 @@ impl Runtime {
         self.shared.metrics.snapshot()
     }
 
-    /// Number of processes currently registered in the directory — i.e.
+    /// Number of flows currently registered in the directory — i.e.
     /// alive (running, ready, sleeping, or waiting), not counting ones that
     /// have already completed or failed.
-    pub fn live_processes(&self) -> usize {
+    pub fn live_flows(&self) -> usize {
         self.shared.directory.len()
     }
 
@@ -209,29 +213,43 @@ impl Runtime {
         self.workers.len()
     }
 
-    /// Deliver `message` to `target` from the embedder (not from bytecode).
-    pub fn send(&self, target: ProcessId, message: Value) -> Result<(), SendError> {
+    /// Deliver an **Atomic Hop** (`Value::Message`) to `target` from the
+    /// embedder (not from bytecode).
+    ///
+    /// # Host trust boundary
+    ///
+    /// This path takes a [`FlowId`] directly — **no Cap required**. The host
+    /// is trusted; bytecode must use `Value::Cap` via `Opcode::Send` /
+    /// `Ask`. Host-injected messages are not re-stamped (`sender` /
+    /// `reply_cap` stay as built). Bare scalars are rejected
+    /// ([`SendError::NotAHop`]).
+    pub fn send(&self, target: FlowId, message: Value) -> Result<(), SendError> {
+        if message.as_message().is_none() {
+            return Err(SendError::NotAHop {
+                got: message.type_name(),
+            });
+        }
         let mailbox = match self.shared.directory.lookup(target) {
             Ok(Some(m)) => m,
-            Ok(None) => return Err(SendError::NoSuchProcess(target)),
+            Ok(None) => return Err(SendError::NoSuchFlow(target)),
             Err(e) => {
                 super::error::report_fault(e);
-                return Err(SendError::NoSuchProcess(target));
+                return Err(SendError::NoSuchFlow(target));
             }
         };
         match mailbox.push(message.clone()) {
             Ok(Delivery::Queued) => Ok(()),
-            Ok(Delivery::Handoff(mut process)) => {
-                if let Some(dest) = process.last_receive_dest {
-                    let _ = process.vm.resume_with(dest, message);
+            Ok(Delivery::Handoff(mut flow)) => {
+                if let Some(dest) = flow.last_receive_dest {
+                    let _ = flow.vm.resume_with(dest, message);
                 }
-                self.shared.injector.push(process);
+                self.shared.injector.push(flow);
                 wake_workers(&self.shared);
                 Ok(())
             }
             Err(e) => {
                 super::error::report_fault(e);
-                Err(SendError::NoSuchProcess(target))
+                Err(SendError::NoSuchFlow(target))
             }
         }
     }
@@ -262,22 +280,27 @@ impl Runtime {
 }
 
 /// A convenience Pid constructor for embedders that stored a raw `u64`
-/// (e.g. round-tripped through `Value::Pid`) and need a [`ProcessId`] to
+/// (e.g. round-tripped through `Value::Pid`) and need a [`FlowId`] to
 /// call APIs that take one.
-pub fn pid_from_u64(raw: u64) -> ProcessId {
-    ProcessId(raw)
+pub fn flow_id_from_u64(raw: u64) -> FlowId {
+    FlowId(raw)
 }
 
-/// Why [`Runtime::send`] could not deliver a message.
+/// Why [`Runtime::send`] could not deliver a hop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendError {
-    NoSuchProcess(ProcessId),
+    NoSuchFlow(FlowId),
+    /// Atomic Hop rule: only [`crate::Value::Message`] may cross `Send`.
+    NotAHop { got: &'static str },
 }
 
 impl std::fmt::Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SendError::NoSuchProcess(id) => write!(f, "no live process {id}"),
+            SendError::NoSuchFlow(id) => write!(f, "no live flow {id}"),
+            SendError::NotAHop { got } => {
+                write!(f, "atomic hop requires Value::Message, got {got}")
+            }
         }
     }
 }
@@ -285,13 +308,13 @@ impl std::fmt::Display for SendError {
 impl std::error::Error for SendError {}
 
 /// Shared machinery behind `Runtime::spawn` and `RuntimeSpawner::spawn`
-/// (and, transitively, `Supervisor`): build a fresh `Process` (VM +
+/// (and, transitively, `Supervisor`): build a fresh `Flow` (VM +
 /// mailbox + completion channel), register it in the directory, and push
 /// it onto the global injector for any worker to pick up.
 ///
 /// Returns [`SpawnError`] on bad function index / VM init / directory
 /// poison — never panics. Bytecode `Opcode::Spawn` that fails here turns
-/// into `ProcessOutcome::Failed` for the *parent* (see `worker`).
+/// into `FlowOutcome::Failed` for the *parent* (see `worker`).
 pub(crate) fn spawn_on(
     shared: &Arc<Shared>,
     chunk: &Arc<Chunk>,
@@ -300,8 +323,8 @@ pub(crate) fn spawn_on(
     args: &[Value],
     restart_policy: RestartPolicy,
     supervisor: Option<SupervisorLink>,
-) -> Result<ProcessHandle, SpawnError> {
-    let id = super::process::next_process_id();
+) -> Result<FlowHandle, SpawnError> {
+    let id = super::process::next_flow_id();
     let vm = Vm::new(chunk.clone(), natives.clone(), function, args)?;
     let mailbox = Arc::new(Mailbox::new());
     if let Err(e) = shared.directory.register(id, mailbox.clone()) {
@@ -311,12 +334,12 @@ pub(crate) fn spawn_on(
         ));
     }
     let (tx, rx) = super::oneshot::channel();
-    let mut process = Box::new(Process::new(id, vm, mailbox, restart_policy, tx));
-    process.supervisor = supervisor;
+    let mut flow = Box::new(Flow::new(id, vm, mailbox, restart_policy, tx));
+    flow.supervisor = supervisor;
     RuntimeMetrics::inc(&shared.metrics.processes_spawned);
-    shared.injector.push(process);
+    shared.injector.push(flow);
     wake_workers(shared);
-    Ok(ProcessHandle { id, receiver: rx })
+    Ok(FlowHandle { id, receiver: rx })
 }
 
 pub(crate) fn wake_workers(shared: &Shared) {
@@ -345,7 +368,7 @@ impl RuntimeSpawner {
         function: u32,
         args: &[Value],
         restart_policy: RestartPolicy,
-    ) -> Result<ProcessHandle, SpawnError> {
+    ) -> Result<FlowHandle, SpawnError> {
         spawn_on(
             &self.shared,
             &self.chunk,
@@ -363,7 +386,7 @@ impl RuntimeSpawner {
         args: &[Value],
         restart_policy: RestartPolicy,
         supervisor: SupervisorLink,
-    ) -> Result<ProcessHandle, SpawnError> {
+    ) -> Result<FlowHandle, SpawnError> {
         spawn_on(
             &self.shared,
             &self.chunk,
@@ -384,7 +407,7 @@ impl RuntimeSpawner {
 mod tests {
     use super::*;
     use crate::bytecode::{ChunkBuilder, Opcode, Value};
-    use crate::scheduler::process::ProcessOutcome;
+    use crate::scheduler::FlowOutcome;
 
     fn add_chunk() -> Chunk {
         let mut b = ChunkBuilder::new("test");
@@ -409,7 +432,7 @@ mod tests {
         let outcome = rt.spawn(0, &[]).expect("spawn").join();
         rt.shutdown();
         match outcome {
-            ProcessOutcome::Completed(Value::Int(42)) => {}
+            FlowOutcome::Completed(Value::Int(42)) => {}
             other => panic!("unexpected outcome: {other:?}"),
         }
     }

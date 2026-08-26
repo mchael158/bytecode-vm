@@ -5,11 +5,11 @@
 
 [English](README.md) · [Português (Brasil)](README.pt-BR.md)
 
-Concorrência estilo **Erlang** embutível em Rust: bytecode, processos virtuais, mailboxes e supervisor — **uma única crate**.
+Concorrência embutível em Rust: bytecode, **flows**, mailboxes, **Atomic Hop** (`Value::Message` só no `Send`) e supervisor — **uma única crate**.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.3"
+byteflow-actors = "0.5"
 ```
 
 ```rust
@@ -25,6 +25,6 @@ cargo install byteflow-actors
 
 **Não** substitui Tokio / **não** é OTP distribuído. O Rust hospedeiro fica com o I/O.
 
-Request-reply atômico (`Value::Message`): `cargo run -p byteflow-actors --example atomic_actors` — ver `crates/byteflow/docs/atomic-actors.md`. Use `BYTEFLOW_LOG=info` para logs do scheduler no stderr.
+Atomic Hop (`Value::Message`): `cargo run -p byteflow-actors --example atomic_actors` — ver `crates/byteflow/docs/atomic-hop.md`. Use `BYTEFLOW_LOG=info` para logs do scheduler no stderr.
 
 Licença: MIT OR Apache-2.0 · [github.com/mchael158/bytecode-vm](https://github.com/mchael158/bytecode-vm)

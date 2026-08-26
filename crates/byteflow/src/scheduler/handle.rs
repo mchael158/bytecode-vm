@@ -1,34 +1,29 @@
 use super::oneshot;
-use super::process::{ProcessId, ProcessOutcome};
+use super::process::{FlowId, FlowOutcome};
 
-/// A reference to a spawned process, returned by
+/// A reference to a spawned **flow**, returned by
 /// [`super::runtime::Runtime::spawn`].
 ///
-/// Holding a `ProcessHandle` does not keep the process alive or pin it to
-/// any worker — it is purely a way to (a) read off its [`ProcessId`] for
-/// addressing it with `Send`, and (b) block the *calling native thread*
-/// until it finishes, via [`ProcessHandle::join`]. Dropping a handle
-/// without joining is fine; the process runs to completion regardless
-/// (fire-and-forget is the common case for actor-style workers).
-pub struct ProcessHandle {
-    pub(crate) id: ProcessId,
-    pub(crate) receiver: oneshot::Receiver<ProcessOutcome>,
+/// Holding a `FlowHandle` does not keep the flow alive — it is a way to
+/// (a) read its [`FlowId`] for addressing with `Send`, and (b) block the
+/// *calling native thread* until it finishes via [`FlowHandle::join`].
+/// Dropping without joining is fine (fire-and-forget).
+pub struct FlowHandle {
+    pub(crate) id: FlowId,
+    pub(crate) receiver: oneshot::Receiver<FlowOutcome>,
 }
 
-impl ProcessHandle {
-    pub fn id(&self) -> ProcessId {
+impl FlowHandle {
+    pub fn id(&self) -> FlowId {
         self.id
     }
 
-    /// Block the current (native) thread until the process terminates.
-    /// **Never call this from inside a worker thread / from bytecode** —
-    /// see [`super::oneshot::Receiver::join`]'s warning. It is meant for an
-    /// embedder's `main` waiting on a top-level computation, mirroring
-    /// `std::thread::JoinHandle::join`.
-    pub fn join(self) -> ProcessOutcome {
+    /// Block the current (native) thread until the flow terminates.
+    /// **Never call from inside a worker / from bytecode.**
+    pub fn join(self) -> FlowOutcome {
         match self.receiver.join() {
             Ok(outcome) => outcome,
-            Err(e) => ProcessOutcome::Failed(e.to_string()),
+            Err(e) => FlowOutcome::Failed(e.to_string()),
         }
     }
 }

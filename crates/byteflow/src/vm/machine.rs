@@ -9,14 +9,14 @@ use super::native::NativeTable;
 use super::result::VmResult;
 
 /// Hard limit on call nesting. Frames are heap-allocated (see [`Frame`]), so
-/// unbounded recursion would grow the process's memory instead of crashing
+/// unbounded recursion would grow the Flow's memory instead of crashing
 /// the worker thread's native stack — which is worse, not better, without a
 /// limit. `4096` comfortably covers real recursive algorithms while keeping
 /// a runaway `fn f() { f() }` a `Fault`, not an OOM.
 pub const MAX_CALL_DEPTH: usize = 4096;
 
-/// One virtual process's execution state: call stack + registers. Cheap
-/// enough to construct that spawning a process is a handful of small heap
+/// One virtual Flow's execution state: call stack + registers. Cheap
+/// enough to construct that spawning a Flow is a handful of small heap
 /// allocations, not a native thread/stack (contrast: a `std::thread` reserves
 /// megabytes of stack whether it uses them or not).
 ///
@@ -26,7 +26,7 @@ pub struct Vm {
     chunk: Arc<Chunk>,
     natives: Arc<NativeTable>,
     frames: Vec<Frame>,
-    /// Lifetime instruction counter, exposed for `ProcessMetrics` (design
+    /// Lifetime instruction counter, exposed for `FlowMetrics` (design
     /// notes §26).
     instructions_executed: u64,
 }
@@ -53,7 +53,7 @@ impl Vm {
     }
 
     /// Index into `chunk.functions` for the active (top) call frame.
-    /// Useful for diagnostics / supervisor logs when a process traps.
+    /// Useful for diagnostics / supervisor logs when a Flow traps.
     pub fn current_function(&self) -> u32 {
         // Category D: frames must be non-empty while the VM is runnable.
         // We still avoid `.expect` — return 0 as a diagnostic fallback so a
@@ -67,7 +67,7 @@ impl Vm {
 
     /// A cheap `Arc` clone of the chunk this VM is executing. Used by the
     /// scheduler to construct a child `Vm` for `Opcode::Spawn` without
-    /// needing to know anything about `Chunk`'s internals — every process
+    /// needing to know anything about `Chunk`'s internals — every Flow
     /// spawned (transitively) from the same top-level `spawn()` call shares
     /// one immutable chunk in memory, never copies it.
     pub fn chunk_arc(&self) -> Arc<Chunk> {
@@ -81,11 +81,11 @@ impl Vm {
         self.natives.clone()
     }
 
-    /// Deliver a value the scheduler produced on our behalf (the new Pid
-    /// from a `Spawn`, or a dequeued mailbox message from a `Receive`) into
-    /// the register the instruction that suspended us was targeting, ahead
-    /// of the next [`Vm::run`] call. A no-op is never valid to skip: calling
-    /// `run` without this after a `Spawn`/`Receive` result leaves the
+    /// Deliver a value the scheduler produced on our behalf (a **Cap** from
+    /// `Spawn` / `SelfPid`, or a dequeued mailbox message from a `Receive`)
+    /// into the register the instruction that suspended us was targeting,
+    /// ahead of the next [`Vm::run`] call. A no-op is never valid to skip:
+    /// calling `run` without this after a `Spawn`/`Receive` result leaves the
     /// destination register holding its previous (stale) value.
     #[inline]
     pub fn resume_with(&mut self, dest_reg: u8, value: Value) -> Result<(), Fault> {
@@ -188,12 +188,12 @@ impl Vm {
     }
 
     /// Run at most `budget` instructions (cooperative-preemption quantum,
-    /// design notes §10-11), or until the process completes / needs an
+    /// design notes §10-11), or until the Flow completes / needs an
     /// effect the scheduler must perform / faults.
     ///
     /// Every exit path is captured by [`VmResult`] — this function itself
     /// never panics on malformed *verified* bytecode; faults are returned,
-    /// not thrown, so a buggy process can't take a worker thread down.
+    /// not thrown, so a buggy Flow can't take a worker thread down.
     pub fn run(&mut self, budget: u32) -> VmResult {
         for _ in 0..budget {
             self.instructions_executed += 1;
@@ -326,7 +326,7 @@ impl Vm {
                     // notes §30-31): plain Rust on one side, bytecode
                     // registers on the other, with `Fault::NativeError`
                     // as the only channel for a native-side failure to
-                    // become a process fault instead of a host panic.
+                    // become a Flow fault instead of a host panic.
                     match native_fn(&args) {
                         Ok(value) => trap!(self.set_reg(dst, value)),
                         Err(fault) => return VmResult::Trap(fault),
@@ -346,8 +346,8 @@ impl Vm {
                     for i in 0..argc {
                         // Args live at r[a+1 .. a+1+argc] — deliberately
                         // offset from `a` itself, which the scheduler will
-                        // overwrite with the new process's Pid once it
-                        // exists (see Opcode::Spawn's doc comment).
+                        // overwrite with a Cap to the child once it exists
+                        // (see Opcode::Spawn / FlowCap).
                         args.push(trap!(self.get_reg(instr.a + 1 + i)));
                     }
                     return VmResult::Spawn { function: instr.imm as u32, args, dest_reg: instr.a };
@@ -376,21 +376,93 @@ impl Vm {
                 Opcode::Send => {
                     let target = trap!(self.get_reg(instr.a));
                     let message = trap!(self.get_reg(instr.b));
-                    let pid = match target.as_pid() {
-                        Some(p) => p,
+                    let cap = match target.as_cap() {
+                        Some(c) => c,
                         None => {
-                            return VmResult::Trap(Fault::TypeMismatch { expected: "pid", got: target.type_name() })
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "cap",
+                                got: target.type_name(),
+                            })
                         }
                     };
-                    return VmResult::Send { target: pid, message };
+                    if message.as_message().is_none() {
+                        return VmResult::Trap(Fault::TypeMismatch {
+                            expected: "message",
+                            got: message.type_name(),
+                        });
+                    }
+                    return VmResult::Send {
+                        target_cap: cap,
+                        message,
+                    };
                 }
                 Opcode::Receive => {
-                    return VmResult::Receive { dest_reg: instr.a, timeout: None };
+                    return VmResult::Receive {
+                        dest_reg: instr.a,
+                        timeout: None,
+                        match_tag: None,
+                    };
                 }
                 Opcode::ReceiveTimeout => {
                     let millis = trap!(self.get_reg(instr.b));
                     let ms = millis.as_int().unwrap_or(0).max(0) as u64;
-                    return VmResult::Receive { dest_reg: instr.a, timeout: Some(Duration::from_millis(ms)) };
+                    return VmResult::Receive {
+                        dest_reg: instr.a,
+                        timeout: Some(Duration::from_millis(ms)),
+                        match_tag: None,
+                    };
+                }
+                Opcode::ReceiveMatch => {
+                    let tag_v = trap!(self.get_reg(instr.b));
+                    let tag = match tag_from_value(&tag_v) {
+                        Ok(t) => t,
+                        Err(f) => return VmResult::Trap(f),
+                    };
+                    return VmResult::Receive {
+                        dest_reg: instr.a,
+                        timeout: None,
+                        match_tag: Some(tag),
+                    };
+                }
+                Opcode::ReceiveMatchImm => {
+                    let tag = match u16::try_from(instr.imm) {
+                        Ok(t) if instr.imm >= 0 => t,
+                        _ => {
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "tag u16",
+                                got: "imm-out-of-range",
+                            })
+                        }
+                    };
+                    return VmResult::Receive {
+                        dest_reg: instr.a,
+                        timeout: None,
+                        match_tag: Some(tag),
+                    };
+                }
+                Opcode::Ask => {
+                    let target = trap!(self.get_reg(instr.b));
+                    let request = trap!(self.get_reg(instr.c));
+                    let cap = match target.as_cap() {
+                        Some(c) => c,
+                        None => {
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "cap",
+                                got: target.type_name(),
+                            })
+                        }
+                    };
+                    if request.as_message().is_none() {
+                        return VmResult::Trap(Fault::TypeMismatch {
+                            expected: "message",
+                            got: request.type_name(),
+                        });
+                    }
+                    return VmResult::Ask {
+                        dest_reg: instr.a,
+                        target_cap: cap,
+                        request,
+                    };
                 }
                 Opcode::Trap => return VmResult::Trap(Fault::Explicit(instr.imm)),
             }
@@ -399,7 +471,7 @@ impl Vm {
     }
 
     /// Pop the current frame, delivering `value` to the caller (or
-    /// finishing the process if this was the outermost frame). Returns
+    /// finishing the Flow if this was the outermost frame). Returns
     /// `Ok(Some(VmResult::Complete(_)))` only in the latter case.
     fn pop_frame(&mut self, value: Value) -> Result<Option<VmResult>, Fault> {
         let finished = self
@@ -435,5 +507,21 @@ fn as_f64(v: &Value) -> Result<f64, Fault> {
         Value::Int(i) => Ok(*i as f64),
         Value::Float(f) => Ok(*f),
         other => Err(Fault::TypeMismatch { expected: "int or float", got: other.type_name() }),
+    }
+}
+
+/// Decode a Message tag from a register value (`Int` in `0..=u16::MAX`).
+#[inline]
+fn tag_from_value(v: &Value) -> Result<u16, Fault> {
+    match v.as_int() {
+        Some(i) if (0..=i64::from(u16::MAX)).contains(&i) => Ok(i as u16),
+        Some(_) => Err(Fault::TypeMismatch {
+            expected: "tag u16",
+            got: "int-out-of-range",
+        }),
+        None => Err(Fault::TypeMismatch {
+            expected: "int",
+            got: v.type_name(),
+        }),
     }
 }

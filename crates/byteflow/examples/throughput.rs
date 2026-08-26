@@ -6,7 +6,7 @@
 
 use std::time::Instant;
 
-use byteflow::{ChunkBuilder, ProcessOutcome, Runtime, RuntimeConfig, Value};
+use byteflow::{ChunkBuilder, FlowOutcome, Runtime, RuntimeConfig, Value};
 
 fn trivial_chunk() -> byteflow::Chunk {
     let mut b = ChunkBuilder::new("throughput");
@@ -57,7 +57,7 @@ fn main() {
     }
     let mut ok = 0u32;
     for h in handles {
-        if matches!(h.join(), ProcessOutcome::Completed(Value::Int(1))) {
+        if matches!(h.join(), FlowOutcome::Completed(Value::Int(1))) {
             ok += 1;
         }
     }
