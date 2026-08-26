@@ -15,7 +15,7 @@
 
 Never:
 
-```rust
+```text
 lock.lock().unwrap()
 lock.lock().unwrap_or_else(|e| e.into_inner())
 ```
@@ -34,7 +34,7 @@ Tests are allowed unwrap/expect via `cfg_attr(test, allow(...))` on the lib crat
 
 ## Host API (category A)
 
-```rust
+```text
 let rt = Runtime::new(chunk)?;                         // SpawnError::VerifyFailed | ThreadSpawnFailed
 let handle = rt.spawn(fn_idx, &args)?;                 // SpawnError::BadFunction | …
 let sup = Supervisor::new(rt.spawner())?;

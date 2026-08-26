@@ -19,7 +19,7 @@
 //!
 //! | Index | Name | Role |
 //! |------:|------|------|
-//! | 0 | `print` | host stdout log line (actor-visible) |
+//! | 0 | `print` | host stdout log line (flow-visible) |
 //! | 1 | `now_ms` | wall-clock millis as `Value::Int` |
 //! | 2 | `make_msg` | build [`crate::Message`] from four scalars (**untrusted** `sender`) |
 //! | 3 | `msg_sender` | extract `sender` → `Value::Pid` (authenticated **after** delivery) |

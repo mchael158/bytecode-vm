@@ -2,6 +2,13 @@
 
 All notable changes to **byteflow-actors** are documented here.
 
+## [0.5.1] — 2026-08-26
+
+### Docs
+- Crate rustdoc rewritten for docs.rs: Atomic Hop, FlowCap, value table,
+  scalar + ping-pong examples.
+- Guides rendered on docs.rs via `byteflow::docs::{atomic_hop, security, error_model}`.
+
 ## [0.5.0] — 2026-08-26
 
 ### Breaking

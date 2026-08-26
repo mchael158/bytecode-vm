@@ -65,11 +65,16 @@ pub struct Shared {
     pub(crate) quantum: u32,
 }
 
-/// A running Byteflow runtime: a fixed pool of worker threads plus one
-/// timer thread, all operating on flows compiled from a single shared
-/// [`Chunk`] (VM + M:N scheduler + spawn/yield/sleep/mailboxes + FlowCap —
-/// see the crate-level docs for what's intentionally *not* here yet: JIT,
-/// native quotas, distribution).
+/// A running Byteflow runtime: worker pool + timer thread over one shared
+/// [`Chunk`].
+///
+/// Owns M:N scheduling for **flows** (spawn, yield, sleep, mailboxes,
+/// FlowCap resolution, supervised restarts). Intentionally *not* here yet:
+/// JIT, native quotas, distribution across machines.
+///
+/// Construct with [`Runtime::new`] (no natives) or
+/// [`Runtime::with_natives`] when the chunk uses `CallNative` /
+/// [`crate::std_native_table`].
 pub struct Runtime {
     shared: Arc<Shared>,
     chunk: Arc<Chunk>,
@@ -90,8 +95,8 @@ impl Runtime {
         Self::with_config(chunk, RuntimeConfig::default())
     }
 
-    /// Construct a runtime whose processes can call into `natives` via
-    /// `Opcode::CallNative` — the real FFI boundary (design notes §30-31).
+    /// Construct a runtime whose flows can call into `natives` via
+    /// `Opcode::CallNative` — the host FFI boundary.
     pub fn with_natives(chunk: Chunk, natives: Arc<NativeTable>) -> Result<Self, SpawnError> {
         Self::with_natives_and_config(chunk, natives, RuntimeConfig::default())
     }

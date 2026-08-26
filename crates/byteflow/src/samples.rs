@@ -1,15 +1,27 @@
-//! Built-in demo chunks assembled with [`crate::ChunkBuilder`].
+﻿//! Built-in demo chunks assembled with [`crate::ChunkBuilder`].
 //!
-//! These are the runtime's "hello world" suite: scalar arithmetic, an
-//! **Atomic Hop** ping-pong, request-reply, **selective receive**
-//! (`ReceiveMatch`), and a deliberate `Trap` for supervisor demos.
+//! Use these as runnable specs of the messaging contract (and as regression
+//! tests). Prefer copying a sample over inventing hop register layouts from
+//! scratch.
+//!
+//! | Sample | Shows |
+//! |--------|--------|
+//! | [`add_forty_two`] | Scalar VM path (no natives) |
+//! | [`ping_pong`] | Cap spawn + Atomic Hop round-trip |
+//! | [`atomic_request_reply`] | Tagged REQ/REP + `print` |
+//! | [`selective_receive`] | `ReceiveMatch` FIFO skip |
+//! | [`ask_reply`] | `Ask` RPC hop |
+//! | [`forged_sender_send`] / [`forged_sender_ask`] | S1: forged `make_msg` sender dies |
+//! | [`boom`] | Immediate trap (supervisor demos) |
+//!
+//! Hop samples require [`crate::std_native_table`].
 
 use crate::{emit_native1_from, emit_native_n, Chunk, ChunkBuilder, Opcode};
 
 /// Native indices (must match [`crate::std_native_map`]).
 ///
 /// Hard-coded here so the sample stays self-contained without looking up
-/// the map at assembly time — the stability test in `natives` guards drift.
+/// the map at assembly time ÔÇö the stability test in `natives` guards drift.
 const N_PRINT: u32 = 0;
 const N_MAKE_MSG: u32 = 2;
 const N_MSG_SENDER: u32 = 3;
@@ -25,10 +37,10 @@ pub const TAG_REQ: i32 = 1;
 pub const TAG_REP: i32 = 2;
 pub const TAG_PING: i32 = 10;
 pub const TAG_PONG: i32 = 11;
-/// Decoy hop for [`selective_receive`] — must be skipped by `ReceiveMatch`.
+/// Decoy hop for [`selective_receive`] ÔÇö must be skipped by `ReceiveMatch`.
 pub const TAG_JUNK: i32 = 99;
 
-/// `r0 = 41 + 1; return r0` — the 60-second sanity chunk.
+/// `r0 = 41 + 1; return r0` ÔÇö the 60-second sanity chunk.
 pub fn add_forty_two() -> Chunk {
     let mut b = ChunkBuilder::new("add-forty-two");
     b.begin_function("main", 0, 2);
@@ -46,7 +58,7 @@ pub fn add_forty_two() -> Chunk {
 /// Requires [`crate::std_native_table`] (`make_msg` / `msg_*`).
 ///
 /// Every `Send` carries exactly one [`crate::Value::Message`] and targets a
-/// [`crate::Value::Cap`] — bare ints / pids trap (Atomic Hop + FlowCap).
+/// [`crate::Value::Cap`] ÔÇö bare ints / pids trap (Atomic Hop + FlowCap).
 pub fn ping_pong() -> Chunk {
     let mut b = ChunkBuilder::new("ping-pong");
 
@@ -96,7 +108,7 @@ pub fn ping_pong() -> Chunk {
 ///
 /// Correlation (`request_id`) and reply routing (`sender`) travel in a
 /// **single** mailbox value. Classic actor runtimes often allow any scalar
-/// on `Send`; Byteflow rejects that — every hop is a typed envelope.
+/// on `Send`; Byteflow rejects that ÔÇö every hop is a typed envelope.
 ///
 /// # Protocol
 ///
@@ -108,7 +120,7 @@ pub fn ping_pong() -> Chunk {
 ///
 /// # Register discipline (`CallNative` clobbers `r[a]`)
 ///
-/// `CallNative ra, …, nc` reads args from `r[a..a+nc]` and writes the
+/// `CallNative ra, ÔÇª, nc` reads args from `r[a..a+nc]` and writes the
 /// result into `r[a]`. Keeping the original `Message` in `r0` therefore
 /// means every unpack is `Move ri, r0` then `CallNative ri, msg_*, 1`.
 /// `make_msg` needs four **contiguous** arg registers; the server rearranges
@@ -147,7 +159,7 @@ pub fn atomic_request_reply() -> Chunk {
     // --- main -------------------------------------------------------------
     // r0 = server Cap
     // r1 = self Cap
-    // r2..r5 = make_msg(self, 1, TAG_REQ, 41) → r2 becomes the request Message
+    // r2..r5 = make_msg(self, 1, TAG_REQ, 41) ÔåÆ r2 becomes the request Message
     // r6 = reply Message
     // r7 = scratch for print / unpack
     b.begin_function("main", 0, 8);
@@ -174,7 +186,7 @@ pub fn atomic_request_reply() -> Chunk {
 /// Requires [`crate::std_native_table`].
 ///
 /// 1. `main` sends junk (`tag=TAG_JUNK`), then request (`tag=TAG_REQ`, payload=41)
-/// 2. `server` does `ReceiveMatchImm TAG_REQ` — must see payload 41, not junk
+/// 2. `server` does `ReceiveMatchImm TAG_REQ` ÔÇö must see payload 41, not junk
 /// 3. replies `TAG_REP` / 42; then classic `Receive` drains the leftover junk
 /// 4. `main` returns reply payload `42`
 pub fn selective_receive() -> Chunk {
@@ -200,7 +212,7 @@ pub fn selective_receive() -> Chunk {
     emit_native1_from!(b, 3, 0, N_MSG_TAG);
     b.emit_load_imm(7, TAG_JUNK);
     b.emit_binop(Opcode::Eq, 3, 3, 7);
-    // Branch jumps when falsy: not-equal → trap
+    // Branch jumps when falsy: not-equal ÔåÆ trap
     let trap_lbl = b.new_label();
     b.emit_branch(3, trap_lbl);
     b.emit_exit(4);
@@ -281,7 +293,7 @@ pub fn ask_reply() -> Chunk {
 /// Invariant **S1** from `docs/security.md`: structural Atomic Hop typing
 /// alone cannot stop a module from writing `sender = 999` into a
 /// [`crate::Message`]. The scheduler overwrites that field on bytecode
-/// `Send`, so the server’s `msg_sender` / echoed payload reflects the **real**
+/// `Send`, so the serverÔÇÖs `msg_sender` / echoed payload reflects the **real**
 /// client flow id.
 ///
 /// # Protocol
@@ -364,7 +376,7 @@ pub fn forged_sender_ask() -> Chunk {
     b.finish()
 }
 
-/// Immediate `Trap` — used to show [`crate::Supervisor`] restart.
+/// Immediate `Trap` ÔÇö used to show [`crate::Supervisor`] restart.
 pub fn boom() -> Chunk {
     let mut b = ChunkBuilder::new("boom");
     b.begin_function("boom", 0, 1);
@@ -481,7 +493,7 @@ mod tests {
 
     #[test]
     fn send_overwrites_forged_sender() {
-        // S1: make_msg(sender=999, …) + Send → receiver must not see 999.
+        // S1: make_msg(sender=999, ÔÇª) + Send ÔåÆ receiver must not see 999.
         let chunk = forged_sender_send();
         assert!(verify(&chunk).is_ok());
         let rt = tiny_natives(chunk);
@@ -519,7 +531,7 @@ mod tests {
     fn send_scalar_target_traps() {
         let mut b = ChunkBuilder::new("bad-cap-target");
         b.begin_function("main", 0, 6);
-        b.emit_load_imm(0, 99); // Int — not Cap
+        b.emit_load_imm(0, 99); // Int ÔÇö not Cap
         b.emit_load_imm(1, 0);
         b.emit_load_imm(2, 1);
         b.emit_load_imm(3, TAG_PING);

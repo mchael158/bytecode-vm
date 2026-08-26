@@ -1,12 +1,21 @@
 //! M:N **flows**, mailboxes, timer, supervisor and [`Runtime`].
 //!
-//! A flow is Byteflow's unit of concurrent work. Flows exchange **Atomic Hops**
-//! ([`crate::Value::Message`]) — never bare scalars on `Send` / `Ask`.
+//! A **flow** is Byteflow's unit of concurrent work (not an OS thread). Flows
+//! exchange **Atomic Hops** ([`crate::Value::Message`]) — never bare scalars
+//! on bytecode `Send` / `Ask`.
 //!
-//! Outgoing bytecode hops are **sender-authenticated** and grant a **reply
-//! Cap** (`Message.reply_cap`) before mailbox delivery. `Send` / `Ask` targets
-//! must be [`crate::Value::Cap`] — raw [`crate::Value::Pid`] is identity only.
-//! See `docs/security.md`.
+//! # Authority boundary
+//!
+//! The VM only validates types. This module owns delivery:
+//!
+//! 1. Resolve [`crate::Value::Cap`] → [`FlowId`] + rights ([`CapRights`])
+//! 2. Stamp `Message.sender` and mint `reply_cap` (SEND-only)
+//! 3. Push into the target [`Mailbox`] (anti lost-wakeup under one mutex)
+//!
+//! [`crate::Value::Pid`] is identity inside hops, not an ambient address.
+//! Host [`Runtime::send`] takes [`FlowId`] directly (trusted).
+//!
+//! See [`crate::docs::security`] and [`crate::docs::atomic_hop`].
 
 mod capability;
 mod directory;

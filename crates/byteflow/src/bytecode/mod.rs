@@ -1,5 +1,17 @@
-//! Instruction set, `.bf` (BFV0) format, assembler (`ChunkBuilder`) and verifier.
-//! Pure data — no I/O, no threads.
+//! Instruction set, `.bf` (BFV0) wire format, assembler and verifier.
+//!
+//! Pure data plane — no threads, no mailboxes. The scheduler and VM consume
+//! [`Chunk`] values produced here.
+//!
+//! | Piece | Purpose |
+//! |-------|---------|
+//! | [`Opcode`] / [`Instruction`] | ISA (opcodes are **append-only**) |
+//! | [`Value`] / [`Message`] | Runtime / constant-pool tags (ABI versioned) |
+//! | [`ChunkBuilder`] | Host-side assembler with label back-patching |
+//! | [`encode`] / [`decode`] | `.bf` module bytes (`MAGIC` + [`ABI_VERSION`]) |
+//! | [`verify`] | Structural checks before a [`crate::Runtime`] starts |
+//!
+//! Current ABI: see [`ABI_VERSION`] (FlowCap + `Str` / `Bytes`).
 
 mod builder;
 mod chunk;

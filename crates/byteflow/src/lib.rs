@@ -1,28 +1,57 @@
-//! Byteflow — embeddable register-based **flow** runtime.
+//! Byteflow — embeddable **flow** runtime (package **`byteflow-actors`**).
 //!
-//! # Overview
+//! Not a language, not Tokio, not a JVM. You assemble register bytecode in
+//! host Rust ([`ChunkBuilder`]), spawn many lightweight **flows** on an M:N
+//! scheduler, and they talk through mailboxes with a strict hop protocol.
 //!
-//! Assemble programs with [`ChunkBuilder`] in host Rust (no separate source
-//! language). Spawn lightweight **flows** on an M:N scheduler; they communicate
-//! through FIFO mailboxes via **Atomic Hops** ([`Value::Message`] only on
-//! `Send` / `Ask`) and can be supervised on failure.
+//! Dependents write `use byteflow::...` (crate name) while crates.io lists
+//! the package as [`byteflow-actors`](https://crates.io/crates/byteflow-actors).
 //!
-//! The crates.io package is **`byteflow-actors`**; this library crate is named
-//! `byteflow`, so dependents write `use byteflow::...`.
+//! # What you get
 //!
-//! # Security (authenticated hops + FlowCap)
+//! | Piece | Role |
+//! |-------|------|
+//! | [`ChunkBuilder`] / [`Opcode`] | Assemble `.bf` programs in Rust (no source language) |
+//! | [`Vm`] / [`VmResult`] | Per-flow register interpreter; effects hand off to the scheduler |
+//! | [`Runtime`] | Worker pool + timer; spawn / join / host [`Runtime::send`] |
+//! | [`Value::Message`] | **Atomic Hop** envelope — the only value allowed on `Send` / `Ask` |
+//! | [`Value::Cap`] | **FlowCap** address for bytecode delivery (`Send` / `Ask` targets) |
+//! | [`Supervisor`] | Restart policies when a flow fails |
+//! | [`std_native_table`] | `print`, `now_ms`, `make_msg`, `msg_*`, `msg_reply_cap` |
 //!
-//! Structural typing (`Send` requires [`Value::Message`]) is **not**
-//! authentication or authorization. Bytecode may forge `Message.sender` via
-//! `make_msg`; the scheduler **overwrites** that field and mints a
-//! **SEND**-only `reply_cap` before delivery. `Send` / `Ask` targets must be
-//! [`Value::Cap`] — raw [`Value::Pid`] is identity only.
+//! # Atomic Hop (messaging contract)
 //!
-//! Full threat model, invariants **S1–S7**, and the capability roadmap:
-//! `docs/security.md` in the crate sources (also shipped on docs.rs when
-//! `docs/` is included in the package).
+//! Every bytecode `Send` / `Ask` carries exactly one [`Message`]:
 //!
-//! # Quick example
+//! ```text
+//! Message { sender, reply_cap, request_id, tag, payload }
+//! ```
+//!
+//! - Bare `Int` / `Pid` / `Str` on `Send` → trap / [`SendError::NotAHop`]
+//! - Scheduler **stamps** `sender` (authenticated origin) and mints
+//!   `reply_cap` (SEND-only Cap back to the caller)
+//! - Reply with [`std_native_table`]'s `msg_reply_cap` — **not** `msg_sender`
+//!   (`Pid` is identity, not an address)
+//!
+//! Also: selective receive (`ReceiveMatch`), and `Ask` for correlated RPC.
+//!
+//! # FlowCap (addressing)
+//!
+//! | Value | Use |
+//! |-------|-----|
+//! | [`Value::Cap`] | Target of `Send` / `Ask`; from `SelfPid`, `Spawn`, or `reply_cap` |
+//! | [`Value::Pid`] | Identity inside a delivered hop (`msg_sender`) |
+//!
+//! Host [`Runtime::send`] still takes [`FlowId`] (trusted embedder path).
+//!
+//! # Values (ABI v4)
+//!
+//! `Unit | Bool | Int | Float | Pid | Message | Cap | Str | Bytes`
+//!
+//! `Str` / `Bytes` are `Arc`-backed for cheap register/mailbox clones. They
+//! are **not** Atomic Hops by themselves.
+//!
+//! # Quick start — scalar
 //!
 //! ```
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,10 +72,43 @@
 //! # }
 //! ```
 //!
-//! Host owns I/O. Byteflow owns cheap concurrency.
+//! # Quick start — Atomic Hop (ping-pong)
+//!
+//! Hop demos need the std native table (`make_msg` / `msg_*`):
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use byteflow::{samples, std_native_table, FlowOutcome, Runtime, Value};
+//!
+//! let rt = Runtime::with_natives(samples::ping_pong(), std_native_table())?;
+//! let main = rt.function_index("main").expect("main");
+//! let outcome = rt.spawn(main, &[])?.join();
+//! rt.shutdown();
+//! assert!(matches!(outcome, FlowOutcome::Completed(Value::Int(2))));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! More samples: [`samples::atomic_request_reply`], [`samples::ask_reply`],
+//! [`samples::selective_receive`], forged-sender security regressions.
+//!
+//! # Design guides (rendered on docs.rs)
+//!
+//! - [`docs::atomic_hop`] — hop protocol, Cap addressing, natives table
+//! - [`docs::security`] — threat model, invariants S1–S7, roadmap
+//! - [`docs::error_model`] — fail-closed errors (no production `unwrap`)
+//!
+//! # What this is *not*
+//!
+//! - Not a replacement for Tokio / async Rust (no `.await` IO loop)
+//! - Not a distributed cluster runtime (single process, in-memory mailboxes)
+//! - Not a full object-capability OS (native quotas / Cap attenuation come later)
+//!
+//! Host owns I/O and policy. Byteflow owns cheap concurrency and hop delivery.
 #![forbid(unsafe_code)]
 // Tests may use unwrap/expect for brevity; production paths must not.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod bytecode;
 pub mod log;
@@ -54,6 +116,24 @@ pub mod natives;
 pub mod samples;
 pub mod scheduler;
 pub mod vm;
+
+/// Long-form design notes shipped inside the crate (also under `docs/` on GitHub).
+///
+/// These modules exist so [docs.rs](https://docs.rs/byteflow-actors) shows the
+/// same guides as the repository, not only API rustdoc.
+pub mod docs {
+    /// Atomic Hop: Message-only Send, FlowCap addressing, Ask, selective receive.
+    #[doc = include_str!("../docs/atomic-hop.md")]
+    pub mod atomic_hop {}
+
+    /// Security model: authenticated sender, FlowCap, invariants S1–S7.
+    #[doc = include_str!("../docs/security.md")]
+    pub mod security {}
+
+    /// Fail-closed error taxonomy and mutex policy.
+    #[doc = include_str!("../docs/error-model.md")]
+    pub mod error_model {}
+}
 
 pub use bytecode::{
     asm_macros, decode, disassemble, encode, verify, Chunk, ChunkBuilder, FormatError,
