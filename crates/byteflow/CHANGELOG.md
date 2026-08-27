@@ -2,6 +2,27 @@
 
 All notable changes to **byteflow-actors** are documented here.
 
+## [0.6.0] — 2026-08-27
+
+### Breaking
+- **`RuntimeConfig.mailbox`:** every runtime carries a [`MailboxConfig`]
+  (capacity + overflow). Struct literals that only set `workers` / `quantum`
+  must add `mailbox: MailboxConfig::DEFAULT` (or `..Default::default()`).
+- **`SendError::MailboxFull`:** host `Runtime::send` fails when the target
+  inbox is full under `OverflowPolicy::Reject`.
+- **`NativeTableBuilder::register` / `register_at`** return `Result`
+  (`NativeTableError`) instead of panicking on duplicate name/slot.
+
+### Added
+- Bounded mailboxes: [`MailboxCapacity`] (`1..=1<<20`, default 256),
+  [`OverflowPolicy`] (`Reject` / `DropNewest` / `DropOldest` — no `Block`),
+  [`MailboxStats`], [`Delivery`]. Logical bound ≠ physical allocation.
+- [`docs/mailbox.md`](docs/mailbox.md) + `byteflow::docs::mailbox`.
+
+### Changed
+- Production **and tests** use `Result` / `?` — no `unwrap` / `expect` /
+  `unwrap_or*`. Clippy `unwrap_used` + `expect_used` denied crate-wide.
+
 ## [0.5.1] — 2026-08-26
 
 ### Docs

@@ -35,7 +35,8 @@ The `make_msg` sender argument is untrusted metadata — see
 `SelfPid` / `Spawn` return Caps. Reply with `msg_reply_cap`, not `msg_sender`.
 
 Bare scalars (`Int`, `Pid`, …) on `Send` → VM trap / `SendError::NotAHop`.  
-Mailbox park/push share one mutex → no lost-wakeup (`scheduler/mailbox.rs`).
+Mailbox park/push share one mutex → no lost-wakeup (`scheduler/mailbox/`).
+Inboxes are **bounded** — see [`mailbox.md`](mailbox.md).
 
 ### Selective receive (`ReceiveMatch`)
 

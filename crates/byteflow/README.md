@@ -29,7 +29,7 @@ It is **not** a Tokio replacement, not a distributed cluster, and not a JVM.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.5"
+byteflow-actors = "0.6"
 ```
 
 ```rust
@@ -113,7 +113,7 @@ See [`docs/atomic-hop.md`](docs/atomic-hop.md). Built-in samples:
 |---|---|
 | **Bytecode** | ISA, `ChunkBuilder`, BFV0 (`.bf`) encode/decode, static `verify` |
 | **VM** | One flow: registers, call stack, cooperative quantum, `CallNative` |
-| **Scheduler** | M:N workers, FIFO mailboxes (park/wake), timer, supervisor |
+| **Scheduler** | M:N workers, **bounded** FIFO mailboxes (park/wake), timer, supervisor |
 | **Facade** | Public API + std natives + samples + `byteflow` CLI |
 
 **Flow lifecycle (sketch):**
@@ -157,11 +157,13 @@ byteflow run    <file.bf> [function]
 
 ---
 
-## Status (v0.5)
+## Status (v0.6)
 
-**Included:** register ISA + assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, mailboxes, Atomic Hop, FlowCap, supervisor, std natives, CLI, examples, fail-closed error model.
+**Included:** register ISA + assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, **bounded mailboxes** (`MailboxConfig`, default 256 / Reject), Atomic Hop, FlowCap, supervisor, std natives, CLI, examples, fail-closed error model.
 
-**Not yet:** bounded mailboxes, Criterion benches, timing wheel, JIT, distribution.
+**Not yet:** `WAITING_SEND` backpressure, Criterion benches, JIT, distribution.
+
+Mailbox contract: [`docs/mailbox.md`](docs/mailbox.md).
 
 See [`CHANGELOG.md`](CHANGELOG.md).
 

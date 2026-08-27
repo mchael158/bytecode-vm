@@ -10,7 +10,7 @@ Embeddable concurrency for Rust: register bytecode, **flows**, mailboxes, **Atom
 
 ```toml
 [dependencies]
-byteflow-actors = "0.5"
+byteflow-actors = "0.6"
 ```
 
 ```rust

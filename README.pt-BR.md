@@ -9,7 +9,7 @@ Concorrência embutível em Rust: bytecode, **flows**, mailboxes, **Atomic Hop**
 
 ```toml
 [dependencies]
-byteflow-actors = "0.5"
+byteflow-actors = "0.6"
 ```
 
 ```rust

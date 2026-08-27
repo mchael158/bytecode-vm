@@ -96,8 +96,9 @@
 //! # Design guides (rendered on docs.rs)
 //!
 //! - [`docs::atomic_hop`] — hop protocol, Cap addressing, natives table
+//! - [`docs::mailbox`] — bounded inbox, overflow, lost-wakeup
 //! - [`docs::security`] — threat model, invariants S1–S7, roadmap
-//! - [`docs::error_model`] — fail-closed errors (no production `unwrap`)
+//! - [`docs::error_model`] — fail-closed errors (no `unwrap`)
 //!
 //! # What this is *not*
 //!
@@ -132,6 +133,10 @@ pub mod docs {
     /// Fail-closed error taxonomy and mutex policy.
     #[doc = include_str!("../docs/error-model.md")]
     pub mod error_model {}
+
+    /// Bounded mailbox: capacity contract, overflow, anti lost-wakeup.
+    #[doc = include_str!("../docs/mailbox.md")]
+    pub mod mailbox {}
 }
 
 pub use bytecode::{
