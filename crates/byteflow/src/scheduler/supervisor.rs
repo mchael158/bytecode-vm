@@ -246,9 +246,17 @@ fn intensity_hit(inner: &Inner) -> bool {
         }
     };
     times.push_back(now);
-    let window_start = now.checked_sub(inner.config.max_period).unwrap_or(now);
-    while times.front().map(|t| *t < window_start).unwrap_or(false) {
-        times.pop_front();
+    let window_start = match now.checked_sub(inner.config.max_period) {
+        Some(t) => t,
+        None => now,
+    };
+    loop {
+        match times.front() {
+            Some(t) if *t < window_start => {
+                times.pop_front();
+            }
+            _ => break,
+        }
     }
     if times.len() as u32 > inner.config.max_restarts {
         inner.intensity_exceeded.store(true, Ordering::Release);
@@ -344,15 +352,15 @@ mod tests {
         b.finish()
     }
 
-    fn tiny_runtime(chunk: Chunk) -> Runtime {
+    fn tiny_runtime(chunk: Chunk) -> Result<Runtime, crate::scheduler::SpawnError> {
         Runtime::with_config(
             chunk,
             RuntimeConfig {
                 workers: 1,
                 quantum: 1_000,
+                mailbox: super::super::mailbox::MailboxConfig::DEFAULT,
             },
         )
-        .expect("runtime")
     }
 
     fn wait_until(mut pred: impl FnMut() -> bool) {
@@ -367,12 +375,11 @@ mod tests {
     }
 
     #[test]
-    fn on_failure_does_not_restart_a_clean_exit() {
-        let rt = tiny_runtime(ok_chunk());
-        let sup = Supervisor::new(rt.spawner()).expect("supervisor");
+    fn on_failure_does_not_restart_a_clean_exit() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tiny_runtime(ok_chunk())?;
+        let sup = Supervisor::new(rt.spawner())?;
         let outcome = sup
-            .start_child(ChildSpec::new("main", 0).restart(RestartPolicy::OnFailure))
-            .expect("start_child")
+            .start_child(ChildSpec::new("main", 0).restart(RestartPolicy::OnFailure))?
             .join();
         wait_until(|| sup.live_children() == 0);
         let spawned = rt.metrics().processes_spawned;
@@ -380,22 +387,21 @@ mod tests {
         rt.shutdown();
         assert!(matches!(outcome, FlowOutcome::Completed(_)));
         assert_eq!(spawned, 1);
+        Ok(())
     }
 
     #[test]
-    fn on_failure_restarts_until_intensity() {
-        let rt = tiny_runtime(trap_chunk());
+    fn on_failure_restarts_until_intensity() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tiny_runtime(trap_chunk())?;
         let sup = Supervisor::with_config(
             rt.spawner(),
             SupervisorConfig {
                 max_restarts: 2,
                 max_period: Duration::from_secs(5),
             },
-        )
-        .expect("supervisor");
+        )?;
         let _first = sup
-            .start_child(ChildSpec::new("boom", 0).restart(RestartPolicy::OnFailure))
-            .expect("start_child");
+            .start_child(ChildSpec::new("boom", 0).restart(RestartPolicy::OnFailure))?;
         wait_until(|| sup.intensity_exceeded() && rt.metrics().processes_failed >= 3);
         let spawned = rt.metrics().processes_spawned;
         let failed = rt.metrics().processes_failed;
@@ -404,27 +410,27 @@ mod tests {
         // initial start + 2 restarts, then intensity refuses the 3rd restart
         assert_eq!(spawned, 3);
         assert_eq!(failed, 3);
+        Ok(())
     }
 
     #[test]
-    fn always_restarts_a_clean_exit_until_intensity() {
-        let rt = tiny_runtime(ok_chunk());
+    fn always_restarts_a_clean_exit_until_intensity() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tiny_runtime(ok_chunk())?;
         let sup = Supervisor::with_config(
             rt.spawner(),
             SupervisorConfig {
                 max_restarts: 2,
                 max_period: Duration::from_secs(5),
             },
-        )
-        .expect("supervisor");
+        )?;
         let _ = sup
-            .start_child(ChildSpec::new("main", 0).restart(RestartPolicy::Always))
-            .expect("start_child");
+            .start_child(ChildSpec::new("main", 0).restart(RestartPolicy::Always))?;
         wait_until(|| sup.intensity_exceeded() && rt.metrics().processes_completed >= 3);
         let spawned = rt.metrics().processes_spawned;
         sup.shutdown();
         rt.shutdown();
         assert_eq!(spawned, 3);
+        Ok(())
     }
 
     #[test]

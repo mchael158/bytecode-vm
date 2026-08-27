@@ -182,7 +182,11 @@ impl Vm {
             (Opcode::Lt, _, _) => Value::Bool(as_f64(&a)? < as_f64(&b)?),
             (Opcode::Le, Value::Int(x), Value::Int(y)) => Value::Bool(x <= y),
             (Opcode::Le, _, _) => Value::Bool(as_f64(&a)? <= as_f64(&b)?),
-            _ => unreachable!("numeric_binop called with non-arithmetic opcode {op:?}"),
+            _ => {
+                return Err(Fault::Invariant(
+                    "numeric_binop called with a non-arithmetic opcode",
+                ))
+            }
         };
         self.set_reg(dst, result)
     }
@@ -405,7 +409,10 @@ impl Vm {
                 }
                 Opcode::ReceiveTimeout => {
                     let millis = trap!(self.get_reg(instr.b));
-                    let ms = millis.as_int().unwrap_or(0).max(0) as u64;
+                    let ms = match millis.as_int() {
+                        Some(n) if n >= 0 => n as u64,
+                        _ => 0,
+                    };
                     return VmResult::Receive {
                         dest_reg: instr.a,
                         timeout: Some(Duration::from_millis(ms)),
@@ -485,13 +492,13 @@ impl Vm {
                 // this crate's own builder, but we don't want to panic on
                 // foreign bytecode) by trapping instead.
                 if self.set_reg(dest, value).is_err() {
+                    let frame_size = match self.frames.last() {
+                        Some(f) => f.registers.len() as u8,
+                        None => 0,
+                    };
                     return Ok(Some(VmResult::Trap(Fault::RegisterOutOfRange {
                         reg: dest,
-                        frame_size: self
-                            .frames
-                            .last()
-                            .map(|f| f.registers.len() as u8)
-                            .unwrap_or(0),
+                        frame_size,
                     })));
                 }
                 Ok(None)

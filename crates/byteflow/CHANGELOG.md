@@ -62,7 +62,7 @@ All notable changes to **byteflow-actors** are documented here.
 - `samples::atomic_request_reply` + example `atomic_actors`.
 - Scheduler logs via `BYTEFLOW_LOG` (`crate::log`).
 - Fail-closed mutex helpers + `RuntimeError` / `SpawnError` (`docs/error-model.md`).
-- Clippy: `unwrap_used` and `expect_used` denied in non-test code.
+- Clippy: `unwrap_used` and `expect_used` denied (including tests).
 
 ### Docs
 - `docs/atomic-actors.md`, `docs/error-model.md`.

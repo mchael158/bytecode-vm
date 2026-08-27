@@ -391,10 +391,15 @@ fn deliver(
         }
     };
     match mailbox.push(message.clone()) {
-        Ok(Delivery::Queued) => {
+        Ok(Ok(Delivery::Queued | Delivery::QueuedDropOldest)) => {
             log::debug(format!("deliver queued → flow#{target} msg={message}"));
         }
-        Ok(Delivery::Handoff(mut flow)) => {
+        Ok(Ok(Delivery::DroppedNewest)) => {
+            log::debug(format!(
+                "deliver drop-newest → flow#{target} msg={message}"
+            ));
+        }
+        Ok(Ok(Delivery::Handoff(mut flow))) => {
             log::debug(format!(
                 "deliver handoff → flow#{} msg={}",
                 flow.id.as_u64(),
@@ -409,6 +414,11 @@ fn deliver(
             }
             local.push(flow);
             wake_workers(shared);
+        }
+        Ok(Err(_)) => {
+            log::info(format!(
+                "deliver rejected (mailbox full) → flow#{target} msg={message}"
+            ));
         }
         Err(e) => report_fault(e),
     }

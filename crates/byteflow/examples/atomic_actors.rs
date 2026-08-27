@@ -26,6 +26,7 @@ fn main() {
         RuntimeConfig {
             workers: 2,
             quantum: 10_000,
+            mailbox: byteflow::MailboxConfig::DEFAULT,
         },
     ) {
         Ok(rt) => rt,

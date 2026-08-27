@@ -129,7 +129,10 @@ fn cmd_pack(demo: &str, out: &str) -> Result<(), ()> {
     fs::write(out, bytes).map_err(|e| eprintln!("write {out}: {e}"))?;
     println!(
         "wrote {out} ({} bytes, chunk {:?})",
-        fs::metadata(out).map(|m| m.len()).unwrap_or(0),
+        match fs::metadata(out) {
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        },
         chunk.name
     );
     Ok(())
@@ -177,18 +180,27 @@ fn run_chunk(
         RuntimeConfig {
             workers: 1,
             quantum: byteflow::DEFAULT_QUANTUM,
+            mailbox: byteflow::MailboxConfig::DEFAULT,
         },
     )
     .map_err(|e| eprintln!("runtime: {e}"))?;
 
     let idx = match function {
-        Some(name) => rt.function_index(name).ok_or_else(|| {
-            eprintln!("no function named {name:?}");
-        })?,
-        None => rt
-            .function_index("main")
-            .or_else(|| (!chunk.functions.is_empty()).then_some(0))
-            .ok_or_else(|| eprintln!("chunk has no functions"))?,
+        Some(name) => match rt.function_index(name) {
+            Some(i) => i,
+            None => {
+                eprintln!("no function named {name:?}");
+                return Err(());
+            }
+        },
+        None => match rt.function_index("main") {
+            Some(i) => i,
+            None if !chunk.functions.is_empty() => 0,
+            None => {
+                eprintln!("chunk has no functions");
+                return Err(());
+            }
+        },
     };
 
     let outcome = rt

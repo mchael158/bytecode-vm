@@ -41,6 +41,9 @@ unsafe_code = "forbid"
 [lints.clippy]
 unwrap_used = "deny"
 expect_used = "deny"
+# Clippy otherwise suggests converting `match` into unwrap_or / unwrap_or_default.
+manual_unwrap_or = "allow"
+manual_unwrap_or_default = "allow"
 
 [package.metadata.docs.rs]
 all-features = true

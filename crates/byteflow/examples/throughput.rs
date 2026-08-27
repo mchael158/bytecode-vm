@@ -17,20 +17,25 @@ fn trivial_chunk() -> byteflow::Chunk {
 }
 
 fn main() {
-    let n: u32 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50_000);
+    let n: u32 = match std::env::args().nth(1) {
+        Some(s) => match s.parse() {
+            Ok(v) => v,
+            Err(_) => 50_000,
+        },
+        None => 50_000,
+    };
 
-    let workers = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1);
+    let workers = match std::thread::available_parallelism() {
+        Ok(p) => p.get(),
+        Err(_) => 1,
+    };
 
     let rt = match Runtime::with_config(
         trivial_chunk(),
         RuntimeConfig {
             workers,
             quantum: 10_000,
+            mailbox: byteflow::MailboxConfig::DEFAULT,
         },
     ) {
         Ok(rt) => rt,

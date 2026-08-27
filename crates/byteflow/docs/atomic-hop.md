@@ -106,4 +106,4 @@ cargo run -p byteflow-actors --example atomic_actors
 2. Std natives **0–6 frozen**; **7** is `msg_reply_cap` (append-only thereafter).
 3. Fail-closed: no `PoisonError::into_inner()`; mutex helpers → `Result`.
 4. Preserve long design comments (mailbox, directory, oneshot, timer, sync_lock).
-5. Clippy: `unwrap_used` + `expect_used` = deny (tests may allow).
+5. Clippy: `unwrap_used` + `expect_used` = deny (including tests).

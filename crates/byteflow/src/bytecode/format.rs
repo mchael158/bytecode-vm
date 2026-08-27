@@ -297,7 +297,7 @@ mod tests {
 
 
     #[test]
-    fn roundtrip_preserves_chunk() {
+    fn roundtrip_preserves_chunk() -> Result<(), FormatError> {
         let mut b = ChunkBuilder::new("roundtrip");
         b.begin_function("main", 0, 2);
         let k = b.const_(Value::Int(9));
@@ -308,16 +308,17 @@ mod tests {
         let original = b.finish();
         let bytes = encode(&original);
         assert_eq!(&bytes[..4], &MAGIC);
-        let decoded = decode(&bytes).expect("decode");
+        let decoded = decode(&bytes)?;
         assert!(verify(&decoded).is_ok());
         assert_eq!(decoded.name, original.name);
         assert_eq!(decoded.constants, original.constants);
         assert_eq!(decoded.code, original.code);
         assert_eq!(decoded.functions, original.functions);
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_preserves_message_constant() {
+    fn roundtrip_preserves_message_constant() -> Result<(), FormatError> {
         use super::super::value::Message;
         let mut b = ChunkBuilder::new("msg-const");
         b.begin_function("main", 0, 1);
@@ -325,16 +326,17 @@ mod tests {
         b.emit_load_const(0, k);
         b.emit_return(0);
         let original = b.finish();
-        let decoded = decode(&encode(&original)).expect("decode");
+        let decoded = decode(&encode(&original))?;
         assert_eq!(decoded.constants, original.constants);
         assert_eq!(
             decoded.constants[0],
             Value::Message(Message::new(1, 2, 3, 4))
         );
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_preserves_str_and_bytes_constants() {
+    fn roundtrip_preserves_str_and_bytes_constants() -> Result<(), FormatError> {
         let mut b = ChunkBuilder::new("blob-const");
         b.begin_function("main", 0, 2);
         let ks = b.const_(Value::str("olá"));
@@ -343,10 +345,11 @@ mod tests {
         b.emit_load_const(1, kb);
         b.emit_return(0);
         let original = b.finish();
-        let decoded = decode(&encode(&original)).expect("decode");
+        let decoded = decode(&encode(&original))?;
         assert_eq!(decoded.constants, original.constants);
         assert_eq!(decoded.constants[0].as_str(), Some("olá"));
         assert_eq!(decoded.constants[1].as_bytes(), Some(&[0, 255, 7][..]));
+        Ok(())
     }
 
     #[test]

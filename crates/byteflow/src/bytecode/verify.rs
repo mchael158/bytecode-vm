@@ -71,8 +71,12 @@ pub fn verify(chunk: &Chunk) -> Result<(), VerifyError> {
 
     for def in &chunk.functions {
         if def.entry as usize >= len {
+            let function = match chunk.functions.iter().position(|f| f.name == def.name) {
+                Some(i) => i,
+                None => 0,
+            };
             return Err(VerifyError::EntryOutOfRange {
-                function: chunk.functions.iter().position(|f| f.name == def.name).unwrap_or(0),
+                function,
                 entry: def.entry,
                 len,
             });

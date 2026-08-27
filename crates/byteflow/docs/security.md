@@ -315,7 +315,7 @@ Security changes MUST NOT weaken these synchronization guarantees.
 
 Security failures must fail closed.
 
-Production code MUST NOT use `unwrap()` / `expect()` for runtime security
+Production code MUST NOT use `unwrap()` / `expect()` / `unwrap_or*` for runtime security
 decisions.
 
 Poisoned synchronization primitives MUST NOT be recovered through

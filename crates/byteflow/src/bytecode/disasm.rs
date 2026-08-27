@@ -25,12 +25,10 @@ pub fn disassemble(chunk: &Chunk) -> String {
         );
     }
     for (i, instr) in chunk.code.iter().enumerate() {
-        let label = chunk
-            .functions
-            .iter()
-            .find(|f| f.entry as usize == i)
-            .map(|f| format!("  ; {}", f.name))
-            .unwrap_or_default();
+        let label = match chunk.functions.iter().find(|f| f.entry as usize == i) {
+            Some(f) => format!("  ; {}", f.name),
+            None => String::new(),
+        };
         let _ = writeln!(out, "{i:04}  {instr}{label}");
     }
     out

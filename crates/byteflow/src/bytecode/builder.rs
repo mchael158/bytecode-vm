@@ -265,20 +265,25 @@ impl ChunkBuilder {
     }
 
     /// Resolve every pending jump against its bound label and produce the
-    /// final immutable [`Chunk`]. Panics (a build-time bug, not a runtime
-    /// fault) if a label was referenced but never bound.
+    /// final immutable [`Chunk`].
+    ///
+    /// An unbound label is a host assembly bug. This method does **not**
+    /// panic: the jump is left with relative offset `0` (falls through).
+    /// [`crate::verify`] / [`crate::Runtime::new`] then reject or run a
+    /// no-op jump rather than taking the process down at assemble time.
     pub fn finish(mut self) -> Chunk {
         for (idx, label) in self.pending_jumps.drain(..) {
-            let target = match self.label_targets.get(&label) {
-                Some(t) => *t,
-                None => panic!(
-                    "byteflow-bytecode: unbound label {label:?} in chunk '{}'",
-                    self.name
-                ),
-            };
-            // Relative offset from the instruction *after* this jump.
-            let offset = target as i64 - (idx as i64 + 1);
-            self.code[idx].imm = offset as i32;
+            match self.label_targets.get(&label) {
+                Some(target) => {
+                    // Relative offset from the instruction *after* this jump.
+                    let offset = *target as i64 - (idx as i64 + 1);
+                    self.code[idx].imm = offset as i32;
+                }
+                None => {
+                    // Fail-closed without panic: identity jump (offset 0).
+                    self.code[idx].imm = 0;
+                }
+            }
         }
         Chunk {
             name: self.name,

@@ -391,62 +391,64 @@ mod tests {
         decode, encode, std_native_table, verify, FlowOutcome, Runtime, RuntimeConfig, Value,
     };
 
-    fn tiny(chunk: Chunk) -> Runtime {
+    fn tiny(chunk: Chunk) -> Result<Runtime, crate::SpawnError> {
         Runtime::with_config(
             chunk,
             RuntimeConfig {
                 workers: 1,
                 quantum: 10_000,
+                mailbox: crate::MailboxConfig::DEFAULT,
             },
         )
-        .expect("runtime")
     }
 
-    fn tiny_natives(chunk: Chunk) -> Runtime {
+    fn tiny_natives(chunk: Chunk) -> Result<Runtime, crate::SpawnError> {
         Runtime::with_natives_and_config(
             chunk,
             std_native_table(),
             RuntimeConfig {
                 workers: 1,
                 quantum: 10_000,
+                mailbox: crate::MailboxConfig::DEFAULT,
             },
         )
-        .expect("runtime")
     }
 
     #[test]
-    fn add_forty_two_joins_42() {
-        let rt = tiny(add_forty_two());
-        let idx = rt.function_index("main").expect("main");
-        let outcome = rt.spawn(idx, &[]).expect("spawn").join();
+    fn add_forty_two_joins_42() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tiny(add_forty_two())?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
         rt.shutdown();
         assert!(matches!(outcome, FlowOutcome::Completed(Value::Int(42))));
+        Ok(())
     }
 
     #[test]
-    fn ping_pong_joins_2() {
+    fn ping_pong_joins_2() -> Result<(), Box<dyn std::error::Error>> {
         let chunk = ping_pong();
         assert!(verify(&chunk).is_ok());
         let bytes = encode(&chunk);
-        let chunk = decode(&bytes).expect("decode");
-        let rt = tiny_natives(chunk);
-        let idx = rt.function_index("main").expect("main");
-        let outcome = rt.spawn(idx, &[]).expect("spawn").join();
+        let chunk = decode(&bytes)?;
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
         let sent = rt.metrics().messages_sent;
         rt.shutdown();
         assert!(matches!(outcome, FlowOutcome::Completed(Value::Int(2))));
         assert!(sent >= 2);
+        Ok(())
     }
 
     #[test]
-    fn atomic_request_reply_joins_42() {
+    fn atomic_request_reply_joins_42() -> Result<(), Box<dyn std::error::Error>> {
         let chunk = atomic_request_reply();
         assert!(verify(&chunk).is_ok());
         let bytes = encode(&chunk);
-        let chunk = decode(&bytes).expect("decode");
-        let rt = tiny_natives(chunk);
-        let idx = rt.function_index("main").expect("main");
-        let outcome = rt.spawn(idx, &[]).expect("spawn").join();
+        let chunk = decode(&bytes)?;
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
         let sent = rt.metrics().messages_sent;
         rt.shutdown();
         assert!(
@@ -454,33 +456,35 @@ mod tests {
             "got {outcome:?}"
         );
         assert!(sent >= 1);
+        Ok(())
     }
 
     #[test]
-    fn selective_receive_skips_junk_tag() {
+    fn selective_receive_skips_junk_tag() -> Result<(), Box<dyn std::error::Error>> {
         let chunk = selective_receive();
         assert!(verify(&chunk).is_ok());
         let bytes = encode(&chunk);
-        let chunk = decode(&bytes).expect("decode");
-        let rt = tiny_natives(chunk);
-        let idx = rt.function_index("main").expect("main");
-        let outcome = rt.spawn(idx, &[]).expect("spawn").join();
+        let chunk = decode(&bytes)?;
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
         rt.shutdown();
         assert!(
             matches!(outcome, FlowOutcome::Completed(Value::Int(42))),
             "got {outcome:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn ask_reply_joins_42() {
+    fn ask_reply_joins_42() -> Result<(), Box<dyn std::error::Error>> {
         let chunk = ask_reply();
         assert!(verify(&chunk).is_ok());
         let bytes = encode(&chunk);
-        let chunk = decode(&bytes).expect("decode");
-        let rt = tiny_natives(chunk);
-        let idx = rt.function_index("main").expect("main");
-        let outcome = rt.spawn(idx, &[]).expect("spawn").join();
+        let chunk = decode(&bytes)?;
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
         let sent = rt.metrics().messages_sent;
         rt.shutdown();
         assert!(
@@ -489,49 +493,52 @@ mod tests {
         );
         // request + reply
         assert!(sent >= 2);
+        Ok(())
     }
 
     #[test]
-    fn send_overwrites_forged_sender() {
-        // S1: make_msg(sender=999, ÔÇª) + Send ÔåÆ receiver must not see 999.
+    fn send_overwrites_forged_sender() -> Result<(), Box<dyn std::error::Error>> {
+        // S1: make_msg(sender=999, …) + Send → receiver must not see 999.
         let chunk = forged_sender_send();
         assert!(verify(&chunk).is_ok());
-        let rt = tiny_natives(chunk);
-        let idx = rt.function_index("main").expect("main");
-        let outcome = rt.spawn(idx, &[]).expect("spawn").join();
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
         rt.shutdown();
         match outcome {
             FlowOutcome::Completed(Value::Int(n)) => {
                 assert_ne!(n, 999, "forged make_msg sender must not survive Send");
                 assert!(n >= 1, "authenticated sender must be a live flow id");
+                Ok(())
             }
-            other => panic!("expected Completed(Int), got {other:?}"),
+            other => Err(format!("expected Completed(Int), got {other:?}").into()),
         }
     }
 
     #[test]
-    fn ask_overwrites_forged_request_sender() {
+    fn ask_overwrites_forged_request_sender() -> Result<(), Box<dyn std::error::Error>> {
         // S1 on the Ask request path (same forge, RPC hop).
         let chunk = forged_sender_ask();
         assert!(verify(&chunk).is_ok());
-        let rt = tiny_natives(chunk);
-        let idx = rt.function_index("main").expect("main");
-        let outcome = rt.spawn(idx, &[]).expect("spawn").join();
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
         rt.shutdown();
         match outcome {
             FlowOutcome::Completed(Value::Int(n)) => {
                 assert_ne!(n, 999, "forged make_msg sender must not survive Ask");
                 assert!(n >= 1, "authenticated sender must be a live flow id");
+                Ok(())
             }
-            other => panic!("expected Completed(Int), got {other:?}"),
+            other => Err(format!("expected Completed(Int), got {other:?}").into()),
         }
     }
 
     #[test]
-    fn send_scalar_target_traps() {
+    fn send_scalar_target_traps() -> Result<(), Box<dyn std::error::Error>> {
         let mut b = ChunkBuilder::new("bad-cap-target");
         b.begin_function("main", 0, 6);
-        b.emit_load_imm(0, 99); // Int ÔÇö not Cap
+        b.emit_load_imm(0, 99); // Int — not Cap
         b.emit_load_imm(1, 0);
         b.emit_load_imm(2, 1);
         b.emit_load_imm(3, TAG_PING);
@@ -539,29 +546,31 @@ mod tests {
         emit_native_n!(b, 1, N_MAKE_MSG, 4);
         b.emit_send(0, 1);
         b.emit_return(1);
-        let rt = tiny_natives(b.finish());
-        let outcome = rt.spawn(0, &[]).expect("spawn").join();
+        let rt = tiny_natives(b.finish())?;
+        let outcome = rt.spawn(0, &[])?.join();
         rt.shutdown();
         assert!(
             matches!(outcome, FlowOutcome::Failed(_)),
             "non-Cap Send target must fail, got {outcome:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn send_scalar_is_not_an_atomic_hop() {
+    fn send_scalar_is_not_an_atomic_hop() -> Result<(), Box<dyn std::error::Error>> {
         let mut b = ChunkBuilder::new("bad-hop");
         b.begin_function("main", 0, 2);
         b.emit_self_pid(0);
         b.emit_load_imm(1, 99);
         b.emit_send(0, 1);
         b.emit_return(1);
-        let rt = tiny(b.finish());
-        let outcome = rt.spawn(0, &[]).expect("spawn").join();
+        let rt = tiny(b.finish())?;
+        let outcome = rt.spawn(0, &[])?.join();
         rt.shutdown();
         assert!(
             matches!(outcome, FlowOutcome::Failed(_)),
             "scalar Send must trap, got {outcome:?}"
         );
+        Ok(())
     }
 }

@@ -9,7 +9,7 @@ use crossbeam_deque::{Injector, Stealer, Worker as LocalDeque};
 use super::directory::Directory;
 use super::error::SpawnError;
 use super::handle::FlowHandle;
-use super::mailbox::{Delivery, Mailbox};
+use super::mailbox::{Delivery, Mailbox, MailboxConfig};
 use super::metrics::{RuntimeMetrics, RuntimeMetricsSnapshot};
 use super::process::{Flow, FlowId, RestartPolicy};
 use super::supervisor::SupervisorLink;
@@ -37,11 +37,19 @@ pub struct RuntimeConfig {
     /// Instructions a flow runs before being preempted back to the
     /// scheduler even if it never hits `Yield`.
     pub quantum: u32,
+    /// Memory + overflow contract applied to **every** flow mailbox
+    /// spawned by this runtime (bytecode `Spawn` and host `spawn`).
+    /// See [`MailboxConfig`] / `docs/mailbox.md`.
+    pub mailbox: MailboxConfig,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        RuntimeConfig { workers: num_cpus::get().max(1), quantum: DEFAULT_QUANTUM }
+        RuntimeConfig {
+            workers: num_cpus::get().max(1),
+            quantum: DEFAULT_QUANTUM,
+            mailbox: MailboxConfig::DEFAULT,
+        }
     }
 }
 
@@ -63,6 +71,7 @@ pub struct Shared {
     pub(crate) metrics: RuntimeMetrics,
     pub(crate) shutdown: AtomicBool,
     pub(crate) quantum: u32,
+    pub(crate) mailbox: MailboxConfig,
 }
 
 /// A running Byteflow runtime: worker pool + timer thread over one shared
@@ -135,6 +144,7 @@ impl Runtime {
             metrics: RuntimeMetrics::default(),
             shutdown: AtomicBool::new(false),
             quantum: config.quantum,
+            mailbox: config.mailbox,
         });
 
         let mut workers = Vec::with_capacity(workers_n);
@@ -243,8 +253,10 @@ impl Runtime {
             }
         };
         match mailbox.push(message.clone()) {
-            Ok(Delivery::Queued) => Ok(()),
-            Ok(Delivery::Handoff(mut flow)) => {
+            Ok(Ok(Delivery::Queued | Delivery::QueuedDropOldest | Delivery::DroppedNewest)) => {
+                Ok(())
+            }
+            Ok(Ok(Delivery::Handoff(mut flow))) => {
                 if let Some(dest) = flow.last_receive_dest {
                     let _ = flow.vm.resume_with(dest, message);
                 }
@@ -252,6 +264,7 @@ impl Runtime {
                 wake_workers(&self.shared);
                 Ok(())
             }
+            Ok(Err(_)) => Err(SendError::MailboxFull(target)),
             Err(e) => {
                 super::error::report_fault(e);
                 Err(SendError::NoSuchFlow(target))
@@ -297,6 +310,8 @@ pub enum SendError {
     NoSuchFlow(FlowId),
     /// Atomic Hop rule: only [`crate::Value::Message`] may cross `Send`.
     NotAHop { got: &'static str },
+    /// Target inbox is at its logical capacity ([`OverflowPolicy::Reject`]).
+    MailboxFull(FlowId),
 }
 
 impl std::fmt::Display for SendError {
@@ -306,6 +321,7 @@ impl std::fmt::Display for SendError {
             SendError::NotAHop { got } => {
                 write!(f, "atomic hop requires Value::Message, got {got}")
             }
+            SendError::MailboxFull(id) => write!(f, "mailbox full for {id}"),
         }
     }
 }
@@ -331,7 +347,7 @@ pub(crate) fn spawn_on(
 ) -> Result<FlowHandle, SpawnError> {
     let id = super::process::next_flow_id();
     let vm = Vm::new(chunk.clone(), natives.clone(), function, args)?;
-    let mailbox = Arc::new(Mailbox::new());
+    let mailbox = Arc::new(Mailbox::with_config(shared.mailbox));
     if let Err(e) = shared.directory.register(id, mailbox.clone()) {
         super::error::report_fault(e);
         return Err(SpawnError::VmInit(
@@ -425,20 +441,20 @@ mod tests {
     }
 
     #[test]
-    fn spawn_and_join_add() {
+    fn spawn_and_join_add() -> Result<(), Box<dyn std::error::Error>> {
         let rt = Runtime::with_config(
             add_chunk(),
             RuntimeConfig {
                 workers: 1,
                 quantum: 1_000,
+                mailbox: MailboxConfig::DEFAULT,
             },
-        )
-        .expect("runtime");
-        let outcome = rt.spawn(0, &[]).expect("spawn").join();
+        )?;
+        let outcome = rt.spawn(0, &[])?.join();
         rt.shutdown();
         match outcome {
-            FlowOutcome::Completed(Value::Int(42)) => {}
-            other => panic!("unexpected outcome: {other:?}"),
+            FlowOutcome::Completed(Value::Int(42)) => Ok(()),
+            other => Err(format!("unexpected outcome: {other:?}").into()),
         }
     }
 }

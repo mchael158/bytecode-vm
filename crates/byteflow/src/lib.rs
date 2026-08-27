@@ -81,8 +81,9 @@
 //! use byteflow::{samples, std_native_table, FlowOutcome, Runtime, Value};
 //!
 //! let rt = Runtime::with_natives(samples::ping_pong(), std_native_table())?;
-//! let main = rt.function_index("main").expect("main");
-//! let outcome = rt.spawn(main, &[])?.join();
+//! let Some(main) = rt.function_index("main") else { return Ok(()); };
+//! let handle = rt.spawn(main, &[])?;
+//! let outcome = handle.join();
 //! rt.shutdown();
 //! assert!(matches!(outcome, FlowOutcome::Completed(Value::Int(2))));
 //! # Ok(())
@@ -106,8 +107,6 @@
 //!
 //! Host owns I/O and policy. Byteflow owns cheap concurrency and hop delivery.
 #![forbid(unsafe_code)]
-// Tests may use unwrap/expect for brevity; production paths must not.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod bytecode;
@@ -142,14 +141,15 @@ pub use bytecode::{
 pub use natives::{std_native_map, std_native_table, std_natives};
 pub use scheduler::{
     fault_count, next_flow_id, flow_id_from_u64, report_fault, CapId, CapRights, ChildSpec,
-    Delivery, Mailbox, Flow, FlowHandle, FlowId, FlowMetrics, FlowOutcome, FlowState,
+    Delivery, Mailbox, MailboxCapacity, MailboxConfig, MailboxFull, MailboxStats, OverflowPolicy,
+    Flow, FlowHandle, FlowId, FlowMetrics, FlowOutcome, FlowState,
     RestartPolicy, Runtime, RuntimeConfig, RuntimeError, RuntimeMetrics,
     RuntimeMetricsSnapshot, RuntimeSpawner, SendError, SpawnError, Supervisor,
     SupervisorConfig, DEFAULT_QUANTUM,
 };
 pub use vm::{
     expect_arg, expect_bool, expect_int, expect_message, expect_u64, Fault, NativeFn,
-    NativeResult, NativeTable, NativeTableBuilder, Vm, VmResult, MAX_CALL_DEPTH,
+    NativeResult, NativeTable, NativeTableBuilder, NativeTableError, Vm, VmResult, MAX_CALL_DEPTH,
 };
 
 #[cfg(test)]
@@ -159,15 +159,15 @@ mod tests {
     #[test]
     fn std_native_map_has_stable_indices() {
         let map = std_native_map();
-        assert_eq!(map["print"], 0);
-        assert_eq!(map["now_ms"], 1);
-        assert_eq!(map["make_msg"], 2);
-        assert_eq!(map["msg_payload"], 6);
-        assert_eq!(map["msg_reply_cap"], 7);
+        assert_eq!(map.get("print"), Some(&0));
+        assert_eq!(map.get("now_ms"), Some(&1));
+        assert_eq!(map.get("make_msg"), Some(&2));
+        assert_eq!(map.get("msg_payload"), Some(&6));
+        assert_eq!(map.get("msg_reply_cap"), Some(&7));
     }
 
     #[test]
-    fn chunk_builder_with_std_natives() {
+    fn chunk_builder_with_std_natives() -> Result<(), Box<dyn std::error::Error>> {
         let mut b = ChunkBuilder::new("std-natives-demo");
         b.begin_function("main", 0, 2);
         b.emit_load_imm(0, 42);
@@ -176,15 +176,18 @@ mod tests {
         b.emit_return(1);
 
         let chunk = b.finish();
-        verify(&chunk).expect("verify");
+        verify(&chunk)?;
 
-        let rt = Runtime::with_natives(chunk, std_native_table()).expect("runtime");
-        let outcome = rt.spawn(0, &[]).expect("spawn").join();
+        let rt = Runtime::with_natives(chunk, std_native_table())?;
+        let outcome = rt.spawn(0, &[])?.join();
         rt.shutdown();
 
         match outcome {
-            FlowOutcome::Completed(Value::Int(ms)) => assert!(ms >= 0),
-            other => panic!("expected Completed(Value::Int(_)), got {other:?}"),
+            FlowOutcome::Completed(Value::Int(ms)) => {
+                assert!(ms >= 0);
+                Ok(())
+            }
+            other => Err(format!("expected Completed(Value::Int(_)), got {other:?}").into()),
         }
     }
 }

@@ -22,7 +22,7 @@ pub use fault::Fault;
 pub use machine::{Vm, MAX_CALL_DEPTH};
 pub use native::{
     expect_arg, expect_bool, expect_int, expect_message, expect_u64, NativeFn, NativeResult,
-    NativeTable, NativeTableBuilder,
+    NativeTable, NativeTableBuilder, NativeTableError,
 };
 pub use result::VmResult;
 pub use crate::bytecode::Value;

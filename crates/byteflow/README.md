@@ -149,7 +149,7 @@ byteflow run    <file.bf> [function]
 - `#![forbid(unsafe_code)]`
 - Flow panics are caught at the worker boundary so one bad flow cannot kill the OS thread.
 - Native functions must **not block** — they run inline on a worker.
-- Host APIs return `Result` (`SpawnError` / `RuntimeError`) — no `unwrap`/`expect` on production paths (see [`docs/error-model.md`](docs/error-model.md)).
+- Host APIs return `Result` (`SpawnError` / `RuntimeError`) — no `unwrap`/`expect`/`unwrap_or*` anywhere (see [`docs/error-model.md`](docs/error-model.md)).
 - Values today: `Unit | Bool | Int | Float | Pid | Message | Cap | Str | Bytes`.
 - **Atomic Hop:** only `Value::Message` may cross `Send`.
 - **FlowCap:** bytecode `Send`/`Ask` targets are `Value::Cap`; replies use `msg_reply_cap`.

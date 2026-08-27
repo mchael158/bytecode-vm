@@ -53,10 +53,10 @@ fn level() -> u8 {
 
 fn stamp_ms() -> u64 {
     // Logging must never panic: a broken clock just prints epoch-ish 0.
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as u64,
+        Err(_) => 0,
+    }
 }
 
 /// Override the cached level (tests only). `0` off, `1` info, `2` debug.

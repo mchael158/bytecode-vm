@@ -68,7 +68,7 @@ pub fn std_native_map() -> HashMap<String, u32> {
 /// or `print` / `now_ms`. Chunks that never `CallNative` can keep
 /// [`crate::NativeTable::empty`].
 pub fn std_native_table() -> Arc<NativeTable> {
-    NativeTable::builder()
+    let built = NativeTable::builder()
         .register("print", |args| {
             // Space-separated Display forms, trailing newline — mirrors a
             // tiny "println!("{:?}", …)" for bytecode without allocating a
@@ -84,68 +84,85 @@ pub fn std_native_table() -> Arc<NativeTable> {
             println!();
             Ok(Value::Unit)
         })
-        .register("now_ms", |_| {
-            let duration = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| Fault::NativeError(format!("system clock error: {e}")))?;
-            let millis = i64::try_from(duration.as_millis())
-                .map_err(|_| Fault::NativeError("system clock value exceeds i64".into()))?;
-            Ok(Value::Int(millis))
+        .and_then(|b| {
+            b.register("now_ms", |_| {
+                let duration = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|e| Fault::NativeError(format!("system clock error: {e}")))?;
+                let millis = i64::try_from(duration.as_millis())
+                    .map_err(|_| Fault::NativeError("system clock value exceeds i64".into()))?;
+                Ok(Value::Int(millis))
+            })
         })
-        .register("make_msg", |args| {
-            // Args: sender, request_id, tag, payload — each Int≥0, Pid, Cap, or Bool.
-            // Tag must fit `u16` (protocol discriminator width on the wire).
-            //
-            // # Security (crates.io contract)
-            //
-            // The first argument is retained so existing `.bf` modules and
-            // samples keep a stable CallNative layout (indices 0–6 frozen;
-            // 7 = msg_reply_cap appended). It is **not** an authentication
-            // primitive:
-            //
-            // - Before `Send` / `Ask`, `sender` is ordinary register data.
-            // - At delivery, the worker stamps `Message.sender` and mints
-            //   `reply_cap` (`Message::authenticate`).
-            // - After a hop is received, `msg_sender` / `msg_reply_cap`
-            //   reflect runtime identity and the SEND grant (S1 + FlowCap).
-            //
-            // Host code that only builds messages in memory (never sends)
-            // still sees the constructed field unchanged.
-            let sender = expect_u64(args, 0, "make_msg")?;
-            let request_id = expect_u64(args, 1, "make_msg")?;
-            let tag = expect_u64(args, 2, "make_msg")?;
-            let payload = expect_u64(args, 3, "make_msg")?;
-            let tag = u16::try_from(tag).map_err(|_| {
-                Fault::NativeError(format!("make_msg: tag {tag} does not fit in u16"))
-            })?;
-            Ok(Value::Message(Message::new(sender, request_id, tag, payload)))
+        .and_then(|b| {
+            b.register("make_msg", |args| {
+                // Args: sender, request_id, tag, payload — each Int≥0, Pid, Cap, or Bool.
+                // Tag must fit `u16` (protocol discriminator width on the wire).
+                //
+                // # Security (crates.io contract)
+                //
+                // The first argument is retained so existing `.bf` modules and
+                // samples keep a stable CallNative layout (indices 0–6 frozen;
+                // 7 = msg_reply_cap appended). It is **not** an authentication
+                // primitive:
+                //
+                // - Before `Send` / `Ask`, `sender` is ordinary register data.
+                // - At delivery, the worker stamps `Message.sender` and mints
+                //   `reply_cap` (`Message::authenticate`).
+                // - After a hop is received, `msg_sender` / `msg_reply_cap`
+                //   reflect runtime identity and the SEND grant (S1 + FlowCap).
+                //
+                // Host code that only builds messages in memory (never sends)
+                // still sees the constructed field unchanged.
+                let sender = expect_u64(args, 0, "make_msg")?;
+                let request_id = expect_u64(args, 1, "make_msg")?;
+                let tag = expect_u64(args, 2, "make_msg")?;
+                let payload = expect_u64(args, 3, "make_msg")?;
+                let tag = u16::try_from(tag).map_err(|_| {
+                    Fault::NativeError(format!("make_msg: tag {tag} does not fit in u16"))
+                })?;
+                Ok(Value::Message(Message::new(sender, request_id, tag, payload)))
+            })
         })
-        .register("msg_sender", |args| {
-            // After mailbox delivery this is the runtime-stamped origin.
-            // Identity only — not a Send/Ask address (use `msg_reply_cap`).
-            Ok(Value::Pid(expect_message(args, 0, "msg_sender")?.sender))
+        .and_then(|b| {
+            b.register("msg_sender", |args| {
+                // After mailbox delivery this is the runtime-stamped origin.
+                // Identity only — not a Send/Ask address (use `msg_reply_cap`).
+                Ok(Value::Pid(expect_message(args, 0, "msg_sender")?.sender))
+            })
         })
-        .register("msg_request_id", |args| {
-            Ok(Value::Int(
-                expect_message(args, 0, "msg_request_id")?.request_id as i64,
-            ))
+        .and_then(|b| {
+            b.register("msg_request_id", |args| {
+                Ok(Value::Int(
+                    expect_message(args, 0, "msg_request_id")?.request_id as i64,
+                ))
+            })
         })
-        .register("msg_tag", |args| {
-            Ok(Value::Int(i64::from(
-                expect_message(args, 0, "msg_tag")?.tag,
-            )))
+        .and_then(|b| {
+            b.register("msg_tag", |args| {
+                Ok(Value::Int(i64::from(expect_message(args, 0, "msg_tag")?.tag)))
+            })
         })
-        .register("msg_payload", |args| {
-            Ok(Value::Int(
-                expect_message(args, 0, "msg_payload")?.payload as i64,
-            ))
+        .and_then(|b| {
+            b.register("msg_payload", |args| {
+                Ok(Value::Int(
+                    expect_message(args, 0, "msg_payload")?.payload as i64,
+                ))
+            })
         })
-        .register("msg_reply_cap", |args| {
-            Ok(Value::Cap(
-                expect_message(args, 0, "msg_reply_cap")?.reply_cap,
-            ))
-        })
-        .build()
+        .and_then(|b| {
+            b.register("msg_reply_cap", |args| {
+                Ok(Value::Cap(
+                    expect_message(args, 0, "msg_reply_cap")?.reply_cap,
+                ))
+            })
+        });
+    // Unique sequential names cannot hit DuplicateName / SlotOccupied.
+    // Empty table on Err: fail-closed (CallNative → BadNative), never panic.
+    match built {
+        Ok(b) => b.build(),
+        Err(_) => NativeTable::empty(),
+    }
 }
 
 /// Build the default native table and its matching name map together.
@@ -169,14 +186,14 @@ mod tests {
     #[test]
     fn std_native_indices_are_stable() {
         let map = std_native_map();
-        assert_eq!(map["print"], 0);
-        assert_eq!(map["now_ms"], 1);
-        assert_eq!(map["make_msg"], 2);
-        assert_eq!(map["msg_sender"], 3);
-        assert_eq!(map["msg_request_id"], 4);
-        assert_eq!(map["msg_tag"], 5);
-        assert_eq!(map["msg_payload"], 6);
-        assert_eq!(map["msg_reply_cap"], 7);
+        assert_eq!(map.get("print"), Some(&0));
+        assert_eq!(map.get("now_ms"), Some(&1));
+        assert_eq!(map.get("make_msg"), Some(&2));
+        assert_eq!(map.get("msg_sender"), Some(&3));
+        assert_eq!(map.get("msg_request_id"), Some(&4));
+        assert_eq!(map.get("msg_tag"), Some(&5));
+        assert_eq!(map.get("msg_payload"), Some(&6));
+        assert_eq!(map.get("msg_reply_cap"), Some(&7));
     }
 
     #[test]
@@ -189,51 +206,42 @@ mod tests {
     }
 
     #[test]
-    fn now_ms_returns_non_negative_int() {
+    fn now_ms_returns_non_negative_int() -> Result<(), Box<dyn std::error::Error>> {
         let table = std_native_table();
-        let now_ms = table.get(1).expect("now_ms native");
-        let value = now_ms(&[]).expect("clock read");
+        let now_ms = table.get(1).ok_or("now_ms native")?;
+        let value = now_ms(&[])?;
         assert!(matches!(value, Value::Int(ms) if ms >= 0));
+        Ok(())
     }
 
     #[test]
-    fn make_msg_and_unpack_round_trip() {
+    fn make_msg_and_unpack_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let table = std_native_table();
-        let make = table.get(2).expect("make_msg");
+        let make = table.get(2).ok_or("make_msg")?;
         let msg = make(&[
             Value::Pid(9),
             Value::Int(3),
             Value::Int(7),
             Value::Int(42),
-        ])
-        .unwrap();
+        ])?;
         assert_eq!(msg.as_message(), Some(Message::new(9, 3, 7, 42)));
-        assert_eq!(
-            table.get(3).unwrap()(std::slice::from_ref(&msg)).unwrap(),
-            Value::Pid(9)
-        );
-        assert_eq!(
-            table.get(4).unwrap()(std::slice::from_ref(&msg)).unwrap(),
-            Value::Int(3)
-        );
-        assert_eq!(
-            table.get(5).unwrap()(std::slice::from_ref(&msg)).unwrap(),
-            Value::Int(7)
-        );
-        assert_eq!(
-            table.get(6).unwrap()(std::slice::from_ref(&msg)).unwrap(),
-            Value::Int(42)
-        );
-        assert_eq!(
-            table.get(7).unwrap()(std::slice::from_ref(&msg)).unwrap(),
-            Value::Cap(0)
-        );
+        let sender = table.get(3).ok_or("msg_sender")?;
+        let req = table.get(4).ok_or("msg_request_id")?;
+        let tag = table.get(5).ok_or("msg_tag")?;
+        let payload = table.get(6).ok_or("msg_payload")?;
+        let cap = table.get(7).ok_or("msg_reply_cap")?;
+        assert_eq!(sender(std::slice::from_ref(&msg))?, Value::Pid(9));
+        assert_eq!(req(std::slice::from_ref(&msg))?, Value::Int(3));
+        assert_eq!(tag(std::slice::from_ref(&msg))?, Value::Int(7));
+        assert_eq!(payload(std::slice::from_ref(&msg))?, Value::Int(42));
+        assert_eq!(cap(std::slice::from_ref(&msg))?, Value::Cap(0));
+        Ok(())
     }
 
     #[test]
-    fn print_accepts_all_current_values() {
+    fn print_accepts_all_current_values() -> Result<(), Box<dyn std::error::Error>> {
         let table = std_native_table();
-        let print = table.get(0).expect("print native");
+        let print = table.get(0).ok_or("print native")?;
         let values = [
             Value::Unit,
             Value::Bool(true),
@@ -245,13 +253,15 @@ mod tests {
             Value::str("hello"),
             Value::bytes([1u8, 2, 3]),
         ];
-        assert_eq!(print(&values).unwrap(), Value::Unit);
+        assert_eq!(print(&values)?, Value::Unit);
+        Ok(())
     }
 
     #[test]
-    fn print_with_no_args_still_returns_unit() {
+    fn print_with_no_args_still_returns_unit() -> Result<(), Box<dyn std::error::Error>> {
         let table = std_native_table();
-        let print = table.get(0).expect("print native");
-        assert_eq!(print(&[]).unwrap(), Value::Unit);
+        let print = table.get(0).ok_or("print native")?;
+        assert_eq!(print(&[])?, Value::Unit);
+        Ok(())
     }
 }

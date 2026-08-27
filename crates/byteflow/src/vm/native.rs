@@ -71,6 +71,31 @@ impl NativeTable {
     }
 }
 
+/// Host error while building a [`NativeTable`] (duplicate name or occupied slot).
+///
+/// Category A: the embedder misconfigured FFI. Never a panic — `std_native_table`
+/// and host tables must surface this as `Result`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeTableError {
+    DuplicateName(String),
+    SlotOccupied { index: u32, name: String },
+}
+
+impl std::fmt::Display for NativeTableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NativeTableError::DuplicateName(name) => {
+                write!(f, "duplicate native function registered: '{name}'")
+            }
+            NativeTableError::SlotOccupied { index, name } => {
+                write!(f, "native slot {index} already occupied (registering '{name}')")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeTableError {}
+
 /// Fluent builder for a [`NativeTable`].
 ///
 /// - [`Self::register`] — next sequential slot (host builds table + chunk together).
@@ -87,8 +112,7 @@ impl NativeTableBuilder {
     }
 
     /// Register `f` under `name` at the next sequential slot.
-    /// Panics on duplicate `name`.
-    pub fn register<F>(self, name: impl Into<String>, f: F) -> Self
+    pub fn register<F>(self, name: impl Into<String>, f: F) -> Result<Self, NativeTableError>
     where
         F: Fn(&[Value]) -> NativeResult + Send + Sync + 'static,
     {
@@ -98,30 +122,32 @@ impl NativeTableBuilder {
 
     /// Register `f` under `name` at explicit `index`, padding lower gaps as
     /// unregistered (`get` → `None` → [`Fault::BadNative`]).
-    ///
-    /// Panics if the slot is occupied or `name` is already registered.
-    pub fn register_at<F>(mut self, index: u32, name: impl Into<String>, f: F) -> Self
+    pub fn register_at<F>(
+        mut self,
+        index: u32,
+        name: impl Into<String>,
+        f: F,
+    ) -> Result<Self, NativeTableError>
     where
         F: Fn(&[Value]) -> NativeResult + Send + Sync + 'static,
     {
         let name = name.into();
-        assert!(
-            !self
-                .entries
-                .iter()
-                .any(|slot| slot.as_ref().is_some_and(|(n, _)| n == &name)),
-            "byteflow: duplicate native function registered: '{name}'"
-        );
-        let index = index as usize;
-        if index >= self.entries.len() {
-            self.entries.resize_with(index + 1, || None);
+        for slot in &self.entries {
+            if let Some((n, _)) = slot {
+                if n == &name {
+                    return Err(NativeTableError::DuplicateName(name));
+                }
+            }
         }
-        assert!(
-            self.entries[index].is_none(),
-            "byteflow: native slot {index} already occupied (registering '{name}')"
-        );
-        self.entries[index] = Some((name, Arc::new(f)));
-        self
+        let index_usize = index as usize;
+        if index_usize >= self.entries.len() {
+            self.entries.resize_with(index_usize + 1, || None);
+        }
+        if self.entries[index_usize].is_some() {
+            return Err(NativeTableError::SlotOccupied { index, name });
+        }
+        self.entries[index_usize] = Some((name, Arc::new(f)));
+        Ok(self)
     }
 
     pub fn build(self) -> Arc<NativeTable> {
@@ -143,18 +169,18 @@ pub fn expect_arg<'a>(
     index: usize,
     fn_name: &str,
 ) -> Result<&'a Value, Fault> {
-    args.get(index).ok_or_else(|| {
-        Fault::NativeError(format!("{fn_name}: missing argument {index}"))
-    })
+    args.get(index).ok_or(Fault::NativeError(format!(
+        "{fn_name}: missing argument {index}"
+    )))
 }
 
 /// Require `args[index]` to coerce to an int (`Value::as_int`).
 pub fn expect_int(args: &[Value], index: usize, fn_name: &str) -> Result<i64, Fault> {
     expect_arg(args, index, fn_name)?
         .as_int()
-        .ok_or_else(|| {
-            Fault::NativeError(format!("{fn_name}: argument {index} is not an int"))
-        })
+        .ok_or(Fault::NativeError(format!(
+            "{fn_name}: argument {index} is not an int"
+        )))
 }
 
 /// Require `args[index]` to be a bool (ints: nonzero = true).
@@ -180,9 +206,9 @@ pub fn expect_message(
 ) -> Result<crate::Message, Fault> {
     expect_arg(args, index, fn_name)?
         .as_message()
-        .ok_or_else(|| {
-            Fault::NativeError(format!("{fn_name}: argument {index} is not a message"))
-        })
+        .ok_or(Fault::NativeError(format!(
+            "{fn_name}: argument {index} is not a message"
+        )))
 }
 
 /// Coerce `args[index]` to `u64` from `Int` (≥ 0), `Pid`, `Cap`, or `Bool`.
@@ -208,29 +234,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn register_at_leaves_holes_as_none() {
+    fn register_at_leaves_holes_as_none() -> Result<(), Box<dyn std::error::Error>> {
         let table = NativeTable::builder()
-            .register_at(10, "answer", |_| Ok(Value::Int(42)))
+            .register_at(10, "answer", |_| Ok(Value::Int(42)))?
             .build();
         assert_eq!(table.len(), 11);
         assert_eq!(table.index_of("answer"), Some(10));
-        assert!(table.get(10).unwrap()(&[]).unwrap() == Value::Int(42));
+        let f = table.get(10).ok_or("missing native")?;
+        assert!(matches!(f(&[])?, Value::Int(42)));
         assert!(table.get(2).is_none());
+        Ok(())
     }
 
     #[test]
-    #[should_panic(expected = "already occupied")]
-    fn register_at_panics_on_duplicate_slot() {
-        let _ = NativeTable::builder()
+    fn register_at_errors_on_duplicate_slot() {
+        let result = NativeTable::builder()
             .register_at(3, "a", |_| Ok(Value::Unit))
-            .register_at(3, "b", |_| Ok(Value::Unit));
+            .and_then(|b| b.register_at(3, "b", |_| Ok(Value::Unit)));
+        assert!(matches!(
+            result,
+            Err(NativeTableError::SlotOccupied { index: 3, .. })
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "duplicate native")]
-    fn register_panics_on_duplicate_name() {
-        let _ = NativeTable::builder()
+    fn register_errors_on_duplicate_name() {
+        let result = NativeTable::builder()
             .register("x", |_| Ok(Value::Unit))
-            .register("x", |_| Ok(Value::Unit));
+            .and_then(|b| b.register("x", |_| Ok(Value::Unit)));
+        assert!(matches!(result, Err(NativeTableError::DuplicateName(_))));
     }
 }

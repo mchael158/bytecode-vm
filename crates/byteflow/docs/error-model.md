@@ -13,11 +13,13 @@
 
 ## Mutex policy
 
-Never:
+Never (production):
 
 ```text
-lock.lock().unwrap()
-lock.lock().unwrap_or_else(|e| e.into_inner())
+.lock().unwrap()
+.unwrap_or(...)
+.unwrap_or_else(...)
+.lock().unwrap_or_else(|e| e.into_inner())
 ```
 
 Use [`sync_lock::lock`](../src/scheduler/sync_lock.rs) → `Result<_, RuntimeError::PoisonedLock>`.
@@ -30,7 +32,7 @@ unwrap_used = "deny"
 expect_used = "deny"
 ```
 
-Tests are allowed unwrap/expect via `cfg_attr(test, allow(...))` on the lib crate.
+Tests also return `Result` and use `?` — no `unwrap` / `expect` / `unwrap_or*` anywhere in the crate.
 
 ## Host API (category A)
 

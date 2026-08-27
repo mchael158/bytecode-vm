@@ -10,7 +10,7 @@
 //!
 //! 1. Resolve [`crate::Value::Cap`] → [`FlowId`] + rights ([`CapRights`])
 //! 2. Stamp `Message.sender` and mint `reply_cap` (SEND-only)
-//! 3. Push into the target [`Mailbox`] (anti lost-wakeup under one mutex)
+//! 3. Push into the target [`Mailbox`] (bounded; anti lost-wakeup under one mutex)
 //!
 //! [`crate::Value::Pid`] is identity inside hops, not an ambient address.
 //! Host [`Runtime::send`] takes [`FlowId`] directly (trusted).
@@ -34,7 +34,9 @@ mod worker;
 pub use capability::{CapId, CapRights};
 pub use error::{fault_count, report_fault, RuntimeError, SpawnError};
 pub use handle::FlowHandle;
-pub use mailbox::{Delivery, Mailbox};
+pub use mailbox::{
+    Delivery, Mailbox, MailboxCapacity, MailboxConfig, MailboxFull, MailboxStats, OverflowPolicy,
+};
 pub use metrics::{RuntimeMetrics, RuntimeMetricsSnapshot};
 pub use process::{
     next_flow_id, Flow, FlowId, FlowMetrics, FlowOutcome, FlowState, RestartPolicy,
