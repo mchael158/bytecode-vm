@@ -19,6 +19,17 @@ pub enum VerifyError {
     JumpOutOfRange { at: usize, target: i64, len: usize },
     EmptyFunctionTable,
     EntryOutOfRange { function: usize, entry: u32, len: usize },
+    /// A function declares more parameters than it has registers to hold
+    /// them. The VM loads `r0..arity` on entry, so this makes the very first
+    /// thing a call does — copying arguments in — reach past the register
+    /// file. Cheap to settle here: it is a static property of the function
+    /// table, one comparison per function, and no amount of runtime checking
+    /// makes such a function callable.
+    ArityExceedsRegisters {
+        function: usize,
+        arity: u8,
+        num_registers: u8,
+    },
 }
 
 impl fmt::Display for VerifyError {
@@ -44,6 +55,10 @@ impl fmt::Display for VerifyError {
                 f,
                 "function {function} entry point {entry} is out of code bounds (len={len})"
             ),
+            VerifyError::ArityExceedsRegisters { function, arity, num_registers } => write!(
+                f,
+                "function {function} declares arity {arity} but only {num_registers} registers"
+            ),
         }
     }
 }
@@ -57,6 +72,12 @@ impl std::error::Error for VerifyError {}
 /// register indices at runtime (cheap: it's an array index against a fixed
 /// small register file, not worth statically proving away yet).
 ///
+/// The one register fact that *is* settled statically is
+/// [`VerifyError::ArityExceedsRegisters`]. It belongs here rather than in
+/// the VM because it is a property of the function table, not of an
+/// execution: such a function cannot be entered at all, so letting it reach
+/// the interpreter only moves the same rejection later and per call.
+///
 /// `Opcode::CallNative` targets are deliberately **not** range-checked
 /// here: native functions live in a `byteflow_vm::NativeTable` supplied by
 /// the embedder at `Vm` construction time, entirely outside this crate's
@@ -69,16 +90,22 @@ pub fn verify(chunk: &Chunk) -> Result<(), VerifyError> {
 
     let len = chunk.code.len();
 
-    for def in &chunk.functions {
+    // `enumerate` rather than looking the index back up by name: two
+    // functions may share a name, and a search would then report the wrong
+    // one (and cost O(n²) doing it).
+    for (function, def) in chunk.functions.iter().enumerate() {
         if def.entry as usize >= len {
-            let function = match chunk.functions.iter().position(|f| f.name == def.name) {
-                Some(i) => i,
-                None => 0,
-            };
             return Err(VerifyError::EntryOutOfRange {
                 function,
                 entry: def.entry,
                 len,
+            });
+        }
+        if def.arity > def.num_registers {
+            return Err(VerifyError::ArityExceedsRegisters {
+                function,
+                arity: def.arity,
+                num_registers: def.num_registers,
             });
         }
     }
@@ -146,6 +173,34 @@ mod tests {
         b.emit_load_const(0, k);
         b.emit_load_imm(1, 1);
         b.emit_binop(Opcode::Add, 0, 0, 1);
+        b.emit_return(0);
+        let chunk = b.finish();
+        assert!(verify(&chunk).is_ok());
+    }
+
+    /// A function the VM cannot even enter: entry copies `r0..arity`, but
+    /// the frame only has `num_registers` slots. Used to be accepted here and
+    /// then panic with an out-of-bounds index inside `Vm::new` / `Call`.
+    #[test]
+    fn rejects_arity_larger_than_the_register_file() {
+        let mut b = ChunkBuilder::new("test");
+        b.begin_function("main", 3, 1);
+        b.emit_return(0);
+        let chunk = b.finish();
+        assert_eq!(
+            verify(&chunk),
+            Err(VerifyError::ArityExceedsRegisters {
+                function: 0,
+                arity: 3,
+                num_registers: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_arity_equal_to_the_register_file() {
+        let mut b = ChunkBuilder::new("test");
+        b.begin_function("main", 2, 2);
         b.emit_return(0);
         let chunk = b.finish();
         assert!(verify(&chunk).is_ok());

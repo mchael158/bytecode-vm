@@ -4,7 +4,7 @@ use std::fmt;
 ///
 /// A `Fault` is never a Rust panic — panics are reserved for genuine host
 /// bugs and are caught at the worker boundary (see
-/// `byteflow-scheduler::worker::run_worker`) precisely so that one Flow's
+/// `crate::scheduler::worker`) precisely so that one Flow's
 /// bug (division by zero, a corrupt jump target that slipped past the
 /// verifier, an out-of-range register) can never take down a worker thread,
 /// let alone the whole runtime. A `Fault` instead becomes
@@ -14,6 +14,16 @@ use std::fmt;
 pub enum Fault {
     DivideByZero,
     RegisterOutOfRange { reg: u8, frame_size: u8 },
+    /// An instruction's register operand plus the offset it gathers at does
+    /// not fit the register index space *at all* — e.g. `Spawn a=255`, which
+    /// reads its arguments from `a+1..`.
+    ///
+    /// Distinct from [`Fault::RegisterOutOfRange`], which is about an index
+    /// that is perfectly representable and merely absent from this frame.
+    /// Kept separate so the fault cannot lie: reporting "register 255 is out
+    /// of range" for a request that was really for register 256 would send
+    /// whoever reads it looking in the wrong place.
+    RegisterIndexOverflow { base: u8, offset: u8 },
     BadConstant { index: u32, pool_size: u32 },
     BadFunction { index: u32, table_size: u32 },
     BadOpcodeByte(u8),
@@ -53,6 +63,10 @@ impl fmt::Display for Fault {
             Fault::BadFunction { index, table_size } => {
                 write!(f, "function index {index} out of range (table size {table_size})")
             }
+            Fault::RegisterIndexOverflow { base, offset } => write!(
+                f,
+                "register index r{base}+{offset} overflows the register index space (max r255)"
+            ),
             Fault::BadOpcodeByte(b) => write!(f, "unknown opcode byte 0x{b:02X}"),
             Fault::CallStackOverflow { depth } => write!(f, "call stack overflow at depth {depth}"),
             Fault::TypeMismatch { expected, got } => {

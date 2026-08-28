@@ -8,20 +8,137 @@ All notable changes to **byteflow-actors** are documented here.
 - **`RuntimeConfig.mailbox`:** every runtime carries a [`MailboxConfig`]
   (capacity + overflow). Struct literals that only set `workers` / `quantum`
   must add `mailbox: MailboxConfig::DEFAULT` (or `..Default::default()`).
-- **`SendError::MailboxFull`:** host `Runtime::send` fails when the target
-  inbox is full under `OverflowPolicy::Reject`.
+- **`SendError::MailboxFull { flow, reason }`:** host `Runtime::send` fails
+  when the target inbox is at either bound under `OverflowPolicy::Reject`.
+  Was a tuple variant carrying only the `FlowId`.
+- **`MailboxFull`** carries a [`MailboxFullReason`] (read it via
+  `MailboxFull::reason()`). Note that `Err(MailboxFull)` in a pattern now
+  binds a *variable* instead of matching the type, so such matches compile
+  but assert nothing — bind the error and check `reason()`.
+- **Mailboxes now enforce a byte budget** (default 4 MiB per inbox) on top
+  of the hop count. A workload that relied on 256 hops × 1 MiB blobs per
+  inbox must raise it via `MailboxConfig::with_bytes`.
+- **`Mailbox::park` / `park_match`** return `WaitEpoch` instead of `()` on a
+  successful park, and **`Mailbox::take_parked()` is now
+  `take_parked_at(epoch)`**. Required to fix the stale-deadline bug below;
+  only a timeout scheduler could sensibly call these.
 - **`NativeTableBuilder::register` / `register_at`** return `Result`
   (`NativeTableError`) instead of panicking on duplicate name/slot.
+- **`VerifyError::ArityExceedsRegisters`** — `verify` now rejects a function
+  declaring more parameters than it has registers. New variant (exhaustive
+  `match` must handle it), and chunks that previously loaded now fail with
+  `SpawnError::VerifyFailed`. Not a capability regression: such a function
+  could never be entered, it panicked on the first call instead.
+- **`Fault::RegisterIndexOverflow { base, offset }`** — new variant for a
+  register index that does not fit the index space at all.
 
 ### Added
 - Bounded mailboxes: [`MailboxCapacity`] (`1..=1<<20`, default 256),
   [`OverflowPolicy`] (`Reject` / `DropNewest` / `DropOldest` — no `Block`),
   [`MailboxStats`], [`Delivery`]. Logical bound ≠ physical allocation.
+- [`MailboxBytes`] (`1 KiB..=1 GiB`, default 4 MiB — strictly larger than
+  the decoder's 1 MiB max blob, so a legal constant is never undeliverable)
+  and
+  [`MailboxConfig::with_bytes`]. A hop count alone stopped bounding memory
+  at ABI v4, when hops gained `Str` / `Bytes`: 256 hops is ~12 KiB of
+  scalars or ~256 MiB of 1 MiB blobs. Whichever bound is hit first refuses
+  the hop.
+- [`Value::memory_size`] / [`Value::heap_size`] — the per-hop charge model.
+  `Arc`-shared payloads are charged in full to every inbox holding them,
+  on purpose (a budget that discounts sharing is not a bound).
+- `MailboxStats` gained `queued_messages`, `queued_bytes`, and
+  `rejected_byte_limit`, so a hop-count refusal (receiver not draining) is
+  distinguishable from a byte refusal (payloads too large).
+- [`RuntimeError::Abandoned`] — a flow was destroyed before producing an
+  outcome. New variant: exhaustive `match` on `RuntimeError` must handle it.
+- **Bounded and non-blocking joins:** [`FlowHandle::try_join`] (poll, never
+  waits), [`FlowHandle::join_timeout`] and [`FlowHandle::join_deadline`]
+  (wait under a bound the *caller* chooses), all returning
+  `Option<FlowOutcome>` where `None` means "still running". `join` was the
+  only way to read an outcome and it commits the calling thread for however
+  long the bytecode takes — unusable from a control loop, a watchdog, or any
+  embedder with its own event loop. All three take `&self`, so the handle
+  survives an expired bound and can be retried.
+  The wait is anchored on an absolute `Instant`, not a duration re-fed into
+  the condvar loop, so spurious wakeups cannot restart the budget and
+  silently make the bound unlimited.
+- [`RuntimeError::AlreadyCollected`] — a second non-consuming join after the
+  outcome was handed out. New variant: exhaustive `match` must handle it. It
+  exists so a repeat poll is not answered with `Abandoned`, which would
+  blame the runtime for a flow that in fact completed and was observed.
 - [`docs/mailbox.md`](docs/mailbox.md) + `byteflow::docs::mailbox`.
+
+### Fixed
+- **A crafted chunk could kill a worker thread outright.** A function with
+  `arity > num_registers` passed verification, and both `Vm::new` and
+  `Opcode::Call` then copied arguments in with a direct `frame.registers[i]`
+  write — an out-of-bounds index panic in debug *and* release. `Vm::new` runs
+  on the caller's thread: the embedder's under `Runtime::spawn`, or a
+  worker's under bytecode `Opcode::Spawn`, which sits outside the
+  `catch_unwind` that isolates `Vm::run`. With no worker replacement yet, a
+  handful of such spawns took the runtime down. Now rejected statically by
+  `verify`, and the writes are checked (`Fault::RegisterOutOfRange`) for
+  callers that build a `Vm` without verifying.
+- **`Opcode::Spawn` with `a = 255` overflowed a `u8` register index.**
+  Arguments are gathered from `a+1..`, computed as `instr.a + 1 + i`: a debug
+  panic, and in release a silent wraparound that read `r0` instead of
+  faulting — the two builds disagreed, and the silent one was the shipped
+  one. All operand gathering now goes through a checked helper that computes
+  in a wider type and reports `Fault::RegisterIndexOverflow`. The `Call` /
+  `CallNative` gathers were safe only because `u8` register counts cap frames
+  at 255 registers, so the bounds check happened to fire first; they are
+  checked too, since that accident disappears the moment register counts
+  widen.
+- **`FlowHandle::join()` could block the embedder's thread forever.** The
+  completion oneshot only ever notified on `send`, so a flow destroyed
+  without producing an outcome — `Runtime::shutdown` while it slept in the
+  timer or sat in a worker deque, or a value lost to mutex poison — left the
+  joining thread parked on a condvar nobody would notify again, with no way
+  to tell "still running" from "never will". Dropping the sender without
+  sending is now a first-class event: `join` returns
+  [`RuntimeError::Abandoned`] and `FlowHandle::join` reports
+  `FlowOutcome::Failed` with that message.
+- **A stale `ReceiveTimeout` deadline could wake the wrong wait.** Timer
+  cancellation is lazy, and `Mailbox::take_parked` took whoever was parked.
+  A flow whose `ReceiveTimeout` was satisfied early and then parked again
+  on another `Receive` could be resumed by the *old* deadline, which also
+  wrote `Unit` into the previous wait's destination register — a spurious
+  wake plus silent register corruption, reachable from ordinary bytecode.
+  Every park now returns a [`WaitEpoch`]; the deadline carries it and
+  [`Mailbox::take_parked_at`] only fires while that epoch is current.
+- A stale deadline no longer clears `parked_filter`, which would have
+  downgraded a live `ReceiveMatch` / `Ask` waiter to "any hop wakes me".
+- `DropOldest` now evicts as many hops as the byte budget requires rather
+  than exactly one, and refuses a hop larger than the entire budget
+  instead of reporting a delivery that could not happen.
 
 ### Changed
 - Production **and tests** use `Result` / `?` — no `unwrap` / `expect` /
   `unwrap_or*`. Clippy `unwrap_used` + `expect_used` denied crate-wide.
+
+### Docs
+- New guide [`docs/vm-safety.md`](docs/vm-safety.md) +
+  `byteflow::docs::vm_safety`: the trust boundary from `.bf` bytes to
+  `FlowOutcome`, a per-check table of what `verify` settles statically vs
+  what the `Vm` checks per step (and *why* each fact lives where it does),
+  the debug/release divergence that raw `u8` register arithmetic causes, and
+  the one place the VM trusts `verify` instead of re-checking —
+  `Jump` / `Branch`, where an unverified chunk degrades to a silent implicit
+  return rather than a fault.
+- Every guide example is now a **doctest**, compiled and run by
+  `cargo test --doc` (5 → 16). Documentation that drifts from the API now
+  fails the build instead of misleading a reader.
+- `docs/error-model.md`: runnable examples for category A (`SpawnError`),
+  for the bounded joins, and for a flow abandoned by `shutdown`. Documents
+  that an abandoned verdict is *repeatable* while a successful outcome is
+  handed out once.
+- `docs/mailbox.md`: a `Runtime::send` refusal showing
+  `MailboxFullReason::MessageLimit`, plus a byte-budget refusal read back
+  through `Mailbox::stats()` while the hop count is nowhere near its bound.
+- Crate front page and `README`: bounded joins with the wait table, and the
+  verifier's guarantee.
+- All 12 unresolved / private rustdoc intra-doc links fixed; `cargo doc`
+  is warning-free.
 
 ## [0.5.1] — 2026-08-26
 

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossbeam_deque::Injector;
 
 use super::error::report_fault;
-use super::mailbox::Mailbox;
+use super::mailbox::{Mailbox, WaitEpoch};
 use super::process::{Flow, FlowId};
 use super::sync_lock;
 
@@ -19,12 +19,16 @@ enum TimerPayload {
     /// A `ReceiveTimeout`-suspended flow, parked *inside its own
     /// mailbox* rather than held here directly (see
     /// [`super::mailbox::Mailbox`]'s doc comment). We only hold enough to
-    /// find it again: its id (for logging/metrics) and a handle to the
-    /// mailbox to attempt the take.
+    /// find it again: its id (for logging/metrics), a handle to the
+    /// mailbox, and the [`WaitEpoch`] of the park this deadline belongs
+    /// to — without that epoch a late deadline would wake whichever wait
+    /// happens to be current and write `Unit` into the previous wait's
+    /// register.
     WakeReceiver {
         pid: FlowId,
         mailbox: Arc<Mailbox>,
         dest_reg: u8,
+        epoch: WaitEpoch,
     },
 }
 
@@ -90,12 +94,16 @@ impl TimerWheel {
         self.push(entry);
     }
 
+    /// Arm a `ReceiveTimeout` deadline for the park identified by `epoch`.
+    /// Obtain `epoch` from the [`Mailbox::park`] call that installed the
+    /// wait — never fabricate or reuse one.
     pub fn schedule_receive_timeout(
         &self,
         delay: Duration,
         pid: FlowId,
         mailbox: Arc<Mailbox>,
         dest_reg: u8,
+        epoch: WaitEpoch,
     ) {
         let entry = TimerEntry {
             deadline: Instant::now() + delay,
@@ -103,6 +111,7 @@ impl TimerWheel {
                 pid,
                 mailbox,
                 dest_reg,
+                epoch,
             },
         };
         self.push(entry);
@@ -213,15 +222,16 @@ impl TimerWheel {
                 pid,
                 mailbox,
                 dest_reg,
+                epoch,
             } => {
-                match mailbox.take_parked() {
+                match mailbox.take_parked_at(epoch) {
                     Ok(Some(mut flow)) => {
                         debug_assert_eq!(
                             flow.id, pid,
                             "timer fired for a mailbox owned by a different flow"
                         );
-                        // Timeout won the race against a `Send` (see
-                        // `Mailbox::take_parked`): deliver `Unit` as the
+                        // This deadline still owns the current wait (see
+                        // `Mailbox::take_parked_at`): deliver `Unit` as the
                         // "no message arrived in time" result.
                         let _ = flow
                             .vm
@@ -229,7 +239,9 @@ impl TimerWheel {
                         injector.push(flow);
                     }
                     Ok(None) => {
-                        // A `Send` already woke it; nothing to do.
+                        // A hop already ended that wait, or the flow has
+                        // since parked on a different `Receive` this
+                        // deadline does not own.
                     }
                     Err(e) => report_fault(e),
                 }

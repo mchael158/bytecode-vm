@@ -8,7 +8,7 @@ use super::frame::Frame;
 use super::native::NativeTable;
 use super::result::VmResult;
 
-/// Hard limit on call nesting. Frames are heap-allocated (see [`Frame`]), so
+/// Hard limit on call nesting. Frames are heap-allocated, so
 /// unbounded recursion would grow the Flow's memory instead of crashing
 /// the worker thread's native stack — which is worse, not better, without a
 /// limit. `4096` comfortably covers real recursive algorithms while keeping
@@ -42,8 +42,24 @@ impl Vm {
             .ok_or(Fault::BadFunction { index: function, table_size: chunk.functions.len() as u32 })?;
         let mut frame = Frame::new(function, def.num_registers, None);
         frame.pc = def.entry as usize;
+        // Checked, not `frame.registers[i] = ...`: the loop is bounded by
+        // `arity` while the register file is sized by `num_registers`, and a
+        // chunk declaring `arity > num_registers` is structurally possible.
+        // `crate::bytecode::verify` now rejects that statically, but `Vm::new`
+        // is public and reachable without it — and an index panic here fires
+        // on the *caller's* thread (the embedder's, or a worker's via
+        // `Opcode::Spawn`), outside the `catch_unwind` that isolates
+        // `Vm::run`. A fault keeps it a flow-level failure.
         for (i, arg) in args.iter().enumerate().take(def.arity as usize) {
-            frame.registers[i] = arg.clone();
+            match frame.registers.get_mut(i) {
+                Some(slot) => *slot = arg.clone(),
+                None => {
+                    return Err(Fault::RegisterOutOfRange {
+                        reg: i as u8,
+                        frame_size: def.num_registers,
+                    })
+                }
+            }
         }
         Ok(Vm { chunk, natives, frames: vec![frame], instructions_executed: 0 })
     }
@@ -298,12 +314,21 @@ impl Vm {
                     };
                     let mut args = Vec::with_capacity(argc as usize);
                     for i in 0..argc {
-                        args.push(trap!(self.get_reg(dst + i)));
+                        args.push(trap!(self.get_reg(trap!(reg_at(dst, u16::from(i))))));
                     }
                     let mut new_frame = Frame::new(function, def.num_registers, Some(dst));
                     new_frame.pc = def.entry as usize;
+                    // See `Vm::new` on why this is a checked write.
                     for (i, a) in args.into_iter().enumerate().take(def.arity as usize) {
-                        new_frame.registers[i] = a;
+                        match new_frame.registers.get_mut(i) {
+                            Some(slot) => *slot = a,
+                            None => {
+                                return VmResult::Trap(Fault::RegisterOutOfRange {
+                                    reg: i as u8,
+                                    frame_size: def.num_registers,
+                                })
+                            }
+                        }
                     }
                     self.frames.push(new_frame);
                 }
@@ -322,7 +347,7 @@ impl Vm {
                     };
                     let mut args = Vec::with_capacity(argc as usize);
                     for i in 0..argc {
-                        args.push(trap!(self.get_reg(dst + i)));
+                        args.push(trap!(self.get_reg(trap!(reg_at(dst, u16::from(i))))));
                     }
                     // Runs inline on this worker thread — see
                     // `NativeFn`'s doc comment on why natives must not
@@ -352,7 +377,13 @@ impl Vm {
                         // offset from `a` itself, which the scheduler will
                         // overwrite with a Cap to the child once it exists
                         // (see Opcode::Spawn / FlowCap).
-                        args.push(trap!(self.get_reg(instr.a + 1 + i)));
+                        //
+                        // The `+1` is why this one needs `reg_at` most: with
+                        // `a = 255` the very first index already leaves the
+                        // register space, before any bounds check gets a say.
+                        args.push(trap!(
+                            self.get_reg(trap!(reg_at(instr.a, u16::from(i) + 1)))
+                        ));
                     }
                     return VmResult::Spawn { function: instr.imm as u32, args, dest_reg: instr.a };
                 }
@@ -508,6 +539,29 @@ impl Vm {
     }
 }
 
+/// The register index `base + offset`, or [`Fault::RegisterIndexOverflow`]
+/// if that sum leaves the register index space.
+///
+/// Every multi-operand opcode gathers its arguments from consecutive
+/// registers. Written as a plain `base + offset` on `u8`, that addition
+/// panics in debug and **wraps** in release — so a release build silently
+/// reads the wrong register instead of failing, which is the worst of the
+/// two outcomes and the one a debug-mode test suite never sees. The sum is
+/// therefore computed in a wider type and narrowed explicitly.
+#[inline]
+fn reg_at(base: u8, offset: u16) -> Result<u8, Fault> {
+    match u8::try_from(u32::from(base) + u32::from(offset)) {
+        Ok(reg) => Ok(reg),
+        Err(_) => Err(Fault::RegisterIndexOverflow {
+            base,
+            offset: match u8::try_from(offset) {
+                Ok(o) => o,
+                Err(_) => u8::MAX,
+            },
+        }),
+    }
+}
+
 #[inline]
 fn as_f64(v: &Value) -> Result<f64, Fault> {
     match v {
@@ -530,5 +584,92 @@ fn tag_from_value(v: &Value) -> Result<u16, Fault> {
             expected: "int",
             got: v.type_name(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bytecode::ChunkBuilder;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// `Spawn a=255` reads its arguments from `a+1`, so the first index
+    /// already leaves the register space. This used to panic in debug and —
+    /// far worse — wrap around to `r0` in release, silently spawning with the
+    /// wrong argument.
+    #[test]
+    fn spawn_from_the_last_register_traps_instead_of_wrapping() -> TestResult {
+        let mut b = ChunkBuilder::new("t");
+        b.begin_function("main", 0, 2);
+        b.emit_spawn(255, 0, 1);
+        b.emit_return(0);
+        let mut vm = Vm::new(Arc::new(b.finish()), NativeTable::empty(), 0, &[])?;
+        match vm.run(10) {
+            VmResult::Trap(Fault::RegisterIndexOverflow {
+                base: 255,
+                offset: 1,
+            }) => Ok(()),
+            other => Err(format!("expected RegisterIndexOverflow, got {other:?}").into()),
+        }
+    }
+
+    /// `Vm::new` is public and reachable without `verify`, and its panic
+    /// landed on the caller's thread — the embedder's on `Runtime::spawn`, or
+    /// a worker's on bytecode `Spawn`, outside the `catch_unwind`.
+    #[test]
+    fn entering_a_function_with_too_few_registers_faults() -> TestResult {
+        let mut b = ChunkBuilder::new("t");
+        b.begin_function("main", 3, 1);
+        b.emit_return(0);
+        let args = [Value::Int(1), Value::Int(2), Value::Int(3)];
+        match Vm::new(Arc::new(b.finish()), NativeTable::empty(), 0, &args) {
+            Err(Fault::RegisterOutOfRange {
+                reg: 1,
+                frame_size: 1,
+            }) => Ok(()),
+            Err(e) => Err(format!("unexpected fault: {e}").into()),
+            Ok(_) => Err("three arguments cannot be loaded into one register".into()),
+        }
+    }
+
+    #[test]
+    fn calling_a_function_with_too_few_registers_traps() -> TestResult {
+        let mut b = ChunkBuilder::new("t");
+        let callee = b.begin_function("callee", 3, 1);
+        b.emit_return(0);
+        let main = b.begin_function("main", 0, 4);
+        b.emit_load_imm(0, 7);
+        b.emit_load_imm(1, 8);
+        b.emit_load_imm(2, 9);
+        b.emit_call(0, callee, 3);
+        b.emit_return(0);
+        let mut vm = Vm::new(Arc::new(b.finish()), NativeTable::empty(), main, &[])?;
+        match vm.run(50) {
+            VmResult::Trap(Fault::RegisterOutOfRange {
+                reg: 1,
+                frame_size: 1,
+            }) => Ok(()),
+            other => Err(format!("expected RegisterOutOfRange, got {other:?}").into()),
+        }
+    }
+
+    /// The boundary case that must keep working: gathering right up to the
+    /// last register is legal, it is only going *past* it that faults.
+    #[test]
+    fn gathering_up_to_the_last_register_still_works() -> TestResult {
+        let mut b = ChunkBuilder::new("t");
+        let callee = b.begin_function("callee", 1, 1);
+        b.emit_return(0);
+        let main = b.begin_function("main", 0, 255);
+        b.emit_load_imm(254, 5);
+        // Argument at r254 — the highest index a 255-register frame has.
+        b.emit_call(254, callee, 1);
+        b.emit_return(254);
+        let mut vm = Vm::new(Arc::new(b.finish()), NativeTable::empty(), main, &[])?;
+        match vm.run(100) {
+            VmResult::Complete(_) => Ok(()),
+            other => Err(format!("expected completion, got {other:?}").into()),
+        }
     }
 }

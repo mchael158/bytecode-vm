@@ -4,9 +4,15 @@
 //!
 //! Unbounded `VecDeque` growth is not a capacity API — it is an OOM path
 //! when many flows share few workers. Every mailbox is constructed with a
-//! [`MailboxConfig`]: a validated [`MailboxCapacity`] and an
-//! [`OverflowPolicy`]. Logical bound ≠ physical allocation; the queue grows
-//! geometrically up to the limit (see [`queue`]).
+//! [`MailboxConfig`]: a validated [`MailboxCapacity`], a [`MailboxBytes`]
+//! budget, and an [`OverflowPolicy`]. Logical bound ≠ physical allocation;
+//! the queue grows geometrically up to the limit (see [`queue`]).
+//!
+//! Both bounds are load-bearing. A hop count alone stopped being a memory
+//! bound once hops could carry `Str` / `Bytes`: at the default capacity,
+//! 256 hops is ~12 KiB of scalars or ~256 MiB of 1 MiB blobs. Whichever
+//! bound is reached first refuses the hop, and [`MailboxFull::reason`] says
+//! which one it was.
 //!
 //! There is **no** `Block` policy. Blocking an OS worker on a full inbox
 //! would stall every other flow on that thread. Overflow is Reject /
@@ -35,7 +41,7 @@ use super::error::RuntimeError;
 use super::process::Flow;
 use super::sync_lock;
 
-pub use capacity::MailboxCapacity;
+pub use capacity::{MailboxBytes, MailboxCapacity};
 pub use metrics::MailboxStats;
 pub use policy::{MailboxConfig, OverflowPolicy};
 
@@ -96,8 +102,8 @@ impl WaitFilter {
 ///
 /// # Why the flow lives *inside* its own mailbox while waiting
 ///
-/// Internally, a flow is reachable through its [`super::process::FlowId`], which
-/// resolves (via [`super::directory::Directory`]) to this `Mailbox`. Bytecode
+/// Internally, a flow is reachable through its [`FlowId`](crate::FlowId), which
+/// resolves (via the runtime's flow directory) to this `Mailbox`. Bytecode
 /// does **not** address by Pid anymore (FlowCap): `Send` / `Ask` resolve a
 /// Cap to a FlowId first, then look up here. Host [`crate::Runtime::send`]
 /// still uses FlowId directly (trusted).
@@ -128,7 +134,7 @@ impl WaitFilter {
 ///
 /// # Selective wait (`ReceiveMatch` / `Ask`)
 ///
-/// When parked with a non-[`WaitFilter::Any`] filter, only a hop that
+/// When parked with a selective (non-`Any`) filter, only a hop that
 /// satisfies the filter wakes the flow. Other hops are appended to the
 /// queue (subject to the bound) and the waiter stays parked (FIFO skip,
 /// never drop matching semantics).
@@ -149,13 +155,16 @@ struct MailboxInner {
     parked: Option<Box<Flow>>,
     /// Active while `parked` is `Some`. Ignored when nobody is waiting.
     parked_filter: WaitFilter,
+    /// Bumped on every park install, so a deadline armed for an earlier
+    /// wait can be told apart from the current one. See [`WaitEpoch`].
+    wait_epoch: u64,
     stats: MailboxStats,
 }
 
 /// Outcome of pushing a message.
 ///
 /// `Queued*` means the hop (or a replacement under DropOldest) lives in
-/// the inbox for a later `Receive`. [`Handoff`] means a parked flow was
+/// the inbox for a later `Receive`. [`Handoff`](Delivery::Handoff) means a parked flow was
 /// waiting for **this** hop — the caller (`worker::deliver` /
 /// [`crate::Runtime::send`]) must `resume_with` and re-enqueue the flow.
 /// Dropped variants never wake a waiter.
@@ -166,17 +175,95 @@ pub enum Delivery {
     Handoff(Box<Flow>),
 }
 
-/// Inbox at logical capacity under [`OverflowPolicy::Reject`].
+/// Which of a mailbox's two bounds refused a hop.
+///
+/// Reported so an operator can tell "this flow is not draining its inbox"
+/// ([`Self::MessageLimit`]) from "this flow is being sent payloads too
+/// large for its budget" ([`Self::ByteLimit`]) without instrumenting the
+/// sender. Those have different fixes: raise capacity / speed up the
+/// receiver versus raise the byte budget / shrink the payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MailboxFull;
+pub enum MailboxFullReason {
+    /// [`MailboxCapacity`] hops are already queued.
+    MessageLimit,
+    /// Accepting the hop would exceed the [`MailboxBytes`] budget. Also
+    /// reported when a single hop is larger than the entire budget, which
+    /// no eviction policy can make room for.
+    ByteLimit,
+}
+
+impl std::fmt::Display for MailboxFullReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MailboxFullReason::MessageLimit => write!(f, "hop count limit"),
+            MailboxFullReason::ByteLimit => write!(f, "byte budget"),
+        }
+    }
+}
+
+/// Inbox at one of its logical bounds under [`OverflowPolicy::Reject`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxFull {
+    reason: MailboxFullReason,
+}
+
+impl MailboxFull {
+    #[inline]
+    pub const fn reason(self) -> MailboxFullReason {
+        self.reason
+    }
+}
 
 impl std::fmt::Display for MailboxFull {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "mailbox full")
+        write!(f, "mailbox full ({})", self.reason)
     }
 }
 
 impl std::error::Error for MailboxFull {}
+
+/// Identifies **one specific park** of a flow in its mailbox.
+///
+/// # Why a timeout needs a token
+///
+/// Cancellation of a `ReceiveTimeout` deadline is lazy: the timer thread
+/// does not remove its entry when a hop wakes the receiver early, it just
+/// finds nobody parked when it eventually fires. That reasoning only holds
+/// if the flow never parks *again* before the old deadline — and in a
+/// receive loop it always does:
+///
+/// ```text
+///   t=0    ReceiveTimeout(r5, 100ms)  -> park A, timer(100ms) armed
+///   t=20   hop arrives                -> handoff, park A over, flow runs
+///   t=30   Receive(r7)                -> park B  (no timeout)
+///   t=100  timer for park A fires     -> takes park B!
+///                                        writes Unit into r5, not r7
+/// ```
+///
+/// That is a spurious wake *and* a write to the previous wait's register.
+/// So [`Mailbox::park`] returns the epoch of the park it installed, the
+/// timer carries it, and [`Mailbox::take_parked_at`] only hands the flow
+/// over while that epoch is still current.
+///
+/// There is no public constructor: an epoch can only come from parking,
+/// so a timeout cannot present one for a wait that never happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WaitEpoch(u64);
+
+impl WaitEpoch {
+    /// Raw counter value, for logs and metrics only. Never compare epochs
+    /// from two different mailboxes: the counter is per-inbox.
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for WaitEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "wait#{}", self.0)
+    }
+}
 
 impl Mailbox {
     pub fn new() -> Self {
@@ -186,9 +273,10 @@ impl Mailbox {
     pub fn with_config(config: MailboxConfig) -> Self {
         Mailbox {
             inner: Mutex::new(MailboxInner {
-                queue: MailboxQueue::new(config.capacity().get()),
+                queue: MailboxQueue::new(config.capacity().get(), config.bytes().get()),
                 parked: None,
                 parked_filter: WaitFilter::Any,
+                wait_epoch: 0,
                 stats: MailboxStats::default(),
             }),
             config,
@@ -200,10 +288,15 @@ impl Mailbox {
         self.config
     }
 
-    /// Snapshot of enqueue/dequeue/drop counters (under the mailbox lock).
+    /// Snapshot of enqueue/dequeue/drop counters plus current occupancy
+    /// (taken under the mailbox lock, so the depth and the counters
+    /// describe the same instant).
     pub fn stats(&self) -> Result<MailboxStats, RuntimeError> {
         let inner = sync_lock::lock(&self.inner, "Mailbox::stats")?;
-        Ok(inner.stats)
+        let mut stats = inner.stats;
+        stats.queued_messages = inner.queue.len();
+        stats.queued_bytes = inner.queue.bytes();
+        Ok(stats)
     }
 
     /// Push `value` under the mailbox config.
@@ -211,8 +304,10 @@ impl Mailbox {
     /// 1. If a matching waiter is parked → [`Delivery::Handoff`] (does not
     ///    consume a queue slot).
     /// 2. Else enqueue / overflow according to [`OverflowPolicy`].
-    /// 3. [`MailboxFull`] only for Reject when the queue is already at
-    ///    the logical limit.
+    /// 3. [`MailboxFull`] only for Reject when the queue is already at one
+    ///    of its logical bounds (see [`MailboxFullReason`]) — plus the one
+    ///    case no policy can absorb: a hop larger than the whole byte
+    ///    budget.
     ///
     /// Mutex poison → [`RuntimeError`] (fail-closed).
     pub fn push(&self, value: Value) -> Result<Result<Delivery, MailboxFull>, RuntimeError> {
@@ -254,7 +349,7 @@ impl Mailbox {
         filter: WaitFilter,
     ) -> Result<Option<Value>, RuntimeError> {
         let mut inner = sync_lock::lock(&self.inner, "Mailbox::try_pop_filter")?;
-        let got = take_with_filter(inner.queue.inner_mut(), filter);
+        let got = inner.queue.take(filter);
         if got.is_some() {
             inner.stats.dequeued = inner.stats.dequeued.saturating_add(1);
         }
@@ -268,7 +363,12 @@ impl Mailbox {
     /// the lost-wakeup race: `Err(flow)` means a message arrived between
     /// the worker's `try_pop` and this call — resume immediately with the
     /// stashed pending message rather than parking forever.
-    pub fn park(&self, flow: Box<Flow>) -> Result<Result<(), Box<Flow>>, RuntimeError> {
+    ///
+    /// `Ok(Ok(epoch))` identifies the park that was installed. A caller
+    /// arming a `ReceiveTimeout` deadline must carry that [`WaitEpoch`] to
+    /// [`Mailbox::take_parked_at`], or a late deadline will wake whatever
+    /// wait happens to be current instead.
+    pub fn park(&self, flow: Box<Flow>) -> Result<Result<WaitEpoch, Box<Flow>>, RuntimeError> {
         self.park_filter(flow, WaitFilter::Any)
     }
 
@@ -279,7 +379,7 @@ impl Mailbox {
         &self,
         flow: Box<Flow>,
         tag: u16,
-    ) -> Result<Result<(), Box<Flow>>, RuntimeError> {
+    ) -> Result<Result<WaitEpoch, Box<Flow>>, RuntimeError> {
         self.park_filter(flow, WaitFilter::Tag(tag))
     }
 
@@ -289,25 +389,47 @@ impl Mailbox {
         &self,
         flow: Box<Flow>,
         filter: WaitFilter,
-    ) -> Result<Result<(), Box<Flow>>, RuntimeError> {
+    ) -> Result<Result<WaitEpoch, Box<Flow>>, RuntimeError> {
         let mut inner = sync_lock::lock(&self.inner, "Mailbox::park_filter")?;
-        if let Some(value) = take_with_filter(inner.queue.inner_mut(), filter) {
+        if let Some(value) = inner.queue.take(filter) {
             inner.stats.dequeued = inner.stats.dequeued.saturating_add(1);
             drop(inner);
             return Ok(Err(with_pending(flow, value)));
         }
+        // Wrapping, not saturating: a saturated counter would make every
+        // later epoch compare equal, silently restoring the stale-deadline
+        // bug this exists to prevent. Reuse needs 2^64 parks on one inbox.
+        inner.wait_epoch = inner.wait_epoch.wrapping_add(1);
+        let epoch = WaitEpoch(inner.wait_epoch);
         inner.parked_filter = filter;
         inner.parked = Some(flow);
-        Ok(Ok(()))
+        Ok(Ok(epoch))
     }
 
-    /// Attempt to take a timed-out parked flow back out, used by the
-    /// timer wheel when a `ReceiveTimeout` deadline fires. Returns `None`
-    /// if the flow was already woken by a `Send` in the meantime.
-    pub fn take_parked(&self) -> Result<Option<Box<Flow>>, RuntimeError> {
-        let mut inner = sync_lock::lock(&self.inner, "Mailbox::take_parked")?;
-        inner.parked_filter = WaitFilter::Any;
-        Ok(inner.parked.take())
+    /// Take the parked flow back out **only if** `epoch` is still the
+    /// current wait, used by the timer when a `ReceiveTimeout` deadline
+    /// fires.
+    ///
+    /// `None` means the deadline lost the race and must do nothing: either
+    /// a hop already woke that wait, or the flow has since parked on a
+    /// *different* `Receive` that this deadline does not own (see
+    /// [`WaitEpoch`]).
+    ///
+    /// The selective filter is reset only when the flow is actually taken.
+    /// Clearing it on a stale call would downgrade a live `ReceiveMatch` /
+    /// `Ask` waiter to "any hop wakes me".
+    pub fn take_parked_at(&self, epoch: WaitEpoch) -> Result<Option<Box<Flow>>, RuntimeError> {
+        let mut inner = sync_lock::lock(&self.inner, "Mailbox::take_parked_at")?;
+        if inner.wait_epoch != epoch.0 {
+            return Ok(None);
+        }
+        match inner.parked.take() {
+            Some(flow) => {
+                inner.parked_filter = WaitFilter::Any;
+                Ok(Some(flow))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -323,37 +445,26 @@ fn enqueue_locked(
     policy: OverflowPolicy,
 ) -> Result<Delivery, MailboxFull> {
     match inner.queue.enqueue(value, policy) {
-        Some(EnqueueEffect::Enqueued) => {
+        Ok(EnqueueEffect::Enqueued) => {
             inner.stats.enqueued = inner.stats.enqueued.saturating_add(1);
             Ok(Delivery::Queued)
         }
-        Some(EnqueueEffect::DroppedOldest) => {
+        Ok(EnqueueEffect::DroppedOldest) => {
             inner.stats.dropped_oldest = inner.stats.dropped_oldest.saturating_add(1);
             inner.stats.enqueued = inner.stats.enqueued.saturating_add(1);
             Ok(Delivery::QueuedDropOldest)
         }
-        Some(EnqueueEffect::DroppedNewest) => {
+        Ok(EnqueueEffect::DroppedNewest) => {
             inner.stats.dropped_newest = inner.stats.dropped_newest.saturating_add(1);
             Ok(Delivery::DroppedNewest)
         }
-        None => {
+        Err(reason) => {
             inner.stats.rejected = inner.stats.rejected.saturating_add(1);
-            Err(MailboxFull)
-        }
-    }
-}
-
-/// Remove one matching hop from `queue`, preserving relative order of
-/// everything else (FIFO skip — never drop non-matching entries).
-fn take_with_filter(
-    queue: &mut std::collections::VecDeque<Value>,
-    filter: WaitFilter,
-) -> Option<Value> {
-    match filter {
-        WaitFilter::Any => queue.pop_front(),
-        other => {
-            let idx = queue.iter().position(|v| other.matches(v))?;
-            queue.remove(idx)
+            if reason == MailboxFullReason::ByteLimit {
+                inner.stats.rejected_byte_limit =
+                    inner.stats.rejected_byte_limit.saturating_add(1);
+            }
+            Err(MailboxFull { reason })
         }
     }
 }
@@ -482,10 +593,131 @@ mod tests {
     fn reject_when_full_without_waiter() -> TestResult {
         let mb = tiny_reject(1)?;
         assert!(matches!(mb.push(msg(1, 1))??, Delivery::Queued));
-        assert!(matches!(mb.push(msg(1, 2))?, Err(MailboxFull)));
+        // Bind the error: `Err(MailboxFull)` would introduce a *variable*
+        // named MailboxFull now that the type carries a reason, matching
+        // every error and asserting nothing.
+        match mb.push(msg(1, 2))? {
+            Err(full) => assert_eq!(full.reason(), MailboxFullReason::MessageLimit),
+            Ok(_) => return Err("expected the hop count bound to refuse".into()),
+        }
         let s = mb.stats()?;
         assert_eq!(s.enqueued, 1);
         assert_eq!(s.rejected, 1);
+        assert_eq!(s.rejected_byte_limit, 0);
+        assert_eq!(s.queued_messages, 1);
+        Ok(())
+    }
+
+    /// Park `flow`, requiring that it actually parked, and hand back the
+    /// epoch. Collapses the two-level `Result` the tests do not care about.
+    fn park_now(mb: &Mailbox, flow: Box<Flow>) -> Result<WaitEpoch, Box<dyn std::error::Error>> {
+        match mb.park(flow)? {
+            Ok(epoch) => Ok(epoch),
+            Err(_) => Err("an empty mailbox should have parked the flow".into()),
+        }
+    }
+
+    fn handoff(mb: &Mailbox, value: Value) -> Result<Box<Flow>, Box<dyn std::error::Error>> {
+        match mb.push(value)?? {
+            Delivery::Handoff(flow) => Ok(flow),
+            other => Err(format!("expected a handoff, got {}", delivery_name(&other)).into()),
+        }
+    }
+
+    fn delivery_name(d: &Delivery) -> &'static str {
+        match d {
+            Delivery::Queued => "Queued",
+            Delivery::QueuedDropOldest => "QueuedDropOldest",
+            Delivery::DroppedNewest => "DroppedNewest",
+            Delivery::Handoff(_) => "Handoff",
+        }
+    }
+
+    #[test]
+    fn a_stale_deadline_cannot_steal_a_later_wait() -> TestResult {
+        let mb = Mailbox::new();
+        let first = park_now(&mb, dummy_flow()?)?;
+        // A hop beats the deadline: the handoff ends *this* wait.
+        let woken = handoff(&mb, msg(1, 1))?;
+        // The same flow parks again on a fresh `Receive`.
+        let second = park_now(&mb, woken)?;
+        assert_ne!(first, second, "each park must get its own epoch");
+
+        // The deadline armed for the first wait fires late. Before the
+        // epoch check it took this second wait, resumed the flow, and
+        // wrote Unit into the *first* wait's register.
+        assert!(mb.take_parked_at(first)?.is_none());
+        // The live wait is untouched, so its own deadline still works.
+        assert!(mb.take_parked_at(second)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_deadline_does_not_downgrade_a_selective_waiter() -> TestResult {
+        let mb = Mailbox::new();
+        let first = park_now(&mb, dummy_flow()?)?;
+        let woken = handoff(&mb, msg(1, 1))?;
+        // Second wait is selective: only tag 7 may wake it.
+        let second = match mb.park_match(woken, 7)? {
+            Ok(epoch) => epoch,
+            Err(_) => return Err("empty mailbox should have parked the flow".into()),
+        };
+        assert_ne!(first, second);
+
+        assert!(mb.take_parked_at(first)?.is_none());
+        // The filter must survive the stale call: a tag-9 hop is queued,
+        // not handed off.
+        assert!(matches!(mb.push(msg(9, 0))??, Delivery::Queued));
+        // ...and tag 7 still wakes it.
+        assert!(matches!(mb.push(msg(7, 0))??, Delivery::Handoff(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_deadline_for_a_wait_that_a_hop_ended_does_nothing() -> TestResult {
+        let mb = Mailbox::new();
+        let epoch = park_now(&mb, dummy_flow()?)?;
+        let _woken = handoff(&mb, msg(1, 1))?;
+        // Nobody is parked now; the deadline must be a no-op rather than
+        // reporting a flow it does not have.
+        assert!(mb.take_parked_at(epoch)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn byte_budget_refuses_before_the_hop_count_and_says_so() -> TestResult {
+        // 64 hop slots but a 1 KiB budget: blobs exhaust bytes first.
+        let cap = MailboxCapacity::new(64).ok_or("cap")?;
+        let budget = MailboxBytes::new(MailboxBytes::MIN).ok_or("bytes")?;
+        let mb = Mailbox::with_config(
+            MailboxConfig::new(cap, OverflowPolicy::Reject).with_bytes(budget),
+        );
+        assert!(matches!(mb.push(Value::bytes(vec![0u8; 900]))??, Delivery::Queued));
+        match mb.push(Value::bytes(vec![0u8; 900]))? {
+            Err(full) => assert_eq!(full.reason(), MailboxFullReason::ByteLimit),
+            Ok(_) => return Err("expected the byte budget to refuse".into()),
+        }
+        let s = mb.stats()?;
+        assert_eq!(s.queued_messages, 1);
+        assert!(s.queued_bytes >= 900);
+        assert_eq!(s.rejected, 1);
+        assert_eq!(s.rejected_byte_limit, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn draining_a_hop_frees_its_byte_charge() -> TestResult {
+        let cap = MailboxCapacity::new(64).ok_or("cap")?;
+        let budget = MailboxBytes::new(MailboxBytes::MIN).ok_or("bytes")?;
+        let mb = Mailbox::with_config(
+            MailboxConfig::new(cap, OverflowPolicy::Reject).with_bytes(budget),
+        );
+        mb.push(Value::bytes(vec![0u8; 900]))??;
+        mb.try_pop()?.ok_or("queued blob")?;
+        assert_eq!(mb.stats()?.queued_bytes, 0);
+        // A receiver that keeps up must not be permanently throttled by a
+        // charge that was never refunded.
+        assert!(matches!(mb.push(Value::bytes(vec![0u8; 900]))??, Delivery::Queued));
         Ok(())
     }
 

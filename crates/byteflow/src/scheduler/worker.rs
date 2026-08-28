@@ -415,9 +415,10 @@ fn deliver(
             local.push(flow);
             wake_workers(shared);
         }
-        Ok(Err(_)) => {
+        Ok(Err(full)) => {
+            let reason = full.reason();
             log::info(format!(
-                "deliver rejected (mailbox full) → flow#{target} msg={message}"
+                "deliver rejected (mailbox full: {reason}) → flow#{target} msg={message}"
             ));
         }
         Err(e) => report_fault(e),
@@ -435,11 +436,11 @@ fn park_on_mailbox(
     let pid = flow.id;
 
     match mailbox.park_filter(flow, filter) {
-        Ok(Ok(())) => {
+        Ok(Ok(epoch)) => {
             if let Some(delay) = timeout {
                 shared
                     .timer
-                    .schedule_receive_timeout(delay, pid, mailbox, dest_reg);
+                    .schedule_receive_timeout(delay, pid, mailbox, dest_reg, epoch);
             }
         }
         Ok(Err(mut flow)) => {

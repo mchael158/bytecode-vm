@@ -67,6 +67,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Collecting a result without committing the thread
+
+`join()` blocks until the flow finishes, which is right for a `main` that
+has nothing else to do. Anything with a deadline — a control loop, a
+watchdog, a test harness — picks its own bound instead:
+
+| Call | Waits | While the flow is still running |
+|---|---|---|
+| `try_join()` | never | `None` |
+| `join_timeout(d)` / `join_deadline(t)` | up to the bound | `None` |
+| `join()` | unbounded | (blocks) |
+
+```rust
+use byteflow::{ChunkBuilder, FlowOutcome, Runtime, Value};
+use std::time::Duration;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut b = ChunkBuilder::new("slow");
+    b.begin_function("main", 0, 2);
+    b.emit_load_imm(0, 300);
+    b.emit_sleep(0); // sleeps 300 ms
+    b.emit_load_imm(0, 7);
+    b.emit_return(0);
+
+    let rt = Runtime::new(b.finish())?;
+    let handle = rt.spawn(0, &[])?;
+
+    // Poll for free, or wait under a bound — neither consumes the handle.
+    assert!(handle.try_join().is_none());
+    assert!(handle.join_timeout(Duration::from_millis(10)).is_none());
+
+    let outcome = handle.join_timeout(Duration::from_secs(10));
+    rt.shutdown();
+
+    assert!(matches!(outcome, Some(FlowOutcome::Completed(Value::Int(7)))));
+    Ok(())
+}
+```
+
+The bounds are anchored on an absolute `Instant`, so a spurious condvar
+wakeup cannot silently restart the budget. And a flow destroyed before
+producing an outcome (`shutdown` does not drain suspended flows) wakes its
+joiner with a failure rather than leaving it parked forever — see
+[`docs/error-model.md`](docs/error-model.md).
+
 ### Std natives (`print`, `now_ms`, `make_msg`, …)
 
 Stable indices: **`print = 0`**, **`now_ms = 1`**, **`make_msg = 2`**, **`msg_*` = 3–6**, **`msg_reply_cap = 7`**.
@@ -124,9 +169,15 @@ See [`docs/atomic-hop.md`](docs/atomic-hop.md). Built-in samples:
 4. Empty `Receive` → flow parks **inside its mailbox**; the next Atomic Hop wakes under the same lock (no lost wakeup).  
 5. `Fault` / `Trap` → `FlowState::Failed` → supervisor (`Always` / `OnFailure` / `Never`; default intensity 3 / 5s).
 
-`join()` is for the embedder’s native thread only — workers never block on it.
+`join()` and its bounded forms are for the embedder’s native thread only —
+workers never block on them.
 
-Untrusted `.bf` files go through `Opcode::from_u8` + `verify` before execution.
+Untrusted `.bf` files go through `Opcode::from_u8` + `verify` before
+execution. The verifier settles what is a property of the chunk (jump
+targets, constant/function indices, `arity ≤ num_registers`); the VM checks
+what depends on runtime state (register bounds, index overflow, types,
+division, call depth) and turns each into a `Fault` on that one flow — see
+[`docs/vm-safety.md`](docs/vm-safety.md).
 
 ---
 
@@ -148,8 +199,11 @@ byteflow run    <file.bf> [function]
 
 - `#![forbid(unsafe_code)]`
 - Flow panics are caught at the worker boundary so one bad flow cannot kill the OS thread.
+- Malformed bytecode is a `Fault` on one flow, never a panic on the thread that spawned it (see [`docs/vm-safety.md`](docs/vm-safety.md)).
+- Register indices are never computed with plain `u8` arithmetic — no “panics in debug, silently wraps in release” divergence.
 - Native functions must **not block** — they run inline on a worker.
 - Host APIs return `Result` (`SpawnError` / `RuntimeError`) — no `unwrap`/`expect`/`unwrap_or*` anywhere (see [`docs/error-model.md`](docs/error-model.md)).
+- Blocking APIs are bounded by choice: `try_join` / `join_timeout` / `join_deadline`, and an abandoned flow wakes its joiner instead of hanging it.
 - Values today: `Unit | Bool | Int | Float | Pid | Message | Cap | Str | Bytes`.
 - **Atomic Hop:** only `Value::Message` may cross `Send`.
 - **FlowCap:** bytecode `Send`/`Ask` targets are `Value::Cap`; replies use `msg_reply_cap`.
@@ -159,11 +213,15 @@ byteflow run    <file.bf> [function]
 
 ## Status (v0.6)
 
-**Included:** register ISA + assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, **bounded mailboxes** (`MailboxConfig`, default 256 / Reject), Atomic Hop, FlowCap, supervisor, std natives, CLI, examples, fail-closed error model.
+**Included:** register ISA + assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, **bounded mailboxes** (`MailboxConfig`: 256 hops + 4 MiB / Reject by default), Atomic Hop, FlowCap, supervisor, std natives, CLI, examples, fail-closed error model.
 
-**Not yet:** `WAITING_SEND` backpressure, Criterion benches, JIT, distribution.
+**Not yet:** `WAITING_SEND` backpressure, runtime-wide resource governor (flow count / spawn rate), Criterion benches, JIT, distribution.
 
-Mailbox contract: [`docs/mailbox.md`](docs/mailbox.md).
+Design guides: [`docs/atomic-hop.md`](docs/atomic-hop.md) ·
+[`docs/mailbox.md`](docs/mailbox.md) ·
+[`docs/vm-safety.md`](docs/vm-safety.md) ·
+[`docs/error-model.md`](docs/error-model.md) ·
+[`docs/security.md`](docs/security.md)
 
 See [`CHANGELOG.md`](CHANGELOG.md).
 

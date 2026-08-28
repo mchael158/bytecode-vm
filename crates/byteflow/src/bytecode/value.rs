@@ -166,6 +166,43 @@ impl Value {
         }
     }
 
+    /// Bytes this value is **charged** for against a mailbox byte budget
+    /// (see [`crate::MailboxBytes`]).
+    ///
+    /// # This is a charge model, not an RSS measurement
+    ///
+    /// [`Value::Str`] / [`Value::Bytes`] are `Arc`-shared: the same buffer
+    /// cloned into N mailboxes exists once in memory, but each mailbox is
+    /// charged the full length. That over-counts on purpose — a budget that
+    /// under-counts shared payloads is not a bound at all, since a single
+    /// producer could fan one large `Arc` out to every inbox and stay
+    /// "within budget" everywhere while the host pays once per distinct
+    /// buffer it keeps alive.
+    ///
+    /// The inline `size_of::<Value>()` term is included so a flood of
+    /// scalar hops is also bounded, not just blob hops.
+    #[inline]
+    pub fn memory_size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.heap_size()
+    }
+
+    /// Heap bytes owned (transitively) by this value, excluding the enum
+    /// itself. Zero for every scalar variant.
+    #[inline]
+    pub fn heap_size(&self) -> usize {
+        match self {
+            Value::Str(s) => s.len(),
+            Value::Bytes(b) => b.len(),
+            Value::Unit
+            | Value::Bool(_)
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Pid(_)
+            | Value::Message(_)
+            | Value::Cap(_) => 0,
+        }
+    }
+
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Unit => "unit",

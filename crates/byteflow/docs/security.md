@@ -235,10 +235,11 @@ FlowId** behind the target Cap — never to a CapId.
 
 ## 7. FlowCap — Current Version (0.5.x)
 
-Bytecode `Send` / `Ask` require [`Value::Cap`]. A CapId is opaque and resolves
-through the runtime `CapTable` to `{ FlowId, CapRights }` (`SEND`, `ASK`).
+Bytecode `Send` / `Ask` require [`Value::Cap`](crate::Value::Cap). A CapId is
+opaque and resolves through the runtime `CapTable` to
+`{ FlowId, CapRights }` (`SEND`, `ASK`).
 
-[`Value::Pid`] remains for **identity** inside authenticated messages
+[`Value::Pid`](crate::Value::Pid) remains for **identity** inside authenticated messages
 (`Message.sender` / `msg_sender`). It is **not** an ambient address.
 
 Outgoing hops also mint `Message.reply_cap` with **SEND**-only rights so a

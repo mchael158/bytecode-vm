@@ -9,7 +9,7 @@ use crossbeam_deque::{Injector, Stealer, Worker as LocalDeque};
 use super::directory::Directory;
 use super::error::SpawnError;
 use super::handle::FlowHandle;
-use super::mailbox::{Delivery, Mailbox, MailboxConfig};
+use super::mailbox::{Delivery, Mailbox, MailboxConfig, MailboxFullReason};
 use super::metrics::{RuntimeMetrics, RuntimeMetricsSnapshot};
 use super::process::{Flow, FlowId, RestartPolicy};
 use super::supervisor::SupervisorLink;
@@ -99,7 +99,7 @@ impl Runtime {
     ///
     /// Returns [`SpawnError`] instead of panicking: verify failures and OS
     /// thread-spawn refusals are category-A errors (see
-    /// [`super::error`]).
+    /// [`docs::error_model`](crate::docs::error_model)).
     pub fn new(chunk: Chunk) -> Result<Self, SpawnError> {
         Self::with_config(chunk, RuntimeConfig::default())
     }
@@ -264,7 +264,10 @@ impl Runtime {
                 wake_workers(&self.shared);
                 Ok(())
             }
-            Ok(Err(_)) => Err(SendError::MailboxFull(target)),
+            Ok(Err(full)) => Err(SendError::MailboxFull {
+                flow: target,
+                reason: full.reason(),
+            }),
             Err(e) => {
                 super::error::report_fault(e);
                 Err(SendError::NoSuchFlow(target))
@@ -310,8 +313,13 @@ pub enum SendError {
     NoSuchFlow(FlowId),
     /// Atomic Hop rule: only [`crate::Value::Message`] may cross `Send`.
     NotAHop { got: &'static str },
-    /// Target inbox is at its logical capacity ([`OverflowPolicy::Reject`]).
-    MailboxFull(FlowId),
+    /// Target inbox is at one of its logical bounds
+    /// ([`OverflowPolicy::Reject`](crate::OverflowPolicy::Reject)). `reason` says which — see
+    /// [`MailboxFullReason`].
+    MailboxFull {
+        flow: FlowId,
+        reason: MailboxFullReason,
+    },
 }
 
 impl std::fmt::Display for SendError {
@@ -321,7 +329,9 @@ impl std::fmt::Display for SendError {
             SendError::NotAHop { got } => {
                 write!(f, "atomic hop requires Value::Message, got {got}")
             }
-            SendError::MailboxFull(id) => write!(f, "mailbox full for {id}"),
+            SendError::MailboxFull { flow, reason } => {
+                write!(f, "mailbox full for {flow} ({reason})")
+            }
         }
     }
 }
@@ -429,6 +439,7 @@ mod tests {
     use super::*;
     use crate::bytecode::{ChunkBuilder, Opcode, Value};
     use crate::scheduler::FlowOutcome;
+    use std::time::Duration;
 
     fn add_chunk() -> Chunk {
         let mut b = ChunkBuilder::new("test");
@@ -438,6 +449,59 @@ mod tests {
         b.emit_binop(Opcode::Add, 0, 0, 1);
         b.emit_return(0);
         b.finish()
+    }
+
+    /// Sleeps `millis` inside the flow, then returns 7. The sleep is what
+    /// makes "still running" an observable state from the host thread.
+    fn sleep_then_return_chunk(millis: i32) -> Chunk {
+        let mut b = ChunkBuilder::new("test");
+        b.begin_function("main", 0, 2);
+        b.emit_load_imm(0, millis);
+        b.emit_sleep(0);
+        b.emit_load_imm(0, 7);
+        b.emit_return(0);
+        b.finish()
+    }
+
+    /// The host thread must be able to ask "done yet?" and to wait under a
+    /// bound *it* chooses, instead of surrendering itself to `join` for
+    /// however long the bytecode decides to take.
+    #[test]
+    fn polling_and_bounded_waits_never_commit_the_host_thread() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const FLOW_SLEEP: i32 = 150;
+        let rt = Runtime::with_config(
+            sleep_then_return_chunk(FLOW_SLEEP),
+            RuntimeConfig {
+                workers: 1,
+                quantum: 1_000,
+                mailbox: MailboxConfig::DEFAULT,
+            },
+        )?;
+        let handle = rt.spawn(0, &[])?;
+
+        // The flow cannot possibly be finished yet: it has to be picked up
+        // and then sleep. A poll must say so without waiting.
+        if let Some(outcome) = handle.try_join() {
+            rt.shutdown();
+            return Err(format!("try_join answered too early: {outcome:?}").into());
+        }
+
+        // A bound well below the flow's sleep must expire and hand control
+        // back, not block until the flow happens to finish.
+        if let Some(outcome) = handle.join_timeout(Duration::from_millis(20)) {
+            rt.shutdown();
+            return Err(format!("join_timeout answered too early: {outcome:?}").into());
+        }
+
+        // A generous bound collects the real outcome through the same
+        // (non-consuming) handle.
+        let outcome = handle.join_timeout(Duration::from_secs(10));
+        rt.shutdown();
+        match outcome {
+            Some(FlowOutcome::Completed(Value::Int(7))) => Ok(()),
+            other => Err(format!("unexpected outcome: {other:?}").into()),
+        }
     }
 
     #[test]

@@ -35,7 +35,8 @@ pub use capability::{CapId, CapRights};
 pub use error::{fault_count, report_fault, RuntimeError, SpawnError};
 pub use handle::FlowHandle;
 pub use mailbox::{
-    Delivery, Mailbox, MailboxCapacity, MailboxConfig, MailboxFull, MailboxStats, OverflowPolicy,
+    Delivery, Mailbox, MailboxBytes, MailboxCapacity, MailboxConfig, MailboxFull,
+    MailboxFullReason, MailboxStats, OverflowPolicy, WaitEpoch,
 };
 pub use metrics::{RuntimeMetrics, RuntimeMetricsSnapshot};
 pub use process::{

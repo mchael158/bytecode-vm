@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 
 use crate::bytecode::Value;
 
-use super::OverflowPolicy;
+use super::{MailboxFullReason, OverflowPolicy, WaitFilter};
 
-/// FIFO hop storage with a **logical** bound independent of physical
-/// allocation.
+/// FIFO hop storage with two **logical** bounds independent of physical
+/// allocation: a hop count and a byte budget.
 ///
 /// # Logical vs physical
 ///
@@ -17,6 +17,15 @@ use super::OverflowPolicy;
 /// keeps hot mailboxes from reallocating on every push without pre-paying
 /// the worst-case footprint.
 ///
+/// # Why bytes are tracked here and not by the caller
+///
+/// `bytes` must move in lockstep with every push **and** pop, or the
+/// budget drifts until the inbox wedges (a leaked charge is never
+/// refunded, so the mailbox rejects forever). That is why this type owns
+/// the filtered take ([`Self::take`]) instead of handing out `&mut
+/// VecDeque`: there is no way to remove a hop without going through the
+/// accounting.
+///
 /// # Why `VecDeque`, not an `unsafe` ring
 ///
 /// A dedicated `MaybeUninit` ring would be a natural next step, but this
@@ -26,14 +35,19 @@ use super::OverflowPolicy;
 pub(crate) struct MailboxQueue {
     inner: VecDeque<Value>,
     limit: usize,
+    bytes: usize,
+    byte_limit: usize,
 }
 
 impl MailboxQueue {
-    pub(crate) fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize, byte_limit: usize) -> Self {
         debug_assert!(limit >= 1);
+        debug_assert!(byte_limit >= 1);
         Self {
             inner: VecDeque::new(),
             limit,
+            bytes: 0,
+            byte_limit,
         }
     }
 
@@ -42,42 +56,90 @@ impl MailboxQueue {
         self.inner.len()
     }
 
+    /// Bytes currently charged to this inbox (see
+    /// [`Value::memory_size`]).
     #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 
     #[inline]
-    pub(crate) fn is_full(&self) -> bool {
+    fn is_full(&self) -> bool {
         self.inner.len() >= self.limit
     }
 
     #[inline]
-    pub(crate) fn inner_mut(&mut self) -> &mut VecDeque<Value> {
-        &mut self.inner
+    fn would_exceed_bytes(&self, cost: usize) -> bool {
+        self.bytes.saturating_add(cost) > self.byte_limit
     }
 
-    /// Try to accept `value` under `policy`. Returns `None` on
-    /// [`OverflowPolicy::Reject`] when already at the logical limit.
+    /// Remove one hop matching `filter`, preserving the relative order of
+    /// everything else (FIFO skip — non-matching hops are never dropped).
+    pub(crate) fn take(&mut self, filter: WaitFilter) -> Option<Value> {
+        let value = match filter {
+            WaitFilter::Any => self.inner.pop_front(),
+            other => {
+                let idx = self.inner.iter().position(|v| other.matches(v))?;
+                self.inner.remove(idx)
+            }
+        };
+        if let Some(v) = &value {
+            self.bytes = self.bytes.saturating_sub(v.memory_size());
+        }
+        value
+    }
+
+    /// Try to accept `value` under `policy`.
+    ///
+    /// `Err` carries which bound refused the hop. When both are at their
+    /// limit the hop count is reported first, because it is the bound
+    /// embedders configure most often and the one they read in
+    /// [`super::MailboxCapacity`].
     pub(crate) fn enqueue(
         &mut self,
         value: Value,
         policy: OverflowPolicy,
-    ) -> Option<EnqueueEffect> {
-        if !self.is_full() {
+    ) -> Result<EnqueueEffect, MailboxFullReason> {
+        let cost = value.memory_size();
+        if !self.is_full() && !self.would_exceed_bytes(cost) {
             if !reserve_for_push(&mut self.inner, self.limit) {
-                return None;
+                return Err(MailboxFullReason::MessageLimit);
             }
+            self.bytes = self.bytes.saturating_add(cost);
             self.inner.push_back(value);
-            return Some(EnqueueEffect::Enqueued);
+            return Ok(EnqueueEffect::Enqueued);
         }
+        let reason = if self.is_full() {
+            MailboxFullReason::MessageLimit
+        } else {
+            MailboxFullReason::ByteLimit
+        };
         match policy {
-            OverflowPolicy::Reject => None,
-            OverflowPolicy::DropNewest => Some(EnqueueEffect::DroppedNewest),
+            OverflowPolicy::Reject => Err(reason),
+            // "Drop the newest" is satisfiable no matter how large the
+            // incoming hop is: the hop discarded *is* the incoming one.
+            OverflowPolicy::DropNewest => Ok(EnqueueEffect::DroppedNewest),
             OverflowPolicy::DropOldest => {
-                let _ = self.inner.pop_front();
+                let mut dropped = false;
+                while (self.is_full() || self.would_exceed_bytes(cost)) && !self.inner.is_empty() {
+                    if let Some(old) = self.inner.pop_front() {
+                        self.bytes = self.bytes.saturating_sub(old.memory_size());
+                        dropped = true;
+                    }
+                }
+                // An empty inbox that still cannot fit `cost` means the hop
+                // is larger than the entire budget. Evicting the queue
+                // bought nothing, so refuse instead of pretending it landed.
+                if self.would_exceed_bytes(cost) {
+                    return Err(MailboxFullReason::ByteLimit);
+                }
+                self.bytes = self.bytes.saturating_add(cost);
                 self.inner.push_back(value);
-                Some(EnqueueEffect::DroppedOldest)
+                Ok(if dropped {
+                    EnqueueEffect::DroppedOldest
+                } else {
+                    EnqueueEffect::Enqueued
+                })
             }
         }
     }
@@ -110,12 +172,19 @@ mod tests {
     use super::*;
     use crate::bytecode::{Message, Value};
 
+    /// Byte budget large enough that hop-count tests never trip it.
+    const ROOMY: usize = 1 << 20;
+
     fn hop(n: u64) -> Value {
         Value::Message(Message::new(1, n, 1, n))
     }
 
+    fn blob(len: usize) -> Value {
+        Value::bytes(vec![0u8; len])
+    }
+
     fn hop_payload(q: &mut MailboxQueue) -> Result<u64, &'static str> {
-        match q.inner.pop_front() {
+        match q.take(WaitFilter::Any) {
             Some(v) => match v.as_message() {
                 Some(m) => Ok(m.payload),
                 None => Err("expected Message"),
@@ -126,26 +195,29 @@ mod tests {
 
     #[test]
     fn reject_at_limit() {
-        let mut q = MailboxQueue::new(2);
-        assert!(matches!(
+        let mut q = MailboxQueue::new(2, ROOMY);
+        assert_eq!(
             q.enqueue(hop(1), OverflowPolicy::Reject),
-            Some(EnqueueEffect::Enqueued)
-        ));
-        assert!(matches!(
+            Ok(EnqueueEffect::Enqueued)
+        );
+        assert_eq!(
             q.enqueue(hop(2), OverflowPolicy::Reject),
-            Some(EnqueueEffect::Enqueued)
-        ));
-        assert!(q.enqueue(hop(3), OverflowPolicy::Reject).is_none());
+            Ok(EnqueueEffect::Enqueued)
+        );
+        assert_eq!(
+            q.enqueue(hop(3), OverflowPolicy::Reject),
+            Err(MailboxFullReason::MessageLimit)
+        );
         assert_eq!(q.len(), 2);
     }
 
     #[test]
     fn drop_newest_keeps_old() -> Result<(), &'static str> {
-        let mut q = MailboxQueue::new(1);
-        q.enqueue(hop(1), OverflowPolicy::DropNewest);
+        let mut q = MailboxQueue::new(1, ROOMY);
+        let _ = q.enqueue(hop(1), OverflowPolicy::DropNewest);
         assert_eq!(
             q.enqueue(hop(2), OverflowPolicy::DropNewest),
-            Some(EnqueueEffect::DroppedNewest)
+            Ok(EnqueueEffect::DroppedNewest)
         );
         assert_eq!(hop_payload(&mut q)?, 1);
         Ok(())
@@ -153,15 +225,87 @@ mod tests {
 
     #[test]
     fn drop_oldest_slides() -> Result<(), &'static str> {
-        let mut q = MailboxQueue::new(2);
-        q.enqueue(hop(1), OverflowPolicy::DropOldest);
-        q.enqueue(hop(2), OverflowPolicy::DropOldest);
+        let mut q = MailboxQueue::new(2, ROOMY);
+        let _ = q.enqueue(hop(1), OverflowPolicy::DropOldest);
+        let _ = q.enqueue(hop(2), OverflowPolicy::DropOldest);
         assert_eq!(
             q.enqueue(hop(3), OverflowPolicy::DropOldest),
-            Some(EnqueueEffect::DroppedOldest)
+            Ok(EnqueueEffect::DroppedOldest)
         );
         assert_eq!(hop_payload(&mut q)?, 2);
         assert_eq!(hop_payload(&mut q)?, 3);
         Ok(())
+    }
+
+    #[test]
+    fn byte_limit_rejects_long_before_the_hop_count() {
+        // 64 hop slots, but only room for ~one 3 KiB blob.
+        let mut q = MailboxQueue::new(64, 4096);
+        assert_eq!(
+            q.enqueue(blob(3000), OverflowPolicy::Reject),
+            Ok(EnqueueEffect::Enqueued)
+        );
+        assert_eq!(
+            q.enqueue(blob(3000), OverflowPolicy::Reject),
+            Err(MailboxFullReason::ByteLimit)
+        );
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn take_refunds_the_charge() {
+        let mut q = MailboxQueue::new(64, 4096);
+        let _ = q.enqueue(blob(3000), OverflowPolicy::Reject);
+        assert!(q.bytes() >= 3000);
+        assert!(q.take(WaitFilter::Any).is_some());
+        assert_eq!(q.bytes(), 0);
+        // Budget freed, so an equally large hop fits again.
+        assert_eq!(
+            q.enqueue(blob(3000), OverflowPolicy::Reject),
+            Ok(EnqueueEffect::Enqueued)
+        );
+    }
+
+    #[test]
+    fn selective_take_refunds_the_right_charge() {
+        let mut q = MailboxQueue::new(64, ROOMY);
+        let _ = q.enqueue(hop(1), OverflowPolicy::Reject);
+        let _ = q.enqueue(blob(3000), OverflowPolicy::Reject);
+        let _ = q.enqueue(hop(2), OverflowPolicy::Reject);
+        let charged = q.bytes();
+        // Tag 1 matches the Message hops, never the blob.
+        assert!(q.take(WaitFilter::Tag(1)).is_some());
+        assert_eq!(q.bytes(), charged - std::mem::size_of::<Value>());
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn hop_larger_than_the_whole_budget_is_refused_even_by_drop_oldest() {
+        let mut q = MailboxQueue::new(64, 2048);
+        let _ = q.enqueue(hop(1), OverflowPolicy::DropOldest);
+        // Evicting everything still cannot make room, so refuse rather
+        // than report a delivery that silently never happened.
+        assert_eq!(
+            q.enqueue(blob(4000), OverflowPolicy::DropOldest),
+            Err(MailboxFullReason::ByteLimit)
+        );
+    }
+
+    #[test]
+    fn drop_oldest_evicts_as_many_as_the_byte_budget_needs() {
+        let mut q = MailboxQueue::new(64, 4096);
+        for n in 0..3 {
+            assert_eq!(
+                q.enqueue(blob(1000), OverflowPolicy::DropOldest),
+                Ok(EnqueueEffect::Enqueued),
+                "blob {n} should fit"
+            );
+        }
+        // A 3 KiB blob needs two of the three 1 KiB blobs evicted.
+        assert_eq!(
+            q.enqueue(blob(3000), OverflowPolicy::DropOldest),
+            Ok(EnqueueEffect::DroppedOldest)
+        );
+        assert!(q.bytes() <= 4096);
     }
 }

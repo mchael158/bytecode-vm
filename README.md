@@ -29,4 +29,11 @@ cargo install byteflow-actors
 
 Atomic Hop (`Value::Message`): `cargo run -p byteflow-actors --example atomic_actors` — see `crates/byteflow/docs/atomic-hop.md`. Set `BYTEFLOW_LOG=info` for scheduler stderr logs.
 
+**Design guides** (every example is a doctest, so they cannot drift from the API):
+[atomic-hop](crates/byteflow/docs/atomic-hop.md) ·
+[mailbox](crates/byteflow/docs/mailbox.md) ·
+[vm-safety](crates/byteflow/docs/vm-safety.md) ·
+[error-model](crates/byteflow/docs/error-model.md) ·
+[security](crates/byteflow/docs/security.md)
+
 License: MIT OR Apache-2.0 · [github.com/mchael158/bytecode-vm](https://github.com/mchael158/bytecode-vm)

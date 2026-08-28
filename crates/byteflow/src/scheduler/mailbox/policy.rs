@@ -33,31 +33,55 @@ impl Default for OverflowPolicy {
 
 /// Memory + overflow contract for every mailbox spawned by a [`crate::Runtime`].
 ///
-/// Fields are private so an invalid `u32` cannot sneak in as capacity.
-/// Construct with [`MailboxConfig::new`] or [`MailboxConfig::DEFAULT`].
+/// Fields are private so an out-of-range capacity or byte budget cannot
+/// sneak in. Construct with [`MailboxConfig::new`] or
+/// [`MailboxConfig::DEFAULT`], then narrow the byte budget with
+/// [`MailboxConfig::with_bytes`].
+///
+/// Both bounds apply; the first one reached refuses the hop. See
+/// [`super::MailboxBytes`] for why the hop count alone is not a memory
+/// bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MailboxConfig {
     capacity: super::MailboxCapacity,
+    bytes: super::MailboxBytes,
     overflow: OverflowPolicy,
 }
 
 impl MailboxConfig {
-    /// Compile-time-valid default: 256 hops, reject on overflow.
+    /// Compile-time-valid default: 256 hops, 4 MiB, reject on overflow.
     pub const DEFAULT: MailboxConfig = MailboxConfig {
         capacity: super::MailboxCapacity::DEFAULT,
+        bytes: super::MailboxBytes::DEFAULT,
         overflow: OverflowPolicy::Reject,
     };
 
+    /// Capacity + policy, with the default byte budget.
+    ///
+    /// The byte budget is a separate builder step rather than a third
+    /// parameter so embedders that only care about hop count are not
+    /// forced to reason about bytes to keep compiling.
     pub const fn new(capacity: super::MailboxCapacity, overflow: OverflowPolicy) -> Self {
         Self {
             capacity,
+            bytes: super::MailboxBytes::DEFAULT,
             overflow,
         }
+    }
+
+    /// Replace the byte budget.
+    pub const fn with_bytes(self, bytes: super::MailboxBytes) -> Self {
+        Self { bytes, ..self }
     }
 
     #[inline]
     pub const fn capacity(&self) -> super::MailboxCapacity {
         self.capacity
+    }
+
+    #[inline]
+    pub const fn bytes(&self) -> super::MailboxBytes {
+        self.bytes
     }
 
     #[inline]
@@ -75,12 +99,13 @@ impl Default for MailboxConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::mailbox::MailboxCapacity;
+    use crate::scheduler::mailbox::{MailboxBytes, MailboxCapacity};
 
     #[test]
     fn default_is_reject_256() {
         let c = MailboxConfig::DEFAULT;
         assert_eq!(c.capacity().get(), 256);
+        assert_eq!(c.bytes().get(), MailboxBytes::DEFAULT.get());
         assert_eq!(c.overflow(), OverflowPolicy::Reject);
     }
 
@@ -88,6 +113,18 @@ mod tests {
     fn new_preserves_parts() -> Result<(), &'static str> {
         let cap = MailboxCapacity::new(4).ok_or("cap")?;
         let c = MailboxConfig::new(cap, OverflowPolicy::DropOldest);
+        assert_eq!(c.capacity().get(), 4);
+        assert_eq!(c.overflow(), OverflowPolicy::DropOldest);
+        assert_eq!(c.bytes().get(), MailboxBytes::DEFAULT.get());
+        Ok(())
+    }
+
+    #[test]
+    fn with_bytes_narrows_only_the_budget() -> Result<(), &'static str> {
+        let cap = MailboxCapacity::new(4).ok_or("cap")?;
+        let budget = MailboxBytes::new(8192).ok_or("bytes")?;
+        let c = MailboxConfig::new(cap, OverflowPolicy::DropOldest).with_bytes(budget);
+        assert_eq!(c.bytes().get(), 8192);
         assert_eq!(c.capacity().get(), 4);
         assert_eq!(c.overflow(), OverflowPolicy::DropOldest);
         Ok(())

@@ -12,8 +12,10 @@
 //! | Piece | Role |
 //! |-------|------|
 //! | [`ChunkBuilder`] / [`Opcode`] | Assemble `.bf` programs in Rust (no source language) |
+//! | [`verify`] | Static gate for untrusted chunks — mandatory, not advisory |
 //! | [`Vm`] / [`VmResult`] | Per-flow register interpreter; effects hand off to the scheduler |
 //! | [`Runtime`] | Worker pool + timer; spawn / join / host [`Runtime::send`] |
+//! | [`FlowHandle`] | Collect an outcome: blocking [`FlowHandle::join`] or a bounded form |
 //! | [`Value::Message`] | **Atomic Hop** envelope — the only value allowed on `Send` / `Ask` |
 //! | [`Value::Cap`] | **FlowCap** address for bytecode delivery (`Send` / `Ask` targets) |
 //! | [`Supervisor`] | Restart policies when a flow fails |
@@ -93,12 +95,54 @@
 //! More samples: [`samples::atomic_request_reply`], [`samples::ask_reply`],
 //! [`samples::selective_receive`], forged-sender security regressions.
 //!
+//! # Collecting a result
+//!
+//! [`FlowHandle::join`] blocks, which suits a `main` with nothing else to
+//! do. Anything holding a deadline picks its own bound instead:
+//!
+//! | Call | Waits | While the flow is still running |
+//! |------|-------|---------------------------------|
+//! | [`FlowHandle::try_join`] | never | `None` |
+//! | [`FlowHandle::join_timeout`] / [`FlowHandle::join_deadline`] | up to the bound | `None` |
+//! | [`FlowHandle::join`] | unbounded | (blocks) |
+//!
+//! ```
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use byteflow::{ChunkBuilder, FlowOutcome, Runtime, Value};
+//! use std::time::Duration;
+//!
+//! let mut b = ChunkBuilder::new("slow");
+//! b.begin_function("main", 0, 2);
+//! b.emit_load_imm(0, 300);
+//! b.emit_sleep(0);
+//! b.emit_load_imm(0, 7);
+//! b.emit_return(0);
+//!
+//! let rt = Runtime::new(b.finish())?;
+//! let handle = rt.spawn(0, &[])?;
+//!
+//! // Neither of these consumes the handle or the outcome.
+//! assert!(handle.try_join().is_none());
+//! assert!(handle.join_timeout(Duration::from_millis(10)).is_none());
+//!
+//! let outcome = handle.join_timeout(Duration::from_secs(10));
+//! rt.shutdown();
+//! assert!(matches!(outcome, Some(FlowOutcome::Completed(Value::Int(7)))));
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A flow destroyed before it produced an outcome — [`Runtime::shutdown`]
+//! does not drain suspended flows — wakes its joiner with a failure instead
+//! of leaving it parked forever. See [`docs::error_model`].
+//!
 //! # Design guides (rendered on docs.rs)
 //!
 //! - [`docs::atomic_hop`] — hop protocol, Cap addressing, natives table
 //! - [`docs::mailbox`] — bounded inbox, overflow, lost-wakeup
 //! - [`docs::security`] — threat model, invariants S1–S7, roadmap
-//! - [`docs::error_model`] — fail-closed errors (no `unwrap`)
+//! - [`docs::error_model`] — fail-closed errors (no `unwrap`), bounded joins
+//! - [`docs::vm_safety`] — trust boundary: `verify` vs per-step `Fault`
 //!
 //! # What this is *not*
 //!
@@ -134,6 +178,11 @@ pub mod docs {
     #[doc = include_str!("../docs/error-model.md")]
     pub mod error_model {}
 
+    /// Trust boundary: what `verify` settles statically vs what the `Vm`
+    /// checks per step, and why a fault never becomes a panic.
+    #[doc = include_str!("../docs/vm-safety.md")]
+    pub mod vm_safety {}
+
     /// Bounded mailbox: capacity contract, overflow, anti lost-wakeup.
     #[doc = include_str!("../docs/mailbox.md")]
     pub mod mailbox {}
@@ -146,7 +195,8 @@ pub use bytecode::{
 pub use natives::{std_native_map, std_native_table, std_natives};
 pub use scheduler::{
     fault_count, next_flow_id, flow_id_from_u64, report_fault, CapId, CapRights, ChildSpec,
-    Delivery, Mailbox, MailboxCapacity, MailboxConfig, MailboxFull, MailboxStats, OverflowPolicy,
+    Delivery, Mailbox, MailboxBytes, MailboxCapacity, MailboxConfig, MailboxFull,
+    MailboxFullReason, MailboxStats, OverflowPolicy, WaitEpoch,
     Flow, FlowHandle, FlowId, FlowMetrics, FlowOutcome, FlowState,
     RestartPolicy, Runtime, RuntimeConfig, RuntimeError, RuntimeMetrics,
     RuntimeMetricsSnapshot, RuntimeSpawner, SendError, SpawnError, Supervisor,

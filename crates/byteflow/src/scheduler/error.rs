@@ -24,6 +24,24 @@ pub enum RuntimeError {
     /// A `Mutex` was poisoned: another thread panicked while holding it.
     /// Shared tables may be inconsistent; callers must not continue using them.
     PoisonedLock(&'static str),
+    /// A flow was destroyed before it produced a [`crate::FlowOutcome`], so
+    /// the completion value its handle was waiting for will never arrive.
+    ///
+    /// Reachable when the runtime shuts down while a flow is suspended (in
+    /// the timer, in a worker deque, or parked in its mailbox): those flows
+    /// are dropped without reaching `finish`. The alternative to reporting
+    /// this is worse — a `join()` that blocks the embedder's thread forever
+    /// with no way to tell "still running" from "never will".
+    Abandoned(&'static str),
+    /// The outcome was already collected by an earlier non-consuming
+    /// `try_join` / `join_timeout`, so there is nothing left to hand out.
+    ///
+    /// Caller misuse rather than an infrastructure failure (kind A in the
+    /// table above), reported here because it shares `join`'s return type.
+    /// It exists so a second poll cannot be answered with `Abandoned`, which
+    /// would blame the runtime for destroying a flow that in fact completed
+    /// normally and was already observed.
+    AlreadyCollected(&'static str),
 }
 
 impl fmt::Display for RuntimeError {
@@ -31,6 +49,15 @@ impl fmt::Display for RuntimeError {
         match self {
             RuntimeError::PoisonedLock(where_) => {
                 write!(f, "runtime mutex poisoned at {where_}")
+            }
+            RuntimeError::Abandoned(where_) => {
+                write!(
+                    f,
+                    "{where_}: flow was destroyed before producing an outcome"
+                )
+            }
+            RuntimeError::AlreadyCollected(where_) => {
+                write!(f, "{where_}: outcome was already collected")
             }
         }
     }
