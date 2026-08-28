@@ -2,7 +2,7 @@
 
 All notable changes to **byteflow-actors** are documented here.
 
-## [0.6.0] — 2026-08-27
+## [0.7.0] — 2026-08-27
 
 ### Breaking
 - **`RuntimeConfig.mailbox`:** every runtime carries a [`MailboxConfig`]
