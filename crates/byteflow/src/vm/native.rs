@@ -132,11 +132,9 @@ impl NativeTableBuilder {
         F: Fn(&[Value]) -> NativeResult + Send + Sync + 'static,
     {
         let name = name.into();
-        for slot in &self.entries {
-            if let Some((n, _)) = slot {
-                if n == &name {
-                    return Err(NativeTableError::DuplicateName(name));
-                }
+        for (n, _) in self.entries.iter().flatten() {
+            if n == &name {
+                return Err(NativeTableError::DuplicateName(name));
             }
         }
         let index_usize = index as usize;

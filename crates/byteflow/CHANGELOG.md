@@ -2,6 +2,33 @@
 
 All notable changes to **byteflow-actors** are documented here.
 
+## [0.8.0] — 2026-08-29
+
+### Breaking
+
+- **Bytecode assembly API:** public `ChunkBuilder`, `FnBuilder`, and `emit_*`
+  removed from the crate root. Use [`Program`] and [`Fn`] (`Program::new`,
+  `function`, `build`). All samples, examples, and design-guide doctests
+  migrated.
+
+### Added
+
+- **[`Program`] / [`Fn`]** — named registers, control flow (`while_lt`, labels),
+  messaging (`send`, `receive`, `receive_match_imm`, `ask`), natives
+  (`native1_from`, `make_msg`, `call_native0`), and layout helpers
+  (`function_raw`, `spawn_at`, `reg`, `window`).
+- **Trace JIT** (`feature = "jit"`): intra-chunk `Call`, trace-cache
+  invalidation on chunk reload, JIT attempts interleaved with `vm.run()`.
+- Example **`jit_loop`** (interpreter vs JIT benchmark).
+
+### Changed
+
+- README and design guides document `Program`/`Fn` as the only public
+  assembly path. `ChunkBuilder` remains crate-internal.
+
+[`Program`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.Program.html
+[`Fn`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.Fn.html
+
 ## [0.7.0] — 2026-08-27
 
 ### Breaking

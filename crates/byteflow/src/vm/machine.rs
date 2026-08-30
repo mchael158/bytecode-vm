@@ -108,6 +108,43 @@ impl Vm {
         self.set_reg(dest_reg, value)
     }
 
+    /// Program counter of the active frame — used by the optional JIT hook.
+    pub fn current_pc(&self) -> Option<usize> {
+        self.frames.last().map(|f| f.pc)
+    }
+
+    /// Number of registers in the active frame.
+    pub fn current_num_registers(&self) -> Option<u8> {
+        self.frames.last().map(|f| f.registers.len() as u8)
+    }
+
+    /// Read-only view of the active register file.
+    pub fn top_registers(&self) -> Option<&[Value]> {
+        self.frames.last().map(|f| f.registers.as_slice())
+    }
+
+    /// Mutable view of the active register file (JIT sync path).
+    pub fn top_registers_mut(&mut self) -> Option<&mut [Value]> {
+        self.frames.last_mut().map(|f| f.registers.as_mut_slice())
+    }
+
+    /// Set the active frame's program counter.
+    pub fn set_pc(&mut self, pc: usize) {
+        if let Some(frame) = self.frames.last_mut() {
+            frame.pc = pc;
+        }
+    }
+
+    /// Write one register in the active frame (JIT sync path).
+    pub fn set_register(&mut self, reg: u8, value: Value) -> Result<(), Fault> {
+        self.set_reg(reg, value)
+    }
+
+    /// Deliver a return value through the call stack.
+    pub fn return_value(&mut self, value: Value) -> Result<Option<VmResult>, Fault> {
+        self.pop_frame(value)
+    }
+
     /// Top call frame. Empty stack is a broken invariant (category D) —
     /// returned as [`Fault::Invariant`], never as `unwrap`/`expect`.
     #[inline]
@@ -590,7 +627,7 @@ fn tag_from_value(v: &Value) -> Result<u16, Fault> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::ChunkBuilder;
+    use crate::bytecode::builder::ChunkBuilder;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

@@ -27,6 +27,7 @@ fn main() {
             workers: 2,
             quantum: 10_000,
             mailbox: byteflow::MailboxConfig::DEFAULT,
+            ..Default::default()
         },
     ) {
         Ok(rt) => rt,

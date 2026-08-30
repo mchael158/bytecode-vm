@@ -6,15 +6,15 @@
 
 [English](README.md) · [Português (Brasil)](README.pt-BR.md)
 
-Embeddable concurrency for Rust: register bytecode, **flows**, mailboxes, **Atomic Hop** (`Value::Message` only on `Send`), and a supervisor — **one crate**.
+Embeddable concurrency for Rust: register bytecode via **`Program`** / **`Fn`**, **flows**, mailboxes, **Atomic Hop** (`Value::Message` only on `Send`), and a supervisor — **one crate**.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.6"
+byteflow-actors = "0.8"
 ```
 
 ```rust
-use byteflow::{ChunkBuilder, Runtime, Value};
+use byteflow::{Program, Runtime, Value};
 ```
 
 Full documentation and examples: the crate README on [crates.io/crates/byteflow-actors](https://crates.io/crates/byteflow-actors) and [docs.rs](https://docs.rs/byteflow-actors).

@@ -7,7 +7,7 @@ use super::opcode::Opcode;
 /// Layout is 8 bytes (`op` + `a`/`b`/`c` + signed `imm`) so a `Vec<Instruction>`
 /// stays dense and the interpreter can fetch with a single aligned load.
 /// Operand meaning is opcode-specific; see [`Opcode`] and
-/// [`ChunkBuilder`](crate::ChunkBuilder).
+/// [`Program`](crate::Program) / [`Fn`](crate::Fn).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Instruction {
     pub op: Opcode,

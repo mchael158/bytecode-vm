@@ -1,7 +1,7 @@
 //! Byteflow — embeddable **flow** runtime (package **`byteflow-actors`**).
 //!
 //! Not a language, not Tokio, not a JVM. You assemble register bytecode in
-//! host Rust ([`ChunkBuilder`]), spawn many lightweight **flows** on an M:N
+//! host Rust ([`Program`] / [`Fn`]), spawn many lightweight **flows** on an M:N
 //! scheduler, and they talk through mailboxes with a strict hop protocol.
 //!
 //! Dependents write `use byteflow::...` (crate name) while crates.io lists
@@ -11,7 +11,7 @@
 //!
 //! | Piece | Role |
 //! |-------|------|
-//! | [`ChunkBuilder`] / [`Opcode`] | Assemble `.bf` programs in Rust (no source language) |
+//! | [`Program`] / [`Fn`] / [`Opcode`] | Assemble `.bf` programs in Rust (no source language) |
 //! | [`verify`] | Static gate for untrusted chunks — mandatory, not advisory |
 //! | [`Vm`] / [`VmResult`] | Per-flow register interpreter; effects hand off to the scheduler |
 //! | [`Runtime`] | Worker pool + timer; spawn / join / host [`Runtime::send`] |
@@ -57,16 +57,17 @@
 //!
 //! ```
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use byteflow::{ChunkBuilder, Opcode, FlowOutcome, Runtime, Value};
+//! use byteflow::{Program, FlowOutcome, Runtime, Value};
 //!
-//! let mut b = ChunkBuilder::new("demo");
-//! b.begin_function("main", 0, 2);
-//! b.emit_load_imm(0, 41);
-//! b.emit_load_imm(1, 1);
-//! b.emit_binop(Opcode::Add, 0, 0, 1);
-//! b.emit_return(0);
+//! let mut program = Program::new("demo");
+//! program.function("main", 0, |f| {
+//!     let a = f.load_i32(41);
+//!     let b = f.load_i32(1);
+//!     let sum = f.add(a, b);
+//!     f.return_(sum);
+//! });
 //!
-//! let rt = Runtime::new(b.finish())?;
+//! let rt = Runtime::new(program.build())?;
 //! let outcome = rt.spawn(0, &[])?.join();
 //! rt.shutdown();
 //! assert!(matches!(outcome, FlowOutcome::Completed(Value::Int(42))));
@@ -108,17 +109,18 @@
 //!
 //! ```
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use byteflow::{ChunkBuilder, FlowOutcome, Runtime, Value};
+//! use byteflow::{Program, FlowOutcome, Runtime, Value};
 //! use std::time::Duration;
 //!
-//! let mut b = ChunkBuilder::new("slow");
-//! b.begin_function("main", 0, 2);
-//! b.emit_load_imm(0, 300);
-//! b.emit_sleep(0);
-//! b.emit_load_imm(0, 7);
-//! b.emit_return(0);
+//! let mut program = Program::new("slow");
+//! program.function("main", 0, |f| {
+//!     let ms = f.load_i32(300);
+//!     f.sleep(ms);
+//!     let out = f.load_i32(7);
+//!     f.return_(out);
+//! });
 //!
-//! let rt = Runtime::new(b.finish())?;
+//! let rt = Runtime::new(program.build())?;
 //! let handle = rt.spawn(0, &[])?;
 //!
 //! // Neither of these consumes the handle or the outcome.
@@ -151,7 +153,7 @@
 //! - Not a full object-capability OS (native quotas / Cap attenuation come later)
 //!
 //! Host owns I/O and policy. Byteflow owns cheap concurrency and hop delivery.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod bytecode;
@@ -160,6 +162,10 @@ pub mod natives;
 pub mod samples;
 pub mod scheduler;
 pub mod vm;
+
+#[cfg(feature = "jit")]
+#[cfg_attr(docsrs, doc(cfg(feature = "jit")))]
+pub mod jit;
 
 /// Long-form design notes shipped inside the crate (also under `docs/` on GitHub).
 ///
@@ -189,8 +195,9 @@ pub mod docs {
 }
 
 pub use bytecode::{
-    asm_macros, decode, disassemble, encode, verify, Chunk, ChunkBuilder, FormatError,
-    FunctionDef, Instruction, Label, Message, Opcode, Value, VerifyError, ABI_VERSION, MAGIC,
+    asm_macros, decode, disassemble, encode, verify, Chunk, Fn, FormatError, FuncId, FunctionDef,
+    Instruction, Label, Message, Opcode, Program, Reg, RegWindow, Value, VerifyError, ABI_VERSION,
+    MAGIC,
 };
 pub use natives::{std_native_map, std_native_table, std_natives};
 pub use scheduler::{
@@ -202,9 +209,20 @@ pub use scheduler::{
     RuntimeMetricsSnapshot, RuntimeSpawner, SendError, SpawnError, Supervisor,
     SupervisorConfig, DEFAULT_QUANTUM,
 };
+#[cfg(feature = "jit")]
+pub use scheduler::JitConfig;
 pub use vm::{
     expect_arg, expect_bool, expect_int, expect_message, expect_u64, Fault, NativeFn,
     NativeResult, NativeTable, NativeTableBuilder, NativeTableError, Vm, VmResult, MAX_CALL_DEPTH,
+};
+
+#[cfg(feature = "jit")]
+pub use jit::{
+    apply_exit_to_vm, force_compile, hot_threshold, run_compiled_trace, run_compiled_trace_ref,
+    run_vm_with_jit, run_vm_with_jit_runtime, sync_slots_from_vm, try_run_hot, try_run_hot_runtime,
+    CompileError, CompiledTrace, ExitReason, HotCounter, JitContext, JitEntry, JitFrame, JitReturn,
+    JitRuntime, SyncSlotsResult, TraceCache, TraceCompiler, TraceKey, TraceSpan, HOT_THRESHOLD,
+    MAX_TRACE_LENGTH, JIT_BUDGET, JIT_CONTINUE, JIT_DEOPT, JIT_EFFECT, JIT_RETURN, JIT_TRAP,
 };
 
 #[cfg(test)]
@@ -222,15 +240,16 @@ mod tests {
     }
 
     #[test]
-    fn chunk_builder_with_std_natives() -> Result<(), Box<dyn std::error::Error>> {
-        let mut b = ChunkBuilder::new("std-natives-demo");
-        b.begin_function("main", 0, 2);
-        b.emit_load_imm(0, 42);
-        b.emit_call_native(0, 0, 1);
-        b.emit_call_native(1, 1, 0);
-        b.emit_return(1);
+    fn std_native_chunk_runs() -> Result<(), Box<dyn std::error::Error>> {
+        let mut program = Program::new("std-natives-demo");
+        program.function("main", 0, |f| {
+            let n = f.load_i32(42);
+            f.native1_on(n, 0);
+            let ms = f.call_native0(1);
+            f.return_(ms);
+        });
 
-        let chunk = b.finish();
+        let chunk = program.build();
         verify(&chunk)?;
 
         let rt = Runtime::with_natives(chunk, std_native_table())?;

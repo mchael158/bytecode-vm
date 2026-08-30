@@ -139,7 +139,16 @@ fn drive_process(
             return;
         }
 
-        let ran = panic::catch_unwind(AssertUnwindSafe(|| flow.vm.run(shared.quantum)));
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(feature = "jit")]
+            {
+                super::jit::run_flow_quantum(&mut flow, shared)
+            }
+            #[cfg(not(feature = "jit"))]
+            {
+                flow.vm.run(shared.quantum)
+            }
+        }));
         flow
             .metrics
             .instructions

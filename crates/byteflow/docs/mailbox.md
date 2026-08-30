@@ -126,6 +126,7 @@ let cfg = RuntimeConfig {
     workers: 2,
     quantum: byteflow::DEFAULT_QUANTUM,
     mailbox,
+    ..Default::default()
 };
 ```
 
@@ -137,27 +138,28 @@ Under `Reject`, the host learns **which** bound refused the hop:
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 use byteflow::{
-    ChunkBuilder, MailboxCapacity, MailboxConfig, MailboxFullReason, Message,
+    Program, MailboxCapacity, MailboxConfig, MailboxFullReason, Message,
     OverflowPolicy, Runtime, RuntimeConfig, SendError, Value, DEFAULT_QUANTUM,
 };
 
-// A flow that sleeps instead of draining its inbox.
-let mut b = ChunkBuilder::new("deaf");
-b.begin_function("main", 0, 2);
-b.emit_load_imm(0, 60_000);
-b.emit_sleep(0);
-b.emit_return(0);
+let mut program = Program::new("deaf");
+program.function("main", 0, |f| {
+    let ms = f.load_i32(60_000);
+    f.sleep(ms);
+    f.return_(ms);
+});
 
 let capacity = match MailboxCapacity::new(2) {
     Some(c) => c,
     None => return Err("2 is within MailboxCapacity's range".into()),
 };
 let rt = Runtime::with_config(
-    b.finish(),
+    program.build(),
     RuntimeConfig {
         workers: 1,
         quantum: DEFAULT_QUANTUM,
         mailbox: MailboxConfig::new(capacity, OverflowPolicy::Reject),
+        ..Default::default()
     },
 )?;
 let handle = rt.spawn(0, &[])?;

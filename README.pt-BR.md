@@ -5,15 +5,15 @@
 
 [English](README.md) · [Português (Brasil)](README.pt-BR.md)
 
-Concorrência embutível em Rust: bytecode, **flows**, mailboxes, **Atomic Hop** (`Value::Message` só no `Send`) e supervisor — **uma única crate**.
+Concorrência embutível em Rust: bytecode com **`Program`** / **`Fn`**, **flows**, mailboxes, **Atomic Hop** (`Value::Message` só no `Send`) e supervisor — **uma única crate**.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.6"
+byteflow-actors = "0.8"
 ```
 
 ```rust
-use byteflow::{ChunkBuilder, Runtime, Value};
+use byteflow::{Program, Runtime, Value};
 ```
 
 Documentação completa: [crates.io/crates/byteflow-actors](https://crates.io/crates/byteflow-actors) e [docs.rs](https://docs.rs/byteflow-actors).

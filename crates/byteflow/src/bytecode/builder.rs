@@ -10,19 +10,11 @@ use super::value::Value;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Label(u32);
 
-/// Fluent assembler for [`Chunk`]s.
+/// Low-level fluent assembler for [`Chunk`]s (crate-internal).
 ///
-/// This exists because hand-computing relative jump offsets (design notes
-/// §7 shows raw opcodes) is exactly the kind of bookkeeping that produces
-/// off-by-one bytecode bugs that only show up as a wrong branch at runtime.
-/// The builder defers that arithmetic: emit a `Jump`/`Branch` against a
-/// [`Label`], bind the label once you know where it lands, and the builder
-/// back-patches every use.
-///
-/// This is the *only* supported way to hand-author a `Chunk` in this crate;
-/// a source-level compiler (design notes' long-term "Rust → bytecode" path)
-/// would sit on top of this same API.
-pub struct ChunkBuilder {
+/// External callers should use [`crate::Program`] / [`crate::Fn`]. This type
+/// handles label back-patching and raw opcode emission for the public API.
+pub(crate) struct ChunkBuilder {
     name: String,
     constants: Vec<Value>,
     code: Vec<Instruction>,

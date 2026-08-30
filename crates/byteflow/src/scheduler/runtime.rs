@@ -41,6 +41,29 @@ pub struct RuntimeConfig {
     /// spawned by this runtime (bytecode `Spawn` and host `spawn`).
     /// See [`MailboxConfig`] / `docs/mailbox.md`.
     pub mailbox: MailboxConfig,
+    /// Trace JIT settings (`feature = "jit"`). Ignored when the feature is off.
+    #[cfg(feature = "jit")]
+    pub jit: JitConfig,
+}
+
+/// Trace JIT toggles for [`RuntimeConfig`] (`feature = "jit"`).
+#[cfg(feature = "jit")]
+#[derive(Clone, Debug)]
+pub struct JitConfig {
+    /// When true, workers attempt compiled traces before interpreting.
+    pub enabled: bool,
+    /// How many times a `(function, pc)` pair must run before compilation.
+    pub hot_threshold: u32,
+}
+
+#[cfg(feature = "jit")]
+impl Default for JitConfig {
+    fn default() -> Self {
+        JitConfig {
+            enabled: false,
+            hot_threshold: crate::jit::HOT_THRESHOLD,
+        }
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -49,6 +72,8 @@ impl Default for RuntimeConfig {
             workers: num_cpus::get().max(1),
             quantum: DEFAULT_QUANTUM,
             mailbox: MailboxConfig::DEFAULT,
+            #[cfg(feature = "jit")]
+            jit: JitConfig::default(),
         }
     }
 }
@@ -72,14 +97,17 @@ pub struct Shared {
     pub(crate) shutdown: AtomicBool,
     pub(crate) quantum: u32,
     pub(crate) mailbox: MailboxConfig,
+    /// Shared trace JIT state (`feature = "jit"`).
+    #[cfg(feature = "jit")]
+    pub(crate) jit: Option<std::sync::Arc<crate::jit::JitRuntime>>,
 }
 
 /// A running Byteflow runtime: worker pool + timer thread over one shared
 /// [`Chunk`].
 ///
 /// Owns M:N scheduling for **flows** (spawn, yield, sleep, mailboxes,
-/// FlowCap resolution, supervised restarts). Intentionally *not* here yet:
-/// JIT, native quotas, distribution across machines.
+/// FlowCap resolution, supervised restarts). Optional trace JIT when built
+/// with `feature = "jit"` and enabled in [`RuntimeConfig::jit`].
 ///
 /// Construct with [`Runtime::new`] (no natives) or
 /// [`Runtime::with_natives`] when the chunk uses `CallNative` /
@@ -134,6 +162,13 @@ impl Runtime {
             (0..workers_n).map(|_| LocalDeque::new_fifo()).collect();
         let stealers: Vec<Stealer<Box<Flow>>> = locals.iter().map(|l| l.stealer()).collect();
 
+        #[cfg(feature = "jit")]
+        let jit = if config.jit.enabled {
+            Some(super::jit::new_runtime(chunk.clone(), config.jit.hot_threshold))
+        } else {
+            None
+        };
+
         let shared = Arc::new(Shared {
             injector: Injector::new(),
             stealers,
@@ -145,6 +180,8 @@ impl Runtime {
             shutdown: AtomicBool::new(false),
             quantum: config.quantum,
             mailbox: config.mailbox,
+            #[cfg(feature = "jit")]
+            jit,
         });
 
         let mut workers = Vec::with_capacity(workers_n);
@@ -207,7 +244,7 @@ impl Runtime {
     }
 
     /// Look up a function by name in the runtime's chunk — convenience for
-    /// callers that built their chunk with [`crate::bytecode::ChunkBuilder`]
+    /// callers that built their chunk with [`crate::Program`]
     /// and don't want to thread raw indices through their own code.
     pub fn function_index(&self, name: &str) -> Option<u32> {
         self.chunk.functions.iter().position(|f| f.name == name).map(|i| i as u32)
@@ -273,6 +310,18 @@ impl Runtime {
                 Err(SendError::NoSuchFlow(target))
             }
         }
+    }
+
+    /// Replace the runtime bytecode image and invalidate any compiled JIT traces.
+    pub fn reload_chunk(&mut self, chunk: Chunk) -> Result<(), SpawnError> {
+        crate::bytecode::verify(&chunk).map_err(|e| SpawnError::VerifyFailed(e.to_string()))?;
+        let chunk = Arc::new(chunk);
+        self.chunk = chunk.clone();
+        #[cfg(feature = "jit")]
+        if let Some(jit) = &self.shared.jit {
+            jit.reload(chunk);
+        }
+        Ok(())
     }
 
     /// Stop accepting new scheduling work and join every worker + the timer
@@ -437,7 +486,7 @@ impl RuntimeSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bytecode::{ChunkBuilder, Opcode, Value};
+    use crate::bytecode::{builder::ChunkBuilder, Opcode, Value};
     use crate::scheduler::FlowOutcome;
     use std::time::Duration;
 
@@ -476,6 +525,7 @@ mod tests {
                 workers: 1,
                 quantum: 1_000,
                 mailbox: MailboxConfig::DEFAULT,
+                ..Default::default()
             },
         )?;
         let handle = rt.spawn(0, &[])?;
@@ -512,6 +562,33 @@ mod tests {
                 workers: 1,
                 quantum: 1_000,
                 mailbox: MailboxConfig::DEFAULT,
+                ..Default::default()
+            },
+        )?;
+        let outcome = rt.spawn(0, &[])?.join();
+        rt.shutdown();
+        match outcome {
+            FlowOutcome::Completed(Value::Int(42)) => Ok(()),
+            other => Err(format!("unexpected outcome: {other:?}").into()),
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn runtime_with_jit_enabled_completes_add() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::JitConfig;
+
+        let rt = Runtime::with_config(
+            add_chunk(),
+            RuntimeConfig {
+                workers: 1,
+                quantum: 1_000,
+                mailbox: MailboxConfig::DEFAULT,
+                jit: JitConfig {
+                    enabled: true,
+                    hot_threshold: 1,
+                },
+                ..Default::default()
             },
         )?;
         let outcome = rt.spawn(0, &[])?.join();

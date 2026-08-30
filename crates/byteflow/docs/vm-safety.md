@@ -39,7 +39,7 @@ depends on the **running state** (which frame is on top, what a register
 holds right now), which no static pass can settle.
 
 | Settled statically by `verify` | Why not the VM |
-|--------------------------------|----------------|
+| ------------------------------ | ---------------- |
 | `EmptyFunctionTable` | Nothing to enter; no execution to fault |
 | `EntryOutOfRange` | Function entry is chunk data |
 | `ConstOutOfRange` | Constant pool is chunk data |
@@ -49,7 +49,7 @@ holds right now), which no static pass can settle.
 | `UnknownOpcode` | Opcode byte is chunk data |
 
 | Checked per step by the `Vm` | Why not `verify` |
-|------------------------------|------------------|
+| ---------------------------- | ------------------ |
 | `RegisterOutOfRange` | v0 has no dataflow pass; a cheap array bounds check beats proving liveness statically |
 | `RegisterIndexOverflow` | Depends on the operand plus the gather offset |
 | `TypeMismatch` | Depends on what the register holds at that instant |
@@ -70,14 +70,15 @@ on failure:
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use byteflow::{ChunkBuilder, Runtime, SpawnError};
+use byteflow::{Program, Runtime, SpawnError};
 
-// A function declaring 3 parameters but only 1 register to hold them.
-let mut b = ChunkBuilder::new("malformed");
-b.begin_function("main", 3, 1);
-b.emit_return(0);
+let mut program = Program::new("malformed");
+program.function_raw("main", 3, 1, |f| {
+    let r0 = f.reg(0);
+    f.return_(r0);
+});
 
-match Runtime::new(b.finish()) {
+match Runtime::new(program.build()) {
     Err(SpawnError::VerifyFailed(_)) => {}
     Err(e) => return Err(format!("unexpected error: {e}").into()),
     Ok(_) => return Err("a runtime must not start on an unverifiable chunk".into()),
@@ -90,14 +91,16 @@ Calling [`verify`](crate::verify) directly gives the specific reason, which
 is what a loader should log:
 
 ```rust
-use byteflow::{verify, ChunkBuilder, VerifyError};
+use byteflow::{verify, Program, VerifyError};
 
-let mut b = ChunkBuilder::new("malformed");
-b.begin_function("main", 3, 1);
-b.emit_return(0);
+let mut program = Program::new("malformed");
+program.function_raw("main", 3, 1, |f| {
+    let r0 = f.reg(0);
+    f.return_(r0);
+});
 
 assert!(matches!(
-    verify(&b.finish()),
+    verify(&program.build()),
     Err(VerifyError::ArityExceedsRegisters {
         function: 0,
         arity: 3,
@@ -122,10 +125,10 @@ space on the very first argument, before any bounds check gets a say.
 Written as `instr.a + 1 + i` on `u8`, that addition has two behaviours and
 both are wrong:
 
-| Build | Behaviour |
-|-------|-----------|
-| debug | panics — `attempt to add with overflow` |
-| release | **wraps to `r0`** and silently spawns with the wrong argument |
+| Build   | Behaviour                                                       |
+| ------- | --------------------------------------------------------------- |
+| debug   | panics — `attempt to add with overflow`                         |
+| release | **wraps to `r0`** and silently spawns with the wrong argument   |
 
 The release one is worse, and it is the one that ships. Worse still, a debug
 test suite is green either way. So every gather goes through a helper that
@@ -133,16 +136,18 @@ widens the sum and narrows it explicitly, yielding a fault:
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use byteflow::{ChunkBuilder, Fault, NativeTable, Vm, VmResult};
+use byteflow::{Program, Fault, NativeTable, Vm, VmResult};
 use std::sync::Arc;
 
-let mut b = ChunkBuilder::new("overflow");
-b.begin_function("main", 0, 2);
-// Spawn into r255, gathering one argument from r256 — which cannot exist.
-b.emit_spawn(255, 0, 1);
-b.emit_return(0);
+let mut program = Program::new("overflow");
+program.function_raw("main", 0, 2, |f| {
+    let dst = f.reg(255);
+    f.spawn_at(dst, 0, 1);
+    let out = f.load_i32(0);
+    f.return_(out);
+});
 
-let mut vm = Vm::new(Arc::new(b.finish()), NativeTable::empty(), 0, &[])?;
+let mut vm = Vm::new(Arc::new(program.build()), NativeTable::empty(), 0, &[])?;
 assert!(matches!(
     vm.run(10),
     VmResult::Trap(Fault::RegisterIndexOverflow {
@@ -161,15 +166,18 @@ does not have it":
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use byteflow::{ChunkBuilder, Fault, NativeTable, Vm, VmResult};
+use byteflow::{Program, Fault, NativeTable, Vm, VmResult};
 use std::sync::Arc;
 
-let mut b = ChunkBuilder::new("out-of-range");
-b.begin_function("main", 0, 2);
-b.emit_move(0, 200); // r200 in a 2-register frame
-b.emit_return(0);
+let mut program = Program::new("out-of-range");
+program.function_raw("main", 0, 2, |f| {
+    let zero = f.reg(0);
+    let bad = f.reg(200);
+    f.mov(zero, bad);
+    f.return_(zero);
+});
 
-let mut vm = Vm::new(Arc::new(b.finish()), NativeTable::empty(), 0, &[])?;
+let mut vm = Vm::new(Arc::new(program.build()), NativeTable::empty(), 0, &[])?;
 assert!(matches!(
     vm.run(10),
     VmResult::Trap(Fault::RegisterOutOfRange {
@@ -216,13 +224,11 @@ worker thread, and therefore cannot take down the flows queued behind it.
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use byteflow::{ChunkBuilder, FlowOutcome, Runtime};
+use byteflow::{Program, FlowOutcome, Runtime};
 
-// `Trap` is the explicit form — an assertion a compiler might emit.
-let mut b = ChunkBuilder::new("trap");
-b.begin_function("main", 0, 1);
-b.emit_trap(7);
-let rt = Runtime::new(b.finish())?;
+let mut program = Program::new("trap");
+program.function("main", 0, |f| f.trap(7));
+let rt = Runtime::new(program.build())?;
 let outcome = rt.spawn(0, &[])?.join();
 rt.shutdown();
 

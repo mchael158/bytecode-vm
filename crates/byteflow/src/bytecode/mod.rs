@@ -7,15 +7,16 @@
 //! |-------|---------|
 //! | [`Opcode`] / [`Instruction`] | ISA (opcodes are **append-only**) |
 //! | [`Value`] / [`Message`] | Runtime / constant-pool tags (ABI versioned) |
-//! | [`ChunkBuilder`] | Host-side assembler with label back-patching |
+//! | [`Program`] / [`Fn`] | Host-side assembler with named registers |
 //! | [`encode`] / [`decode`] | `.bf` module bytes (`MAGIC` + [`ABI_VERSION`]) |
 //! | [`verify`] | Structural checks before a [`crate::Runtime`] starts |
 //!
 //! Current ABI: see [`ABI_VERSION`] (FlowCap + `Str` / `Bytes`).
 
-mod builder;
+pub(crate) mod builder;
 mod chunk;
 mod disasm;
+mod program;
 mod format;
 mod instruction;
 mod macros;
@@ -23,7 +24,7 @@ mod opcode;
 mod value;
 mod verify;
 
-pub use builder::{ChunkBuilder, Label};
+pub use program::{Fn, FuncId, Label, Program, Reg, RegWindow};
 pub use chunk::{Chunk, FunctionDef, ABI_VERSION, MAGIC};
 pub use disasm::disassemble;
 pub use format::{decode, encode, FormatError};

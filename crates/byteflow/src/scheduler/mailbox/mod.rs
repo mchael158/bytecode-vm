@@ -484,7 +484,7 @@ mod tests {
     use crate::scheduler::oneshot;
     use crate::scheduler::process::{next_flow_id, RestartPolicy};
     use crate::vm::{NativeTable, Vm};
-    use crate::ChunkBuilder;
+    use crate::bytecode::builder::ChunkBuilder;
     use std::sync::Arc;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;

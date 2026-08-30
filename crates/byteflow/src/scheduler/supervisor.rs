@@ -334,7 +334,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    use crate::bytecode::{Chunk, ChunkBuilder, Value};
+    use crate::bytecode::{builder::ChunkBuilder, Chunk, Value};
     use crate::scheduler::runtime::{Runtime, RuntimeConfig};
 
     fn trap_chunk() -> Chunk {
@@ -359,6 +359,7 @@ mod tests {
                 workers: 1,
                 quantum: 1_000,
                 mailbox: super::super::mailbox::MailboxConfig::DEFAULT,
+                ..Default::default()
             },
         )
     }

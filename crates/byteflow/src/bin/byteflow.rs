@@ -64,7 +64,7 @@ fn usage(msg: &str) -> Result<(), ()> {
 fn print_help() {
     eprintln!(
         "\
-byteflow — verify, disassemble and run .bf modules (assembled via ChunkBuilder)
+byteflow — verify, disassemble and run .bf modules (assembled via Program)
 
 USAGE:
     byteflow demo [ping-pong|atomic|selective|ask|add]
@@ -181,6 +181,7 @@ fn run_chunk(
             workers: 1,
             quantum: byteflow::DEFAULT_QUANTUM,
             mailbox: byteflow::MailboxConfig::DEFAULT,
+            ..Default::default()
         },
     )
     .map_err(|e| eprintln!("runtime: {e}"))?;

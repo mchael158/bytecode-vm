@@ -6,7 +6,7 @@
 
 **Byteflow** is a small, embeddable **flow** runtime for Rust: register-based bytecode, lightweight flows, **Atomic Hop** messaging (`Value::Message` only on `Send`), cooperative scheduling, and a one-for-one supervisor — without a separate scripting language.
 
-You assemble programs with `ChunkBuilder` in host Rust. The host owns I/O; Byteflow owns cheap concurrency.
+You assemble programs with [`Program`](https://docs.rs/byteflow-actors/latest/byteflow/struct.Program.html) and [`Fn`](https://docs.rs/byteflow-actors/latest/byteflow/struct.Fn.html) in host Rust. The host owns I/O; Byteflow owns cheap concurrency.
 
 > **Package name:** `byteflow-actors` on [crates.io](https://crates.io/crates/byteflow-actors)  
 > **Rust import:** `use byteflow::...` (the library crate is named `byteflow`)
@@ -29,11 +29,11 @@ It is **not** a Tokio replacement, not a distributed cluster, and not a JVM.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.6"
+byteflow-actors = "0.8"
 ```
 
 ```rust
-use byteflow::{ChunkBuilder, Opcode, FlowOutcome, Runtime, Value};
+use byteflow::{FlowOutcome, Program, Runtime, Value};
 ```
 
 CLI (same package):
@@ -48,17 +48,18 @@ byteflow demo ping-pong
 ## Quick start
 
 ```rust
-use byteflow::{ChunkBuilder, Opcode, FlowOutcome, Runtime, Value};
+use byteflow::{FlowOutcome, Program, Runtime, Value};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut b = ChunkBuilder::new("demo");
-    b.begin_function("main", 0, 2);
-    b.emit_load_imm(0, 41);
-    b.emit_load_imm(1, 1);
-    b.emit_binop(Opcode::Add, 0, 0, 1);
-    b.emit_return(0);
+    let mut program = Program::new("demo");
+    program.function("main", 0, |f| {
+        let a = f.load_i32(41);
+        let b = f.load_i32(1);
+        let sum = f.add(a, b);
+        f.return_(sum);
+    });
 
-    let rt = Runtime::new(b.finish())?;
+    let rt = Runtime::new(program.build())?;
     let outcome = rt.spawn(0, &[])?.join();
     rt.shutdown();
 
@@ -80,18 +81,19 @@ watchdog, a test harness — picks its own bound instead:
 | `join()` | unbounded | (blocks) |
 
 ```rust
-use byteflow::{ChunkBuilder, FlowOutcome, Runtime, Value};
+use byteflow::{FlowOutcome, Program, Runtime, Value};
 use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut b = ChunkBuilder::new("slow");
-    b.begin_function("main", 0, 2);
-    b.emit_load_imm(0, 300);
-    b.emit_sleep(0); // sleeps 300 ms
-    b.emit_load_imm(0, 7);
-    b.emit_return(0);
+    let mut program = Program::new("slow");
+    program.function("main", 0, |f| {
+        let ms = f.load_i32(300);
+        f.sleep(ms);
+        let out = f.load_i32(7);
+        f.return_(out);
+    });
 
-    let rt = Runtime::new(b.finish())?;
+    let rt = Runtime::new(program.build())?;
     let handle = rt.spawn(0, &[])?;
 
     // Poll for free, or wait under a bound — neither consumes the handle.
@@ -117,17 +119,18 @@ joiner with a failure rather than leaving it parked forever — see
 Stable indices: **`print = 0`**, **`now_ms = 1`**, **`make_msg = 2`**, **`msg_*` = 3–6**, **`msg_reply_cap = 7`**.
 
 ```rust
-use byteflow::{std_native_table, ChunkBuilder, Runtime};
+use byteflow::{std_native_table, Program, Runtime};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut b = ChunkBuilder::new("clock");
-    b.begin_function("main", 0, 2);
-    b.emit_load_imm(0, 42);
-    b.emit_call_native(0, 0, 1); // print(r0)
-    b.emit_call_native(1, 1, 0); // r1 = now_ms()
-    b.emit_return(1);
+    let mut program = Program::new("clock");
+    program.function("main", 0, |f| {
+        let n = f.load_i32(42);
+        f.native1_on(n, 0);
+        let ms = f.call_native0(1);
+        f.return_(ms);
+    });
 
-    let rt = Runtime::with_natives(b.finish(), std_native_table())?;
+    let rt = Runtime::with_natives(program.build(), std_native_table())?;
     let _ = rt.spawn(0, &[])?.join();
     rt.shutdown();
     Ok(())
@@ -150,15 +153,18 @@ cargo run --example atomic_actors
 See [`docs/atomic-hop.md`](docs/atomic-hop.md). Built-in samples:
 `byteflow::samples::{ping_pong, atomic_request_reply, add_forty_two, boom}`.
 
+Hop-heavy code uses helpers such as `make_msg`, `native1_from`, `send`, `receive`, and `ask` on [`Fn`](https://docs.rs/byteflow-actors/latest/byteflow/struct.Fn.html) — see [`samples/ping_pong.rs`](examples/ping_pong.rs) or `byteflow::samples::ping_pong()`.
+
 ---
 
 ## Architecture
 
 | Layer | Responsibility |
 |---|---|
-| **Bytecode** | ISA, `ChunkBuilder`, BFV0 (`.bf`) encode/decode, static `verify` |
+| **Bytecode** | ISA, `Program` / `Fn`, BFV0 (`.bf`) encode/decode, static `verify` |
 | **VM** | One flow: registers, call stack, cooperative quantum, `CallNative` |
 | **Scheduler** | M:N workers, **bounded** FIFO mailboxes (park/wake), timer, supervisor |
+| **JIT** (feature `jit`) | Trace JIT for hot loops via Cranelift |
 | **Facade** | Public API + std natives + samples + `byteflow` CLI |
 
 **Flow lifecycle (sketch):**
@@ -211,11 +217,11 @@ byteflow run    <file.bf> [function]
 
 ---
 
-## Status (v0.6)
+## Status (v0.8)
 
-**Included:** register ISA + assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, **bounded mailboxes** (`MailboxConfig`: 256 hops + 4 MiB / Reject by default), Atomic Hop, FlowCap, supervisor, std natives, CLI, examples, fail-closed error model.
+**Included:** register ISA + `Program`/`Fn` assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, **bounded mailboxes** (`MailboxConfig`: 256 hops + 4 MiB / Reject by default), Atomic Hop, FlowCap, supervisor, std natives, CLI, examples, fail-closed error model, optional trace JIT (`feature = "jit"`).
 
-**Not yet:** `WAITING_SEND` backpressure, runtime-wide resource governor (flow count / spawn rate), Criterion benches, JIT, distribution.
+**Not yet:** `WAITING_SEND` backpressure, runtime-wide resource governor (flow count / spawn rate), Criterion benches, distribution.
 
 Design guides: [`docs/atomic-hop.md`](docs/atomic-hop.md) ·
 [`docs/mailbox.md`](docs/mailbox.md) ·

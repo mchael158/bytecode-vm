@@ -1,4 +1,4 @@
-﻿//! Built-in demo chunks assembled with [`crate::ChunkBuilder`].
+﻿//! Built-in demo chunks assembled with [`crate::Program`].
 //!
 //! Use these as runnable specs of the messaging contract (and as regression
 //! tests). Prefer copying a sample over inventing hop register layouts from
@@ -16,12 +16,9 @@
 //!
 //! Hop samples require [`crate::std_native_table`].
 
-use crate::{emit_native1_from, emit_native_n, Chunk, ChunkBuilder, Opcode};
+use crate::{Chunk, Program};
 
 /// Native indices (must match [`crate::std_native_map`]).
-///
-/// Hard-coded here so the sample stays self-contained without looking up
-/// the map at assembly time ÔÇö the stability test in `natives` guards drift.
 const N_PRINT: u32 = 0;
 const N_MAKE_MSG: u32 = 2;
 const N_MSG_SENDER: u32 = 3;
@@ -31,357 +28,212 @@ const N_MSG_PAYLOAD: u32 = 6;
 const N_MSG_REPLY_CAP: u32 = 7;
 
 /// Protocol tags for Atomic Hop samples.
-///
-/// Opaque to the VM; only this sample (and its clients) interpret them.
 pub const TAG_REQ: i32 = 1;
 pub const TAG_REP: i32 = 2;
 pub const TAG_PING: i32 = 10;
 pub const TAG_PONG: i32 = 11;
-/// Decoy hop for [`selective_receive`] ÔÇö must be skipped by `ReceiveMatch`.
+/// Decoy hop for [`selective_receive`] — must be skipped by `ReceiveMatch`.
 pub const TAG_JUNK: i32 = 99;
 
-/// `r0 = 41 + 1; return r0` ÔÇö the 60-second sanity chunk.
+/// `41 + 1; return` — the 60-second sanity chunk.
 pub fn add_forty_two() -> Chunk {
-    let mut b = ChunkBuilder::new("add-forty-two");
-    b.begin_function("main", 0, 2);
-    b.emit_load_imm(0, 41);
-    b.emit_load_imm(1, 1);
-    b.emit_binop(Opcode::Add, 0, 0, 1);
-    b.emit_return(0);
-    b.finish()
+    let mut p = Program::new("add-forty-two");
+    p.function("main", 0, |f| {
+        let a = f.load_i32(41);
+        let b = f.load_i32(1);
+        let sum = f.add(a, b);
+        f.return_(sum);
+    });
+    p.build()
 }
 
 /// Two flows, one **Atomic Hop** round-trip: `main` sends a `Message` to
 /// `pong`, `pong` replies with payload+1 via `msg_reply_cap`, `main` returns
 /// that payload (`2`).
-///
-/// Requires [`crate::std_native_table`] (`make_msg` / `msg_*`).
-///
-/// Every `Send` carries exactly one [`crate::Value::Message`] and targets a
-/// [`crate::Value::Cap`] ÔÇö bare ints / pids trap (Atomic Hop + FlowCap).
 pub fn ping_pong() -> Chunk {
-    let mut b = ChunkBuilder::new("ping-pong");
-
-    // pong: receive Message, reply payload+1 via reply_cap
-    // r0 = request Message
-    // r1 = reply Cap
-    // r2 = request_id
-    // r3 = payload (+1), then make_msg result
-    // r4..r7 = make_msg arg window
-    let pong = b.begin_function("pong", 0, 8);
-    b.emit_receive(0);
-    emit_native1_from!(b, 1, 0, N_MSG_REPLY_CAP);
-    emit_native1_from!(b, 2, 0, N_MSG_REQUEST_ID);
-    emit_native1_from!(b, 3, 0, N_MSG_PAYLOAD);
-    b.emit_load_imm(7, 1);
-    b.emit_binop(Opcode::Add, 3, 3, 7);
-    b.emit_self_pid(4);
-    b.emit_move(5, 2);
-    b.emit_load_imm(6, TAG_PONG);
-    b.emit_move(7, 3);
-    emit_native_n!(b, 4, N_MAKE_MSG, 4);
-    b.emit_send(1, 4);
-    b.emit_exit(4);
-
-    // main: spawn pong (Cap), hop Message{tag=PING, payload=1}, return reply payload
-    b.begin_function("main", 0, 8);
-    b.emit_self_pid(1);
-    b.emit_spawn(0, pong, 0);
-    b.emit_move(2, 1);
-    b.emit_load_imm(3, 1);
-    b.emit_load_imm(4, TAG_PING);
-    b.emit_load_imm(5, 1);
-    emit_native_n!(b, 2, N_MAKE_MSG, 4);
-    b.emit_send(0, 2);
-    b.emit_receive(6);
-    emit_native1_from!(b, 4, 6, N_MSG_PAYLOAD);
-    b.emit_return(4);
-
-    b.finish()
+    let mut p = Program::new("ping-pong");
+    let pong =     p.function("pong", 0, |f| {
+        let msg = f.receive();
+        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
+        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
+        let payload = f.native1_from(msg, N_MSG_PAYLOAD);
+        f.add_imm(payload, 1);
+        let self_cap = f.self_cap();
+        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_PONG, payload);
+        f.send(reply_cap, reply);
+        f.exit(reply);
+    });
+    p.function("main", 0, |f| {
+        let self_cap = f.self_cap();
+        let child = f.spawn(pong, 0);
+        let req_id = f.load_i32(1);
+        let payload = f.load_i32(1);
+        let req = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_PING, payload);
+        f.send(child, req);
+        let reply = f.receive();
+        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        f.return_(out);
+    });
+    p.build()
 }
 
 /// Atomic request-reply with [`crate::Value::Message`] (one envelope per hop).
-///
-/// Requires [`crate::std_native_table`] (`make_msg` / `msg_*` / `print`).
-///
-/// # Why "Atomic Hop"
-///
-/// Correlation (`request_id`) and reply routing (`sender`) travel in a
-/// **single** mailbox value. Classic actor runtimes often allow any scalar
-/// on `Send`; Byteflow rejects that ÔÇö every hop is a typed envelope.
-///
-/// # Protocol
-///
-/// 1. `main` spawns `server`, builds
-///    `Message { id=1, tag=REQ, payload=41 }` (sender placeholder ignored)
-/// 2. `server` receives, logs via `print`, replies
-///    `tag=REP, payload=42` via `msg_reply_cap` (echoing `request_id`)
-/// 3. `main` returns the reply payload `42`
-///
-/// # Register discipline (`CallNative` clobbers `r[a]`)
-///
-/// `CallNative ra, ÔÇª, nc` reads args from `r[a..a+nc]` and writes the
-/// result into `r[a]`. Keeping the original `Message` in `r0` therefore
-/// means every unpack is `Move ri, r0` then `CallNative ri, msg_*, 1`.
-/// `make_msg` needs four **contiguous** arg registers; the server rearranges
-/// into `r4..r7` before the call.
 pub fn atomic_request_reply() -> Chunk {
-    let mut b = ChunkBuilder::new("atomic-request-reply");
-
-    // --- server -----------------------------------------------------------
-    // r0  = request Message (never overwritten until Exit)
-    // r1  = reply Cap (from msg_reply_cap)
-    // r2  = request_id
-    // r3  = tag
-    // r4  = payload, then make_msg result (reply Message)
-    // r5  = self Cap, then make_msg arg slot
-    // r6  = TAG_REP for make_msg
-    // r7  = scratch (print copy, +1 imm, payload for make_msg)
-    let server = b.begin_function("server", 0, 8);
-    b.emit_receive(0);
-    emit_native1_from!(b, 7, 0, N_PRINT);
-    emit_native1_from!(b, 1, 0, N_MSG_REPLY_CAP);
-    emit_native1_from!(b, 2, 0, N_MSG_REQUEST_ID);
-    emit_native1_from!(b, 3, 0, N_MSG_TAG);
-    emit_native1_from!(b, 4, 0, N_MSG_PAYLOAD);
-    b.emit_load_imm(7, 1);
-    b.emit_binop(Opcode::Add, 4, 4, 7);
-    b.emit_self_pid(5);
-    b.emit_move(7, 4);
-    b.emit_move(4, 5);
-    b.emit_move(5, 2);
-    b.emit_load_imm(6, TAG_REP);
-    emit_native_n!(b, 4, N_MAKE_MSG, 4);
-    emit_native1_from!(b, 7, 4, N_PRINT);
-    b.emit_send(1, 4);
-    b.emit_exit(4);
-
-    // --- main -------------------------------------------------------------
-    // r0 = server Cap
-    // r1 = self Cap
-    // r2..r5 = make_msg(self, 1, TAG_REQ, 41) ÔåÆ r2 becomes the request Message
-    // r6 = reply Message
-    // r7 = scratch for print / unpack
-    b.begin_function("main", 0, 8);
-    b.emit_self_pid(1);
-    b.emit_spawn(0, server, 0);
-    b.emit_move(2, 1);
-    b.emit_load_imm(3, 1);
-    b.emit_load_imm(4, TAG_REQ);
-    b.emit_load_imm(5, 41);
-    emit_native_n!(b, 2, N_MAKE_MSG, 4);
-    emit_native1_from!(b, 7, 2, N_PRINT);
-    b.emit_send(0, 2);
-    b.emit_receive(6);
-    emit_native1_from!(b, 7, 6, N_PRINT);
-    emit_native1_from!(b, 4, 6, N_MSG_PAYLOAD);
-    b.emit_return(4);
-
-    b.finish()
+    let mut p = Program::new("atomic-request-reply");
+    let server = p.function("server", 0, |f| {
+        let msg = f.receive();
+        f.native1_on(msg, N_PRINT);
+        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
+        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
+        let _tag = f.native1_from(msg, N_MSG_TAG);
+        let payload = f.native1_from(msg, N_MSG_PAYLOAD);
+        f.add_imm(payload, 1);
+        let self_cap = f.self_cap();
+        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REP, payload);
+        f.native1_on(reply, N_PRINT);
+        f.send(reply_cap, reply);
+        f.exit(reply);
+    });
+    p.function("main", 0, |f| {
+        let self_cap = f.self_cap();
+        let server_cap = f.spawn(server, 0);
+        let req_id = f.load_i32(1);
+        let payload = f.load_i32(41);
+        let req = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REQ, payload);
+        f.native1_on(req, N_PRINT);
+        f.send(server_cap, req);
+        let reply = f.receive();
+        f.native1_on(reply, N_PRINT);
+        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        f.return_(out);
+    });
+    p.build()
 }
 
 /// Selective Atomic Hop: server waits for `TAG_REQ` while a `TAG_JUNK` hop
 /// sits ahead in the mailbox (FIFO skip, not drop).
-///
-/// Requires [`crate::std_native_table`].
-///
-/// 1. `main` sends junk (`tag=TAG_JUNK`), then request (`tag=TAG_REQ`, payload=41)
-/// 2. `server` does `ReceiveMatchImm TAG_REQ` ÔÇö must see payload 41, not junk
-/// 3. replies `TAG_REP` / 42; then classic `Receive` drains the leftover junk
-/// 4. `main` returns reply payload `42`
 pub fn selective_receive() -> Chunk {
-    let mut b = ChunkBuilder::new("selective-receive");
-
-    // server: match TAG_REQ, reply 42 via reply_cap, then drain junk
-    let server = b.begin_function("server", 0, 8);
-    b.emit_receive_match_imm(0, TAG_REQ as u16);
-    emit_native1_from!(b, 1, 0, N_MSG_REPLY_CAP);
-    emit_native1_from!(b, 2, 0, N_MSG_REQUEST_ID);
-    emit_native1_from!(b, 4, 0, N_MSG_PAYLOAD);
-    b.emit_load_imm(7, 1);
-    b.emit_binop(Opcode::Add, 4, 4, 7);
-    b.emit_self_pid(5);
-    b.emit_move(7, 4);
-    b.emit_move(4, 5);
-    b.emit_move(5, 2);
-    b.emit_load_imm(6, TAG_REP);
-    emit_native_n!(b, 4, N_MAKE_MSG, 4);
-    b.emit_send(1, 4);
-    // leftover TAG_JUNK must still be waiting
-    b.emit_receive(0);
-    emit_native1_from!(b, 3, 0, N_MSG_TAG);
-    b.emit_load_imm(7, TAG_JUNK);
-    b.emit_binop(Opcode::Eq, 3, 3, 7);
-    // Branch jumps when falsy: not-equal ÔåÆ trap
-    let trap_lbl = b.new_label();
-    b.emit_branch(3, trap_lbl);
-    b.emit_exit(4);
-    b.bind_label(trap_lbl);
-    b.emit_trap(2);
-
-    b.begin_function("main", 0, 8);
-    b.emit_self_pid(1);
-    b.emit_spawn(0, server, 0);
-    // junk hop first
-    b.emit_move(2, 1);
-    b.emit_load_imm(3, 1);
-    b.emit_load_imm(4, TAG_JUNK);
-    b.emit_load_imm(5, 0);
-    emit_native_n!(b, 2, N_MAKE_MSG, 4);
-    b.emit_send(0, 2);
-    // real request
-    b.emit_move(2, 1);
-    b.emit_load_imm(3, 1);
-    b.emit_load_imm(4, TAG_REQ);
-    b.emit_load_imm(5, 41);
-    emit_native_n!(b, 2, N_MAKE_MSG, 4);
-    b.emit_send(0, 2);
-    b.emit_receive_match_imm(6, TAG_REP as u16);
-    emit_native1_from!(b, 4, 6, N_MSG_PAYLOAD);
-    b.emit_return(4);
-
-    b.finish()
+    let mut p = Program::new("selective-receive");
+    let server = p.function("server", 0, |f| {
+        let msg = f.receive_match_imm(TAG_REQ as u16);
+        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
+        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
+        let payload = f.native1_from(msg, N_MSG_PAYLOAD);
+        f.add_imm(payload, 1);
+        let self_cap = f.self_cap();
+        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REP, payload);
+        f.send(reply_cap, reply);
+        let junk = f.receive();
+        let tag = f.native1_from(junk, N_MSG_TAG);
+        let is_junk = f.eq_imm(tag, TAG_JUNK);
+        let trap_lbl = f.label();
+        f.branch_if_falsy(is_junk, trap_lbl);
+        f.exit(reply);
+        f.bind(trap_lbl);
+        f.trap(2);
+    });
+    p.function("main", 0, |f| {
+        let self_cap = f.self_cap();
+        let server_cap = f.spawn(server, 0);
+        let req_id = f.load_i32(1);
+        let zero = f.load_i32(0);
+        let junk = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_JUNK, zero);
+        f.send(server_cap, junk);
+        let payload = f.load_i32(41);
+        let req = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REQ, payload);
+        f.send(server_cap, req);
+        let reply = f.receive_match_imm(TAG_REP as u16);
+        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        f.return_(out);
+    });
+    p.build()
 }
 
-/// Atomic request/reply via [`Opcode::Ask`] (RPC hop).
-///
-/// Requires [`crate::std_native_table`].
-///
-/// 1. `main` builds `Message { id=1, tag=REQ, payload=41 }` and `Ask`s the server Cap
-/// 2. `server` `ReceiveMatchImm TAG_REQ`, replies via `msg_reply_cap` with
-///    `TAG_REP` / payload 42 and the same `request_id`
-/// 3. `Ask` resumes with the reply; `main` returns payload `42`
+/// Atomic request/reply via `Ask` (RPC hop).
 pub fn ask_reply() -> Chunk {
-    let mut b = ChunkBuilder::new("ask-reply");
-
-    let server = b.begin_function("server", 0, 8);
-    b.emit_receive_match_imm(0, TAG_REQ as u16);
-    emit_native1_from!(b, 1, 0, N_MSG_REPLY_CAP);
-    emit_native1_from!(b, 2, 0, N_MSG_REQUEST_ID);
-    emit_native1_from!(b, 4, 0, N_MSG_PAYLOAD);
-    b.emit_load_imm(7, 1);
-    b.emit_binop(Opcode::Add, 4, 4, 7);
-    b.emit_self_pid(5);
-    b.emit_move(7, 4);
-    b.emit_move(4, 5);
-    b.emit_move(5, 2);
-    b.emit_load_imm(6, TAG_REP);
-    emit_native_n!(b, 4, N_MAKE_MSG, 4);
-    b.emit_send(1, 4);
-    b.emit_exit(4);
-
-    // main: Ask r6, r0 (server Cap), r2 (request Message)
-    b.begin_function("main", 0, 8);
-    b.emit_self_pid(1);
-    b.emit_spawn(0, server, 0);
-    b.emit_move(2, 1);
-    b.emit_load_imm(3, 1);
-    b.emit_load_imm(4, TAG_REQ);
-    b.emit_load_imm(5, 41);
-    emit_native_n!(b, 2, N_MAKE_MSG, 4);
-    b.emit_ask(6, 0, 2);
-    emit_native1_from!(b, 4, 6, N_MSG_PAYLOAD);
-    b.emit_return(4);
-
-    b.finish()
+    let mut p = Program::new("ask-reply");
+    let server = p.function("server", 0, |f| {
+        let msg = f.receive_match_imm(TAG_REQ as u16);
+        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
+        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
+        let payload = f.native1_from(msg, N_MSG_PAYLOAD);
+        f.add_imm(payload, 1);
+        let self_cap = f.self_cap();
+        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REP, payload);
+        f.send(reply_cap, reply);
+        f.exit(reply);
+    });
+    p.function("main", 0, |f| {
+        let self_cap = f.self_cap();
+        let server_cap = f.spawn(server, 0);
+        let req_id = f.load_i32(1);
+        let payload = f.load_i32(41);
+        let req = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REQ, payload);
+        let reply = f.ask(server_cap, req);
+        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        f.return_(out);
+    });
+    p.build()
 }
 
-/// Security regression sample: forged `make_msg` sender must not survive `Send`.
-///
-/// # What this proves
-///
-/// Invariant **S1** from `docs/security.md`: structural Atomic Hop typing
-/// alone cannot stop a module from writing `sender = 999` into a
-/// [`crate::Message`]. The scheduler overwrites that field on bytecode
-/// `Send`, so the serverÔÇÖs `msg_sender` / echoed payload reflects the **real**
-/// client flow id.
-///
-/// # Protocol
-///
-/// 1. `main` builds a request with forged sender `999` and `Send`s it.
-/// 2. `server` reads the delivered hop, puts authenticated `msg_sender` into
-///    the reply `payload`, and answers.
-/// 3. `main` returns that payload as `Int`.
-///
-/// Unit tests assert the returned id is not `999` (and is a plausible live
-/// flow id). Requires [`crate::std_native_table`].
+/// Security regression: forged `make_msg` sender must not survive `Send`.
 pub fn forged_sender_send() -> Chunk {
-    let mut b = ChunkBuilder::new("forged-sender-send");
-
-    let server = b.begin_function("server", 0, 8);
-    b.emit_receive(0);
-    emit_native1_from!(b, 1, 0, N_MSG_REPLY_CAP);
-    emit_native1_from!(b, 2, 0, N_MSG_REQUEST_ID);
-    emit_native1_from!(b, 3, 0, N_MSG_SENDER);
-    // reply: payload = authenticated sender FlowId
-    b.emit_self_pid(4);
-    b.emit_move(5, 2);
-    b.emit_load_imm(6, TAG_REP);
-    b.emit_move(7, 3);
-    emit_native_n!(b, 4, N_MAKE_MSG, 4);
-    b.emit_send(1, 4);
-    b.emit_exit(4);
-
-    b.begin_function("main", 0, 8);
-    b.emit_self_pid(1);
-    b.emit_spawn(0, server, 0);
-    // Deliberately forge sender = 999
-    b.emit_load_imm(2, 999);
-    b.emit_load_imm(3, 1);
-    b.emit_load_imm(4, TAG_REQ);
-    b.emit_load_imm(5, 0);
-    emit_native_n!(b, 2, N_MAKE_MSG, 4);
-    b.emit_send(0, 2);
-    b.emit_receive(6);
-    emit_native1_from!(b, 4, 6, N_MSG_PAYLOAD);
-    b.emit_return(4);
-
-    b.finish()
+    let mut p = Program::new("forged-sender-send");
+    let server = p.function("server", 0, |f| {
+        let msg = f.receive();
+        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
+        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
+        let sender = f.native1_from(msg, N_MSG_SENDER);
+        let self_cap = f.self_cap();
+        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REP, sender);
+        f.send(reply_cap, reply);
+        f.exit(reply);
+    });
+    p.function("main", 0, |f| {
+        let server_cap = f.spawn(server, 0);
+        let forged = f.load_i32(999);
+        let req_id = f.load_i32(1);
+        let zero = f.load_i32(0);
+        let req = f.make_msg(N_MAKE_MSG, forged, req_id, TAG_REQ, zero);
+        f.send(server_cap, req);
+        let reply = f.receive();
+        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        f.return_(out);
+    });
+    p.build()
 }
 
-/// Same security property as [`forged_sender_send`], via [`Opcode::Ask`].
-///
-/// Covers the request half of **S1** on the RPC path: a forged
-/// `make_msg.sender` is stamped away before the server observes the hop.
-/// Reply authenticity (**S2**, `sender == target`) is covered separately by
-/// mailbox unit tests (`ask_requires_reply_from_target`).
+/// Same security property as [`forged_sender_send`], via `Ask`.
 pub fn forged_sender_ask() -> Chunk {
-    let mut b = ChunkBuilder::new("forged-sender-ask");
-
-    let server = b.begin_function("server", 0, 8);
-    b.emit_receive_match_imm(0, TAG_REQ as u16);
-    emit_native1_from!(b, 1, 0, N_MSG_REPLY_CAP);
-    emit_native1_from!(b, 2, 0, N_MSG_REQUEST_ID);
-    emit_native1_from!(b, 3, 0, N_MSG_SENDER);
-    b.emit_self_pid(4);
-    b.emit_move(5, 2);
-    b.emit_load_imm(6, TAG_REP);
-    b.emit_move(7, 3);
-    emit_native_n!(b, 4, N_MAKE_MSG, 4);
-    b.emit_send(1, 4);
-    b.emit_exit(4);
-
-    b.begin_function("main", 0, 8);
-    b.emit_self_pid(1);
-    b.emit_spawn(0, server, 0);
-    b.emit_load_imm(2, 999);
-    b.emit_load_imm(3, 1);
-    b.emit_load_imm(4, TAG_REQ);
-    b.emit_load_imm(5, 0);
-    emit_native_n!(b, 2, N_MAKE_MSG, 4);
-    b.emit_ask(6, 0, 2);
-    emit_native1_from!(b, 4, 6, N_MSG_PAYLOAD);
-    b.emit_return(4);
-
-    b.finish()
+    let mut p = Program::new("forged-sender-ask");
+    let server = p.function("server", 0, |f| {
+        let msg = f.receive_match_imm(TAG_REQ as u16);
+        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
+        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
+        let sender = f.native1_from(msg, N_MSG_SENDER);
+        let self_cap = f.self_cap();
+        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REP, sender);
+        f.send(reply_cap, reply);
+        f.exit(reply);
+    });
+    p.function("main", 0, |f| {
+        let server_cap = f.spawn(server, 0);
+        let forged = f.load_i32(999);
+        let req_id = f.load_i32(1);
+        let zero = f.load_i32(0);
+        let req = f.make_msg(N_MAKE_MSG, forged, req_id, TAG_REQ, zero);
+        let reply = f.ask(server_cap, req);
+        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        f.return_(out);
+    });
+    p.build()
 }
 
-/// Immediate `Trap` ÔÇö used to show [`crate::Supervisor`] restart.
+/// Immediate `Trap` — used to show [`crate::Supervisor`] restart.
 pub fn boom() -> Chunk {
-    let mut b = ChunkBuilder::new("boom");
-    b.begin_function("boom", 0, 1);
-    b.emit_trap(1);
-    b.finish()
+    let mut p = Program::new("boom");
+    p.function("boom", 0, |f| f.trap(1));
+    p.build()
 }
 
 #[cfg(test)]
@@ -398,6 +250,7 @@ mod tests {
                 workers: 1,
                 quantum: 10_000,
                 mailbox: crate::MailboxConfig::DEFAULT,
+                ..Default::default()
             },
         )
     }
@@ -410,6 +263,7 @@ mod tests {
                 workers: 1,
                 quantum: 10_000,
                 mailbox: crate::MailboxConfig::DEFAULT,
+                ..Default::default()
             },
         )
     }
@@ -491,14 +345,12 @@ mod tests {
             matches!(outcome, FlowOutcome::Completed(Value::Int(42))),
             "got {outcome:?}"
         );
-        // request + reply
         assert!(sent >= 2);
         Ok(())
     }
 
     #[test]
     fn send_overwrites_forged_sender() -> Result<(), Box<dyn std::error::Error>> {
-        // S1: make_msg(sender=999, …) + Send → receiver must not see 999.
         let chunk = forged_sender_send();
         assert!(verify(&chunk).is_ok());
         let rt = tiny_natives(chunk)?;
@@ -517,7 +369,6 @@ mod tests {
 
     #[test]
     fn ask_overwrites_forged_request_sender() -> Result<(), Box<dyn std::error::Error>> {
-        // S1 on the Ask request path (same forge, RPC hop).
         let chunk = forged_sender_ask();
         assert!(verify(&chunk).is_ok());
         let rt = tiny_natives(chunk)?;
@@ -536,17 +387,17 @@ mod tests {
 
     #[test]
     fn send_scalar_target_traps() -> Result<(), Box<dyn std::error::Error>> {
-        let mut b = ChunkBuilder::new("bad-cap-target");
-        b.begin_function("main", 0, 6);
-        b.emit_load_imm(0, 99); // Int — not Cap
-        b.emit_load_imm(1, 0);
-        b.emit_load_imm(2, 1);
-        b.emit_load_imm(3, TAG_PING);
-        b.emit_load_imm(4, 1);
-        emit_native_n!(b, 1, N_MAKE_MSG, 4);
-        b.emit_send(0, 1);
-        b.emit_return(1);
-        let rt = tiny_natives(b.finish())?;
+        let mut p = Program::new("bad-cap-target");
+        p.function("main", 0, |f| {
+            let bad_cap = f.load_i32(99);
+            let sender = f.load_i32(0);
+            let req_id = f.load_i32(1);
+            let payload = f.load_i32(1);
+            let msg = f.make_msg(N_MAKE_MSG, sender, req_id, TAG_PING, payload);
+            f.send(bad_cap, msg);
+            f.return_(msg);
+        });
+        let rt = tiny_natives(p.build())?;
         let outcome = rt.spawn(0, &[])?.join();
         rt.shutdown();
         assert!(
@@ -558,13 +409,14 @@ mod tests {
 
     #[test]
     fn send_scalar_is_not_an_atomic_hop() -> Result<(), Box<dyn std::error::Error>> {
-        let mut b = ChunkBuilder::new("bad-hop");
-        b.begin_function("main", 0, 2);
-        b.emit_self_pid(0);
-        b.emit_load_imm(1, 99);
-        b.emit_send(0, 1);
-        b.emit_return(1);
-        let rt = tiny(b.finish())?;
+        let mut p = Program::new("bad-hop");
+        p.function("main", 0, |f| {
+            let cap = f.self_cap();
+            let scalar = f.load_i32(99);
+            f.send(cap, scalar);
+            f.return_(scalar);
+        });
+        let rt = tiny(p.build())?;
         let outcome = rt.spawn(0, &[])?.join();
         rt.shutdown();
         assert!(

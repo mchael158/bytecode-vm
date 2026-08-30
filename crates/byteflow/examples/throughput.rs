@@ -6,14 +6,15 @@
 
 use std::time::Instant;
 
-use byteflow::{ChunkBuilder, FlowOutcome, Runtime, RuntimeConfig, Value};
+use byteflow::{FlowOutcome, Program, Runtime, RuntimeConfig, Value};
 
 fn trivial_chunk() -> byteflow::Chunk {
-    let mut b = ChunkBuilder::new("throughput");
-    b.begin_function("worker", 0, 1);
-    b.emit_load_imm(0, 1);
-    b.emit_return(0);
-    b.finish()
+    let mut program = Program::new("throughput");
+    program.function("worker", 0, |f| {
+        let one = f.load_i32(1);
+        f.return_(one);
+    });
+    program.build()
 }
 
 fn main() {
@@ -36,6 +37,7 @@ fn main() {
             workers,
             quantum: 10_000,
             mailbox: byteflow::MailboxConfig::DEFAULT,
+            ..Default::default()
         },
     ) {
         Ok(rt) => rt,

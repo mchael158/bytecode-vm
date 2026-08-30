@@ -32,12 +32,14 @@ a thread are all things the embedder can act on. None of them panic:
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use byteflow::{ChunkBuilder, Runtime, SpawnError};
+use byteflow::{Program, Runtime, SpawnError};
 
-let mut b = ChunkBuilder::new("demo");
-b.begin_function("main", 0, 1);
-b.emit_return(0);
-let rt = Runtime::new(b.finish())?;
+let mut program = Program::new("demo");
+program.function("main", 0, |f| {
+    let zero = f.load_i32(0);
+    f.return_(zero);
+});
+let rt = Runtime::new(program.build())?;
 
 // The chunk has exactly one function, so index 99 is a caller mistake.
 let result = rt.spawn(99, &[]);
@@ -78,17 +80,17 @@ leaving it on a condvar nobody will notify again.
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use byteflow::{ChunkBuilder, FlowOutcome, Runtime};
+use byteflow::{Program, FlowOutcome, Runtime};
 use std::time::Duration;
 
-// A flow that sleeps for a minute.
-let mut b = ChunkBuilder::new("sleeper");
-b.begin_function("main", 0, 2);
-b.emit_load_imm(0, 60_000);
-b.emit_sleep(0);
-b.emit_return(0);
+let mut program = Program::new("sleeper");
+program.function("main", 0, |f| {
+    let ms = f.load_i32(60_000);
+    f.sleep(ms);
+    f.return_(ms);
+});
 
-let rt = Runtime::new(b.finish())?;
+let rt = Runtime::new(program.build())?;
 let handle = rt.spawn(0, &[])?;
 // Give it time to reach the Sleep and park in the timer.
 std::thread::sleep(Duration::from_millis(150));
@@ -124,18 +126,18 @@ form. Those take `&self`, so an expired bound leaves the handle usable:
 
 ```rust
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use byteflow::{ChunkBuilder, FlowOutcome, Runtime, Value};
+use byteflow::{Program, FlowOutcome, Runtime, Value};
 use std::time::Duration;
 
-// A flow that sleeps 300 ms, then returns 7.
-let mut b = ChunkBuilder::new("slow");
-b.begin_function("main", 0, 2);
-b.emit_load_imm(0, 300);
-b.emit_sleep(0);
-b.emit_load_imm(0, 7);
-b.emit_return(0);
+let mut program = Program::new("slow");
+program.function("main", 0, |f| {
+    let ms = f.load_i32(300);
+    f.sleep(ms);
+    let out = f.load_i32(7);
+    f.return_(out);
+});
 
-let rt = Runtime::new(b.finish())?;
+let rt = Runtime::new(program.build())?;
 let handle = rt.spawn(0, &[])?;
 
 // Asking costs no waiting at all, and it cannot be finished yet.

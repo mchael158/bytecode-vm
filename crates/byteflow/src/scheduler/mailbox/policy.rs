@@ -18,17 +18,12 @@
 /// Default is [`Reject`](Self::Reject): fail-closed. Silent drop is an
 /// explicit embedder choice.
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OverflowPolicy {
+    #[default]
     Reject = 0,
     DropNewest = 1,
     DropOldest = 2,
-}
-
-impl Default for OverflowPolicy {
-    fn default() -> Self {
-        Self::Reject
-    }
 }
 
 /// Memory + overflow contract for every mailbox spawned by a [`crate::Runtime`].

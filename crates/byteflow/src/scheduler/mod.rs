@@ -21,6 +21,8 @@ mod capability;
 mod directory;
 mod error;
 mod handle;
+#[cfg(feature = "jit")]
+mod jit;
 mod mailbox;
 mod metrics;
 pub(crate) mod oneshot;
@@ -45,4 +47,6 @@ pub use process::{
 pub use runtime::{
     flow_id_from_u64, Runtime, RuntimeConfig, RuntimeSpawner, SendError, DEFAULT_QUANTUM,
 };
+#[cfg(feature = "jit")]
+pub use runtime::JitConfig;
 pub use supervisor::{ChildSpec, Supervisor, SupervisorConfig};

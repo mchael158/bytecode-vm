@@ -12,6 +12,16 @@ pub struct RuntimeMetrics {
     pub messages_sent: AtomicU64,
     pub steals: AtomicU64,
     pub reschedules: AtomicU64,
+    #[cfg(feature = "jit")]
+    pub jit_compiles: AtomicU64,
+    #[cfg(feature = "jit")]
+    pub jit_compile_failures: AtomicU64,
+    #[cfg(feature = "jit")]
+    pub jit_executions: AtomicU64,
+    #[cfg(feature = "jit")]
+    pub jit_misses: AtomicU64,
+    #[cfg(feature = "jit")]
+    pub jit_deopts: AtomicU64,
 }
 
 impl RuntimeMetrics {
@@ -28,6 +38,16 @@ impl RuntimeMetrics {
             messages_sent: self.messages_sent.load(Ordering::Relaxed),
             steals: self.steals.load(Ordering::Relaxed),
             reschedules: self.reschedules.load(Ordering::Relaxed),
+            #[cfg(feature = "jit")]
+            jit_compiles: self.jit_compiles.load(Ordering::Relaxed),
+            #[cfg(feature = "jit")]
+            jit_compile_failures: self.jit_compile_failures.load(Ordering::Relaxed),
+            #[cfg(feature = "jit")]
+            jit_executions: self.jit_executions.load(Ordering::Relaxed),
+            #[cfg(feature = "jit")]
+            jit_misses: self.jit_misses.load(Ordering::Relaxed),
+            #[cfg(feature = "jit")]
+            jit_deopts: self.jit_deopts.load(Ordering::Relaxed),
         }
     }
 }
@@ -42,6 +62,16 @@ pub struct RuntimeMetricsSnapshot {
     pub messages_sent: u64,
     pub steals: u64,
     pub reschedules: u64,
+    #[cfg(feature = "jit")]
+    pub jit_compiles: u64,
+    #[cfg(feature = "jit")]
+    pub jit_compile_failures: u64,
+    #[cfg(feature = "jit")]
+    pub jit_executions: u64,
+    #[cfg(feature = "jit")]
+    pub jit_misses: u64,
+    #[cfg(feature = "jit")]
+    pub jit_deopts: u64,
 }
 
 impl std::fmt::Display for RuntimeMetricsSnapshot {
@@ -55,6 +85,17 @@ impl std::fmt::Display for RuntimeMetricsSnapshot {
             self.messages_sent,
             self.steals,
             self.reschedules,
-        )
+        )?;
+        #[cfg(feature = "jit")]
+        write!(
+            f,
+            " jit_compiles={} jit_failures={} jit_exec={} jit_miss={} jit_deopt={}",
+            self.jit_compiles,
+            self.jit_compile_failures,
+            self.jit_executions,
+            self.jit_misses,
+            self.jit_deopts,
+        )?;
+        Ok(())
     }
 }
