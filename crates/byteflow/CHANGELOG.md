@@ -2,6 +2,33 @@
 
 All notable changes to **byteflow-actors** are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **Monitors / links:** `Runtime::monitor` / `link` and bytecode
+  `Fn::monitor` / `Fn::link`. Target exit is coordinated in `finalize_flow`.
+  Monitors deliver [`TAG_SYS_DOWN`] Atomic Hops; abnormal link exit kills
+  the peer. See `docs/lifecycle.md`.
+- **`WAITING_SEND`:** bytecode `Send` / `Ask` park on a full `Reject` inbox;
+  one waiter is admitted per freed slot.
+- **Registry:** `register_name` / `whereis` store a `CapId` (never `FlowId`);
+  entries are swept on flow exit.
+- Opcodes `Monitor` `0x56`, `Demonitor` `0x57`, `Link` `0x58`, `Unlink` `0x59`,
+  `AskTimeout` `0x5A` (append-only ABI; `Trap` stays `0x60`).
+- **`Runtime::kill`:** cooperative abort (`FlowExitReason::Killed`).
+- **OTP strategies:** `RestartStrategy::{OneForOne, OneForAll, RestForOne}`
+  on `SupervisorConfig`. Sibling kills use `expected_shutdown` so they do
+  not cascade.
+- **`RuntimeConfig.max_flows`:** hard cap on live flows (`0` = unlimited);
+  overflow is `SpawnError::FlowLimit`.
+- **Ask target death:** parked `Ask` / `AskTimeout` resume with `TAG_SYS_EXIT`
+  (`Message::linked_exit`) instead of hanging. `AskTimeout` clock expiry
+  still writes `Unit`.
+- **`ChildSpec.name`:** non-empty names are `register_name`'d (Cap) for that
+  incarnation; duplicate → `SpawnError::NameTaken`.
+- Removed unused public `FlowState` (scheduler never stored it).
+
 ## [0.8.0] — 2026-08-29
 
 ### Breaking

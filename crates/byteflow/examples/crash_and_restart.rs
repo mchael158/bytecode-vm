@@ -37,6 +37,7 @@ fn main() {
         SupervisorConfig {
             max_restarts: 2,
             max_period: Duration::from_secs(5),
+            strategy: byteflow::RestartStrategy::OneForOne,
         },
     ) {
         Ok(s) => s,

@@ -41,6 +41,9 @@ pub struct RuntimeConfig {
     /// spawned by this runtime (bytecode `Spawn` and host `spawn`).
     /// See [`MailboxConfig`] / `docs/mailbox.md`.
     pub mailbox: MailboxConfig,
+    /// Hard cap on concurrently live flows (`0` = unlimited).
+    /// Checked on every host and bytecode `spawn`.
+    pub max_flows: u32,
     /// Trace JIT settings (`feature = "jit"`). Ignored when the feature is off.
     #[cfg(feature = "jit")]
     pub jit: JitConfig,
@@ -72,6 +75,7 @@ impl Default for RuntimeConfig {
             workers: num_cpus::get().max(1),
             quantum: DEFAULT_QUANTUM,
             mailbox: MailboxConfig::DEFAULT,
+            max_flows: 0,
             #[cfg(feature = "jit")]
             jit: JitConfig::default(),
         }
@@ -97,6 +101,13 @@ pub struct Shared {
     pub(crate) shutdown: AtomicBool,
     pub(crate) quantum: u32,
     pub(crate) mailbox: MailboxConfig,
+    pub(crate) max_flows: u32,
+    pub(crate) monitors: super::monitor::MonitorStore,
+    pub(crate) links: super::link::LinkStore,
+    pub(crate) registry: super::registry::RegistryStore,
+    pub(crate) kill_signals: super::finalize::KillSignals,
+    pub(crate) waiting_send_at: super::finalize::WaitingSendIndex,
+    pub(crate) ask_waits: super::finalize::AskWaitIndex,
     /// Shared trace JIT state (`feature = "jit"`).
     #[cfg(feature = "jit")]
     pub(crate) jit: Option<std::sync::Arc<crate::jit::JitRuntime>>,
@@ -180,6 +191,13 @@ impl Runtime {
             shutdown: AtomicBool::new(false),
             quantum: config.quantum,
             mailbox: config.mailbox,
+            max_flows: config.max_flows,
+            monitors: super::monitor::MonitorStore::new(),
+            links: super::link::LinkStore::new(),
+            registry: super::registry::RegistryStore::new(),
+            kill_signals: super::finalize::KillSignals::new(),
+            waiting_send_at: super::finalize::WaitingSendIndex::new(),
+            ask_waits: super::finalize::AskWaitIndex::new(),
             #[cfg(feature = "jit")]
             jit,
         });
@@ -201,7 +219,11 @@ impl Runtime {
                 shared_timer
                     .timer
                     .clone()
-                    .drive(&shared_timer.injector, &shared_timer.notify)
+                    .drive(
+                        &shared_timer.injector,
+                        &shared_timer.notify,
+                        &shared_timer.ask_waits,
+                    )
             })
             .map_err(|e| SpawnError::ThreadSpawnFailed(e.to_string()))?;
 
@@ -294,6 +316,7 @@ impl Runtime {
                 Ok(())
             }
             Ok(Ok(Delivery::Handoff(mut flow))) => {
+                let _ = self.shared.ask_waits.remove_asker(flow.id);
                 if let Some(dest) = flow.last_receive_dest {
                     let _ = flow.vm.resume_with(dest, message);
                 }
@@ -312,7 +335,155 @@ impl Runtime {
         }
     }
 
-    /// Replace the runtime bytecode image and invalidate any compiled JIT traces.
+    fn require_live(&self, id: FlowId) -> Result<(), super::error::LifecycleError> {
+        match self.shared.directory.lookup(id) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(super::error::LifecycleError::NoSuchFlow(id)),
+            Err(e) => Err(self.unavailable(e)),
+        }
+    }
+
+    fn unavailable(&self, err: super::error::RuntimeError) -> super::error::LifecycleError {
+        super::error::report_fault(err);
+        super::error::LifecycleError::Unavailable
+    }
+
+    /// Mint a SEND|ASK Cap for a live flow (host equivalent of `SelfPid`).
+    pub fn mint_cap(&self, flow: FlowId) -> Result<super::capability::CapId, super::error::LifecycleError> {
+        self.require_live(flow)?;
+        self.shared
+            .caps
+            .mint(flow, super::capability::CapRights::SEND_ASK)
+            .map_err(|e| self.unavailable(e))
+    }
+
+    /// Watch `target`; when it exits, `owner` receives a [`crate::TAG_SYS_DOWN`] hop.
+    ///
+    /// Both flows must be live. `owner == target` is [`LifecycleError::SelfRelation`].
+    pub fn monitor(
+        &self,
+        owner: FlowId,
+        target: FlowId,
+    ) -> Result<super::monitor::MonitorRef, super::error::LifecycleError> {
+        if owner == target {
+            return Err(super::error::LifecycleError::SelfRelation);
+        }
+        self.require_live(owner)?;
+        self.require_live(target)?;
+        let mon = self
+            .shared
+            .monitors
+            .create(owner, target)
+            .map_err(|e| self.unavailable(e))?;
+        // Target may have finalized between the live check and insert.
+        // Synthesize DOWN and drop the now-useless relation (owner still live).
+        if self.require_live(target).is_err() {
+            let _ = self.shared.monitors.remove_owned(owner, mon);
+            super::finalize::deliver_down(
+                &self.shared,
+                super::monitor::DownEvent {
+                    monitor: mon,
+                    owner,
+                    target,
+                    reason: super::monitor::FlowExitReason::Fault,
+                },
+            );
+        }
+        Ok(mon)
+    }
+
+    /// Drop `monitor` if `owner` still owns it.
+    pub fn demonitor(
+        &self,
+        owner: FlowId,
+        monitor: super::monitor::MonitorRef,
+    ) -> Result<(), super::error::LifecycleError> {
+        self.require_live(owner)?;
+        match self.shared.monitors.remove_owned(owner, monitor) {
+            Ok(inner) => inner,
+            Err(e) => Err(self.unavailable(e)),
+        }
+    }
+
+    /// Bidirectional link. Abnormal exit of either side kills the peer.
+    pub fn link(
+        &self,
+        a: FlowId,
+        b: FlowId,
+    ) -> Result<super::link::LinkId, super::error::LifecycleError> {
+        if a == b {
+            return Err(super::error::LifecycleError::SelfRelation);
+        }
+        self.require_live(a)?;
+        self.require_live(b)?;
+        match self.shared.links.link(a, b) {
+            Ok(inner) => inner,
+            Err(e) => Err(self.unavailable(e)),
+        }
+    }
+
+    /// Drop `link` if `owner` is one of the endpoints.
+    pub fn unlink(
+        &self,
+        owner: FlowId,
+        link: super::link::LinkId,
+    ) -> Result<(), super::error::LifecycleError> {
+        self.require_live(owner)?;
+        match self.shared.links.unlink_owned(owner, link) {
+            Ok(inner) => inner,
+            Err(e) => Err(self.unavailable(e)),
+        }
+    }
+
+    /// Bind `name` to a live Cap (address). Names are swept when that flow exits.
+    pub fn register_name(
+        &self,
+        name: &str,
+        cap: super::capability::CapId,
+    ) -> Result<(), super::error::LifecycleError> {
+        let entry = match self.shared.caps.resolve(cap) {
+            Ok(Some(e)) => e,
+            Ok(None) => return Err(super::error::LifecycleError::InvalidCapability),
+            Err(e) => return Err(self.unavailable(e)),
+        };
+        self.require_live(entry.flow)?;
+        match self.shared.registry.register(
+            super::registry::RegistryName::from(name),
+            cap,
+            entry.flow,
+        ) {
+            Ok(inner) => inner,
+            Err(e) => Err(self.unavailable(e)),
+        }
+    }
+
+    /// Look up a registered Cap, or `None` if the name is free / was swept.
+    pub fn whereis(&self, name: &str) -> Result<Option<super::capability::CapId>, super::error::LifecycleError> {
+        self.shared
+            .registry
+            .whereis(name)
+            .map_err(|e| self.unavailable(e))
+    }
+
+    /// Cooperative abort. Parked flows finalize immediately; a running flow
+    /// dies at the next quantum with [`super::monitor::FlowExitReason::Killed`].
+    pub fn kill(&self, id: FlowId) -> Result<(), super::error::LifecycleError> {
+        self.require_live(id)?;
+        super::finalize::request_kill(&self.shared, id, super::monitor::FlowExitReason::Killed);
+        Ok(())
+    }
+
+    /// Remove a name without waiting for the flow to exit. `false` if unknown.
+    pub fn unregister_name(&self, name: &str) -> Result<bool, super::error::LifecycleError> {
+        self.shared
+            .registry
+            .unregister(name)
+            .map_err(|e| self.unavailable(e))
+    }
+
+    /// Replace the image used by **new host** [`Self::spawn`] calls and
+    /// drop JIT traces. Live flows and bytecode `Spawn` keep the parent's
+    /// existing `Vm` chunk.
     pub fn reload_chunk(&mut self, chunk: Chunk) -> Result<(), SpawnError> {
         crate::bytecode::verify(&chunk).map_err(|e| SpawnError::VerifyFailed(e.to_string()))?;
         let chunk = Arc::new(chunk);
@@ -404,6 +575,15 @@ pub(crate) fn spawn_on(
     restart_policy: RestartPolicy,
     supervisor: Option<SupervisorLink>,
 ) -> Result<FlowHandle, SpawnError> {
+    if shared.max_flows > 0 {
+        let current = shared.directory.len();
+        if current >= shared.max_flows as usize {
+            return Err(SpawnError::FlowLimit {
+                current,
+                max: shared.max_flows,
+            });
+        }
+    }
     let id = super::process::next_flow_id();
     let vm = Vm::new(chunk.clone(), natives.clone(), function, args)?;
     let mailbox = Arc::new(Mailbox::with_config(shared.mailbox));
@@ -480,6 +660,10 @@ impl RuntimeSpawner {
 
     pub fn metrics(&self) -> RuntimeMetricsSnapshot {
         self.shared.metrics.snapshot()
+    }
+
+    pub(crate) fn request_kill(&self, id: FlowId, reason: super::monitor::FlowExitReason) {
+        super::finalize::request_kill(&self.shared, id, reason);
     }
 }
 
@@ -570,6 +754,70 @@ mod tests {
         match outcome {
             FlowOutcome::Completed(Value::Int(42)) => Ok(()),
             other => Err(format!("unexpected outcome: {other:?}").into()),
+        }
+    }
+
+    fn receive_forever_chunk() -> Chunk {
+        let mut b = ChunkBuilder::new("recv");
+        b.begin_function("main", 0, 1);
+        b.emit_receive(0);
+        b.emit_return(0);
+        b.finish()
+    }
+
+    #[test]
+    fn kill_parked_flow_joins_failed() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = Runtime::with_config(
+            receive_forever_chunk(),
+            RuntimeConfig {
+                workers: 1,
+                quantum: 1_000,
+                mailbox: MailboxConfig::DEFAULT,
+                ..Default::default()
+            },
+        )?;
+        let handle = rt.spawn(0, &[])?;
+        rt.kill(handle.id())?;
+        let outcome = handle.join();
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Failed(_)),
+            "kill must fail the joiner, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn max_flows_rejects_extra_spawn() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = Runtime::with_config(
+            receive_forever_chunk(),
+            RuntimeConfig {
+                workers: 1,
+                quantum: 1_000,
+                mailbox: MailboxConfig::DEFAULT,
+                max_flows: 1,
+                ..Default::default()
+            },
+        )?;
+        let first = rt.spawn(0, &[])?;
+        let second = rt.spawn(0, &[]);
+        rt.kill(first.id())?;
+        let _ = first.join();
+        rt.shutdown();
+        match second {
+            Err(SpawnError::FlowLimit { current, max }) => {
+                assert_eq!(current, 1);
+                assert_eq!(max, 1);
+                Ok(())
+            }
+            other => Err(format!(
+                "expected FlowLimit, got {}",
+                match &other {
+                    Ok(_) => "Ok(handle)".into(),
+                    Err(e) => format!("Err({e})"),
+                }
+            )
+            .into()),
         }
     }
 

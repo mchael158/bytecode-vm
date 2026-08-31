@@ -65,7 +65,13 @@ reply.request_id == request.request_id
 Implemented via mailbox `WaitFilter::Correlation { expect_request_id, expect_sender: Some(flow_id) }`.
 FIFO skip applies: unrelated hops (wrong id or wrong sender) stay queued.
 
-No `AskTimeout` in this revision. Sample: [`samples::ask_reply`](../src/samples.rs).
+`AskTimeout` (`0x5A`) is the same hop plus a deadline: the dest register
+gets `Value::Unit` if no correlated reply arrives in time (same writeback
+as `ReceiveTimeout`). If the **target exits** first, dest is a
+`TAG_SYS_EXIT` hop instead (see [`lifecycle.md`](lifecycle.md)). Sample:
+[`samples::ask_reply`](../src/samples.rs),
+[`samples::ask_timeout_expires`](../src/samples.rs),
+[`samples::ask_target_exits`](../src/samples.rs).
 
 That is the deliberate difference vs classic actor runtimes that allow any value on send.
 

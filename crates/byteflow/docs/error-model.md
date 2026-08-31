@@ -171,12 +171,13 @@ of spurious wakeups through the wait to pin this.
 
 ### Still open
 
-Bytecode `Ask` parks with no deadline and is not notified when its target
-dies, so it can wait forever. Same rule, not yet applied.
-
 Calling `join` from inside a worker (from a native function, say) blocks
 that worker on a flow that may need that very worker to progress. The rule
 is documented but not yet machine-checked.
+
+`Ask` without a deadline used to hang if the target died. It now resumes
+with a [`TAG_SYS_EXIT`](../src/bytecode/value.rs) hop. `AskTimeout` still
+writes `Unit` on the clock deadline.
 
 ## Clippy (core crate)
 

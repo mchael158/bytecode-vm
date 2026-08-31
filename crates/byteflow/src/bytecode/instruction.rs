@@ -74,6 +74,15 @@ impl fmt::Display for Instruction {
                 "{} r{}, r{}, r{}",
                 self.op, self.a, self.b, self.c
             ),
+            Opcode::AskTimeout => write!(
+                f,
+                "{} r{}, r{}, r{}, timeout=r{}",
+                self.op, self.a, self.b, self.c, self.imm
+            ),
+            Opcode::Monitor | Opcode::Link => {
+                write!(f, "{} r{}, r{}", self.op, self.a, self.b)
+            }
+            Opcode::Demonitor | Opcode::Unlink => write!(f, "{} r{}", self.op, self.a),
             Opcode::Trap => write!(f, "{} {}", self.op, self.imm),
         }
     }

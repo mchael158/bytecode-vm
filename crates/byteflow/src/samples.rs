@@ -11,21 +11,22 @@
 //! | [`atomic_request_reply`] | Tagged REQ/REP + `print` |
 //! | [`selective_receive`] | `ReceiveMatch` FIFO skip |
 //! | [`ask_reply`] | `Ask` RPC hop |
+//! | [`ask_timeout_expires`] | `AskTimeout` writes `Unit` when the server stays silent |
+//! | [`ask_target_exits`] | `Ask` dest is `TAG_SYS_EXIT` when the server dies first |
+//! | [`server_loop`] | BEAM-style receive → handle → reply loop |
 //! | [`forged_sender_send`] / [`forged_sender_ask`] | S1: forged `make_msg` sender dies |
 //! | [`boom`] | Immediate trap (supervisor demos) |
+//! | [`monitor_down`] | Monitor → [`crate::TAG_SYS_DOWN`] on child exit |
+//! | [`waiting_send`] | `WAITING_SEND`: second hop parks until the first is received |
 //!
 //! Hop samples require [`crate::std_native_table`].
 
 use crate::{Chunk, Program};
+use crate::natives::std_native;
 
 /// Native indices (must match [`crate::std_native_map`]).
-const N_PRINT: u32 = 0;
-const N_MAKE_MSG: u32 = 2;
-const N_MSG_SENDER: u32 = 3;
-const N_MSG_REQUEST_ID: u32 = 4;
-const N_MSG_TAG: u32 = 5;
-const N_MSG_PAYLOAD: u32 = 6;
-const N_MSG_REPLY_CAP: u32 = 7;
+const N_PRINT: u32 = std_native::PRINT;
+const N_MAKE_MSG: u32 = std_native::MAKE_MSG;
 
 /// Protocol tags for Atomic Hop samples.
 pub const TAG_REQ: i32 = 1;
@@ -52,26 +53,21 @@ pub fn add_forty_two() -> Chunk {
 /// that payload (`2`).
 pub fn ping_pong() -> Chunk {
     let mut p = Program::new("ping-pong");
-    let pong =     p.function("pong", 0, |f| {
+    let pong = p.function("pong", 0, |f| {
         let msg = f.receive();
-        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
-        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
-        let payload = f.native1_from(msg, N_MSG_PAYLOAD);
+        let payload = f.hop_payload(msg);
         f.add_imm(payload, 1);
-        let self_cap = f.self_cap();
-        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_PONG, payload);
-        f.send(reply_cap, reply);
-        f.exit(reply);
+        f.send_reply(msg, TAG_PONG, payload);
+        f.exit(payload);
     });
     p.function("main", 0, |f| {
-        let self_cap = f.self_cap();
         let child = f.spawn(pong, 0);
         let req_id = f.load_i32(1);
         let payload = f.load_i32(1);
-        let req = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_PING, payload);
+        let req = f.hop(req_id, TAG_PING, payload);
         f.send(child, req);
         let reply = f.receive();
-        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        let out = f.hop_payload(reply);
         f.return_(out);
     });
     p.build()
@@ -83,28 +79,21 @@ pub fn atomic_request_reply() -> Chunk {
     let server = p.function("server", 0, |f| {
         let msg = f.receive();
         f.native1_on(msg, N_PRINT);
-        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
-        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
-        let _tag = f.native1_from(msg, N_MSG_TAG);
-        let payload = f.native1_from(msg, N_MSG_PAYLOAD);
+        let payload = f.hop_payload(msg);
         f.add_imm(payload, 1);
-        let self_cap = f.self_cap();
-        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REP, payload);
-        f.native1_on(reply, N_PRINT);
-        f.send(reply_cap, reply);
-        f.exit(reply);
+        f.send_reply(msg, TAG_REP, payload);
+        f.exit(payload);
     });
     p.function("main", 0, |f| {
-        let self_cap = f.self_cap();
         let server_cap = f.spawn(server, 0);
         let req_id = f.load_i32(1);
         let payload = f.load_i32(41);
-        let req = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REQ, payload);
+        let req = f.hop(req_id, TAG_REQ, payload);
         f.native1_on(req, N_PRINT);
         f.send(server_cap, req);
         let reply = f.receive();
         f.native1_on(reply, N_PRINT);
-        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        let out = f.hop_payload(reply);
         f.return_(out);
     });
     p.build()
@@ -116,34 +105,29 @@ pub fn selective_receive() -> Chunk {
     let mut p = Program::new("selective-receive");
     let server = p.function("server", 0, |f| {
         let msg = f.receive_match_imm(TAG_REQ as u16);
-        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
-        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
-        let payload = f.native1_from(msg, N_MSG_PAYLOAD);
+        let payload = f.hop_payload(msg);
         f.add_imm(payload, 1);
-        let self_cap = f.self_cap();
-        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REP, payload);
-        f.send(reply_cap, reply);
+        f.send_reply(msg, TAG_REP, payload);
         let junk = f.receive();
-        let tag = f.native1_from(junk, N_MSG_TAG);
+        let tag = f.hop_tag(junk);
         let is_junk = f.eq_imm(tag, TAG_JUNK);
         let trap_lbl = f.label();
         f.branch_if_falsy(is_junk, trap_lbl);
-        f.exit(reply);
+        f.exit(payload);
         f.bind(trap_lbl);
         f.trap(2);
     });
     p.function("main", 0, |f| {
-        let self_cap = f.self_cap();
         let server_cap = f.spawn(server, 0);
         let req_id = f.load_i32(1);
         let zero = f.load_i32(0);
-        let junk = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_JUNK, zero);
+        let junk = f.hop(req_id, TAG_JUNK, zero);
         f.send(server_cap, junk);
         let payload = f.load_i32(41);
-        let req = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REQ, payload);
+        let req = f.hop(req_id, TAG_REQ, payload);
         f.send(server_cap, req);
         let reply = f.receive_match_imm(TAG_REP as u16);
-        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        let out = f.hop_payload(reply);
         f.return_(out);
     });
     p.build()
@@ -154,23 +138,85 @@ pub fn ask_reply() -> Chunk {
     let mut p = Program::new("ask-reply");
     let server = p.function("server", 0, |f| {
         let msg = f.receive_match_imm(TAG_REQ as u16);
-        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
-        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
-        let payload = f.native1_from(msg, N_MSG_PAYLOAD);
+        let payload = f.hop_payload(msg);
         f.add_imm(payload, 1);
-        let self_cap = f.self_cap();
-        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REP, payload);
-        f.send(reply_cap, reply);
-        f.exit(reply);
+        f.send_reply(msg, TAG_REP, payload);
+        f.exit(payload);
     });
     p.function("main", 0, |f| {
-        let self_cap = f.self_cap();
         let server_cap = f.spawn(server, 0);
         let req_id = f.load_i32(1);
         let payload = f.load_i32(41);
-        let req = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REQ, payload);
+        let req = f.hop(req_id, TAG_REQ, payload);
         let reply = f.ask(server_cap, req);
-        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        let out = f.hop_payload(reply);
+        f.return_(out);
+    });
+    p.build()
+}
+
+/// `AskTimeout` against a server that never replies → `Unit`.
+pub fn ask_timeout_expires() -> Chunk {
+    let mut p = Program::new("ask-timeout");
+    let server = p.function("server", 0, |f| {
+        let _msg = f.receive();
+        let ms = f.load_i32(10_000);
+        f.sleep(ms);
+        let zero = f.load_i32(0);
+        f.return_(zero);
+    });
+    p.function("main", 0, |f| {
+        let server_cap = f.spawn(server, 0);
+        let req_id = f.load_i32(1);
+        let payload = f.load_i32(0);
+        let req = f.hop(req_id, TAG_REQ, payload);
+        let ms = f.load_i32(40);
+        let reply = f.ask_timeout(server_cap, req, ms);
+        f.return_(reply);
+    });
+    p.build()
+}
+
+/// Server takes the request and exits; client `Ask` must not hang.
+pub fn ask_target_exits() -> Chunk {
+    let mut p = Program::new("ask-target-exits");
+    let server = p.function("server", 0, |f| {
+        let _msg = f.receive();
+        let z = f.load_i32(0);
+        f.return_(z);
+    });
+    p.function("main", 0, |f| {
+        let server_cap = f.spawn(server, 0);
+        let req_id = f.load_i32(1);
+        let payload = f.load_i32(0);
+        let req = f.hop(req_id, TAG_REQ, payload);
+        let reply = f.ask(server_cap, req);
+        let tag = f.hop_tag(reply);
+        f.return_(tag);
+    });
+    p.build()
+}
+
+/// BEAM-style server loop: `receive_match` → handle → `send_reply` → repeat.
+pub fn server_loop() -> Chunk {
+    let mut p = Program::new("server-loop");
+    let server = p.function("server", 0, |f| {
+        let loop_lbl = f.label();
+        f.bind(loop_lbl);
+        let req = f.receive_match_imm(TAG_REQ as u16);
+        let payload = f.hop_payload(req);
+        f.add_imm(payload, 1);
+        f.send_reply(req, TAG_REP, payload);
+        f.jump(loop_lbl);
+    });
+    p.function("main", 0, |f| {
+        let server_cap = f.spawn(server, 0);
+        let req_id = f.load_i32(1);
+        let payload = f.load_i32(41);
+        let req = f.hop(req_id, TAG_REQ, payload);
+        f.send(server_cap, req);
+        let reply = f.receive_match_imm(TAG_REP as u16);
+        let out = f.hop_payload(reply);
         f.return_(out);
     });
     p.build()
@@ -181,13 +227,9 @@ pub fn forged_sender_send() -> Chunk {
     let mut p = Program::new("forged-sender-send");
     let server = p.function("server", 0, |f| {
         let msg = f.receive();
-        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
-        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
-        let sender = f.native1_from(msg, N_MSG_SENDER);
-        let self_cap = f.self_cap();
-        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REP, sender);
-        f.send(reply_cap, reply);
-        f.exit(reply);
+        let sender = f.hop_sender(msg);
+        f.send_reply(msg, TAG_REP, sender);
+        f.exit(sender);
     });
     p.function("main", 0, |f| {
         let server_cap = f.spawn(server, 0);
@@ -197,7 +239,7 @@ pub fn forged_sender_send() -> Chunk {
         let req = f.make_msg(N_MAKE_MSG, forged, req_id, TAG_REQ, zero);
         f.send(server_cap, req);
         let reply = f.receive();
-        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        let out = f.hop_payload(reply);
         f.return_(out);
     });
     p.build()
@@ -208,13 +250,9 @@ pub fn forged_sender_ask() -> Chunk {
     let mut p = Program::new("forged-sender-ask");
     let server = p.function("server", 0, |f| {
         let msg = f.receive_match_imm(TAG_REQ as u16);
-        let reply_cap = f.native1_from(msg, N_MSG_REPLY_CAP);
-        let req_id = f.native1_from(msg, N_MSG_REQUEST_ID);
-        let sender = f.native1_from(msg, N_MSG_SENDER);
-        let self_cap = f.self_cap();
-        let reply = f.make_msg(N_MAKE_MSG, self_cap, req_id, TAG_REP, sender);
-        f.send(reply_cap, reply);
-        f.exit(reply);
+        let sender = f.hop_sender(msg);
+        f.send_reply(msg, TAG_REP, sender);
+        f.exit(sender);
     });
     p.function("main", 0, |f| {
         let server_cap = f.spawn(server, 0);
@@ -223,8 +261,59 @@ pub fn forged_sender_ask() -> Chunk {
         let zero = f.load_i32(0);
         let req = f.make_msg(N_MAKE_MSG, forged, req_id, TAG_REQ, zero);
         let reply = f.ask(server_cap, req);
-        let out = f.native1_from(reply, N_MSG_PAYLOAD);
+        let out = f.hop_payload(reply);
         f.return_(out);
+    });
+    p.build()
+}
+
+/// Child sleeps then exits; parent monitors and returns the `DOWN` reason (`0` = normal).
+pub fn monitor_down() -> Chunk {
+    let mut p = Program::new("monitor-down");
+    let child = p.function("child", 0, |f| {
+        let ms = f.load_i32(40);
+        f.sleep(ms);
+        let z = f.load_i32(0);
+        f.return_(z);
+    });
+    p.function("main", 0, |f| {
+        let cap = f.spawn(child, 0);
+        let mon = f.monitor(cap);
+        let msg = f.receive_match_imm(crate::TAG_SYS_DOWN);
+        let id = f.hop_request_id(msg);
+        let ok = f.eq(id, mon);
+        let trap = f.label();
+        f.branch_if_falsy(ok, trap);
+        let out = f.hop_payload(msg);
+        f.return_(out);
+        f.bind(trap);
+        f.trap(3);
+    });
+    p.build()
+}
+
+/// Client arity 1 (`r0` = server Cap) sends two hops; server drains both.
+/// With mailbox capacity 1 the second send parks (`WAITING_SEND`).
+pub fn waiting_send() -> Chunk {
+    let mut p = Program::new("waiting-send");
+    p.function("server", 0, |f| {
+        let ms = f.load_i32(50);
+        f.sleep(ms);
+        let _first = f.receive();
+        let second = f.receive();
+        let out = f.hop_payload(second);
+        f.return_(out);
+    });
+    p.function("client", 1, |f| {
+        let server = f.reg(0);
+        let req_id = f.load_i32(1);
+        let one = f.load_i32(1);
+        let first = f.hop(req_id, TAG_REQ, one);
+        f.send(server, first);
+        let forty_two = f.load_i32(42);
+        let second = f.hop(req_id, TAG_REQ, forty_two);
+        f.send(server, second);
+        f.exit(second);
     });
     p.build()
 }
@@ -350,6 +439,54 @@ mod tests {
     }
 
     #[test]
+    fn ask_timeout_writes_unit() -> Result<(), Box<dyn std::error::Error>> {
+        let chunk = ask_timeout_expires();
+        assert!(verify(&chunk).is_ok());
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Completed(Value::Unit)),
+            "got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ask_target_exit_writes_sys_exit() -> Result<(), Box<dyn std::error::Error>> {
+        let chunk = ask_target_exits();
+        assert!(verify(&chunk).is_ok());
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
+        rt.shutdown();
+        assert!(
+            matches!(
+                outcome,
+                FlowOutcome::Completed(Value::Int(n)) if n == i64::from(crate::TAG_SYS_EXIT)
+            ),
+            "got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn server_loop_joins_42() -> Result<(), Box<dyn std::error::Error>> {
+        let chunk = server_loop();
+        assert!(verify(&chunk).is_ok());
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Completed(Value::Int(42))),
+            "got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn send_overwrites_forged_sender() -> Result<(), Box<dyn std::error::Error>> {
         let chunk = forged_sender_send();
         assert!(verify(&chunk).is_ok());
@@ -423,6 +560,153 @@ mod tests {
             matches!(outcome, FlowOutcome::Failed(_)),
             "scalar Send must trap, got {outcome:?}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn monitor_down_joins_normal_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let chunk = monitor_down();
+        assert!(verify(&chunk).is_ok());
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Completed(Value::Int(0))),
+            "DOWN reason should be Normal (0), got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn waiting_send_second_hop_arrives() -> Result<(), Box<dyn std::error::Error>> {
+        let cap = crate::MailboxCapacity::new(1).ok_or("cap")?;
+        let rt = Runtime::with_natives_and_config(
+            waiting_send(),
+            std_native_table(),
+            RuntimeConfig {
+                workers: 1,
+                quantum: 10_000,
+                mailbox: crate::MailboxConfig::new(cap, crate::OverflowPolicy::Reject),
+                ..Default::default()
+            },
+        )?;
+        let server = rt.function_index("server").ok_or("server")?;
+        let client = rt.function_index("client").ok_or("client")?;
+        let server_h = rt.spawn(server, &[])?;
+        let server_cap = rt.mint_cap(server_h.id())?;
+        rt.spawn(client, &[Value::Cap(server_cap.as_u64())])?;
+        let outcome = server_h.join();
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Completed(Value::Int(42))),
+            "second hop should be admitted after the first pop, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn link_kills_peer_on_fault() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = Program::new("link-kill");
+        p.function("park", 0, |f| {
+            let _ = f.receive();
+            f.trap(9);
+        });
+        p.function("boom", 0, |f| f.trap(1));
+        let rt = tiny(p.build())?;
+        let park = rt.function_index("park").ok_or("park")?;
+        let boom = rt.function_index("boom").ok_or("boom")?;
+        let parked = rt.spawn(park, &[])?;
+        let killer = rt.spawn(boom, &[])?;
+        rt.link(parked.id(), killer.id())?;
+        let boom_out = killer.join();
+        let park_out = parked.join();
+        rt.shutdown();
+        assert!(matches!(boom_out, FlowOutcome::Failed(_)), "{boom_out:?}");
+        assert!(
+            matches!(park_out, FlowOutcome::Failed(_)),
+            "linked peer must die on fault, got {park_out:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn linked_exit_down_carries_link_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = Program::new("link-down-reason");
+        p.function("watcher", 0, |f| {
+            let msg = f.receive_match_imm(crate::TAG_SYS_DOWN);
+            let out = f.hop_payload(msg);
+            f.return_(out);
+        });
+        p.function("park", 0, |f| {
+            let _ = f.receive();
+            f.trap(9);
+        });
+        p.function("boom", 0, |f| f.trap(1));
+        let rt = tiny_natives(p.build())?;
+        let watcher = rt.spawn(rt.function_index("watcher").ok_or("watcher")?, &[])?;
+        let parked = rt.spawn(rt.function_index("park").ok_or("park")?, &[])?;
+        let killer = rt.spawn(rt.function_index("boom").ok_or("boom")?, &[])?;
+        rt.monitor(watcher.id(), parked.id())?;
+        rt.link(parked.id(), killer.id())?;
+        let _ = killer.join();
+        let watched = watcher.join();
+        let _ = parked.join();
+        rt.shutdown();
+        assert!(
+            matches!(
+                watched,
+                FlowOutcome::Completed(Value::Int(n)) if n == crate::FlowExitReason::Link.as_u64() as i64
+            ),
+            "DOWN payload must be Link, got {watched:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn monitor_dead_owner_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tiny(add_forty_two())?;
+        let first = rt.spawn(0, &[])?;
+        let dead = first.id();
+        let done = first.join();
+        assert!(matches!(done, FlowOutcome::Completed(_)));
+        let live = rt.spawn(0, &[])?;
+        let err = rt.monitor(dead, live.id());
+        live.join();
+        rt.shutdown();
+        assert!(
+            matches!(err, Err(crate::LifecycleError::NoSuchFlow(_))),
+            "{err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forged_cap_cannot_be_registered() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tiny(add_forty_two())?;
+        let err = rt.register_name("svc", crate::CapId(99_999));
+        rt.shutdown();
+        assert_eq!(err, Err(crate::LifecycleError::InvalidCapability));
+        Ok(())
+    }
+
+    #[test]
+    fn registry_clears_on_exit() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = Program::new("reg");
+        p.function("main", 0, |f| {
+            let ms = f.load_i32(80);
+            f.sleep(ms);
+            let z = f.load_i32(1);
+            f.return_(z);
+        });
+        let rt = tiny(p.build())?;
+        let h = rt.spawn(0, &[])?;
+        let cap = rt.mint_cap(h.id())?;
+        rt.register_name("svc", cap)?;
+        assert_eq!(rt.whereis("svc")?, Some(cap));
+        let _ = h.join();
+        assert_eq!(rt.whereis("svc")?, None);
+        rt.shutdown();
         Ok(())
     }
 }

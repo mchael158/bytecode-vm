@@ -43,6 +43,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::bytecode::{Message, Value};
 use crate::vm::{expect_message, expect_u64, Fault, NativeTable};
 
+/// Stable `CallNative` indices for [`std_native_table`]. Bytecode embeds these
+/// once assembled — append only; never renumber.
+pub mod std_native {
+    pub const PRINT: u32 = 0;
+    pub const NOW_MS: u32 = 1;
+    pub const MAKE_MSG: u32 = 2;
+    pub const MSG_SENDER: u32 = 3;
+    pub const MSG_REQUEST_ID: u32 = 4;
+    pub const MSG_TAG: u32 = 5;
+    pub const MSG_PAYLOAD: u32 = 6;
+    pub const MSG_REPLY_CAP: u32 = 7;
+}
+
 /// Name → `CallNative` index for documentation / host-side lookups.
 ///
 /// Prefer this (or [`std_natives`]) over hard-coding integers in host code

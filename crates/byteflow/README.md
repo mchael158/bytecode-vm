@@ -4,7 +4,7 @@
 [![docs.rs](https://docs.rs/byteflow-actors/badge.svg)](https://docs.rs/byteflow-actors)
 [![license](https://img.shields.io/crates/l/byteflow-actors.svg)](https://github.com/mchael158/bytecode-vm)
 
-**Byteflow** is a small, embeddable **flow** runtime for Rust: register-based bytecode, lightweight flows, **Atomic Hop** messaging (`Value::Message` only on `Send`), cooperative scheduling, and a one-for-one supervisor — without a separate scripting language.
+**Byteflow** is a small, embeddable **flow** runtime for Rust: register-based bytecode, lightweight flows, **Atomic Hop** messaging (`Value::Message` only on `Send`), cooperative scheduling, and an OTP-style supervisor (`one-for-one` / `one-for-all` / `rest-for-one`) — without a separate scripting language.
 
 You assemble programs with [`Program`](https://docs.rs/byteflow-actors/latest/byteflow/struct.Program.html) and [`Fn`](https://docs.rs/byteflow-actors/latest/byteflow/struct.Fn.html) in host Rust. The host owns I/O; Byteflow owns cheap concurrency.
 
@@ -173,7 +173,7 @@ Hop-heavy code uses helpers such as `make_msg`, `native1_from`, `send`, `receive
 2. `Yield` / budget → run queue (stealable).  
 3. `Sleep` → timer thread → injector.  
 4. Empty `Receive` → flow parks **inside its mailbox**; the next Atomic Hop wakes under the same lock (no lost wakeup).  
-5. `Fault` / `Trap` → `FlowState::Failed` → supervisor (`Always` / `OnFailure` / `Never`; default intensity 3 / 5s).
+5. `Fault` / `Trap` → `FlowOutcome::Failed` → supervisor (`Always` / `OnFailure` / `Never`; default intensity 3 / 5s).
 
 `join()` and its bounded forms are for the embedder’s native thread only —
 workers never block on them.
@@ -219,11 +219,13 @@ byteflow run    <file.bf> [function]
 
 ## Status (v0.8)
 
-**Included:** register ISA + `Program`/`Fn` assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, **bounded mailboxes** (`MailboxConfig`: 256 hops + 4 MiB / Reject by default), Atomic Hop, FlowCap, supervisor, std natives, CLI, examples, fail-closed error model, optional trace JIT (`feature = "jit"`).
+**Included:** register ISA + `Program`/`Fn` assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, **bounded mailboxes** (`MailboxConfig`: 256 hops + 4 MiB / Reject by default), Atomic Hop, FlowCap, monitors / links / registry, `WAITING_SEND`, `AskTimeout`, `RuntimeConfig.max_flows`, OTP supervisor strategies, std natives, CLI, examples, fail-closed error model, optional trace JIT (`feature = "jit"`).
 
-**Not yet:** `WAITING_SEND` backpressure, runtime-wide resource governor (flow count / spawn rate), Criterion benches, distribution.
+**Not yet:** Criterion benches, distribution, `trap_exit`.
 
 Design guides: [`docs/atomic-hop.md`](docs/atomic-hop.md) ·
+[`docs/beam-mapping.md`](docs/beam-mapping.md) ·
+[`docs/lifecycle.md`](docs/lifecycle.md) ·
 [`docs/mailbox.md`](docs/mailbox.md) ·
 [`docs/vm-safety.md`](docs/vm-safety.md) ·
 [`docs/error-model.md`](docs/error-model.md) ·

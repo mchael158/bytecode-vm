@@ -143,7 +143,12 @@ impl TimerWheel {
     /// itself never runs flow code.
     ///
     /// Mutex poison → [`report_fault`] and exit the drive loop (fail-closed).
-    pub fn drive(self: &Arc<Self>, injector: &Injector<Box<Flow>>, notify: &(Mutex<()>, Condvar)) {
+    pub fn drive(
+        self: &Arc<Self>,
+        injector: &Injector<Box<Flow>>,
+        notify: &(Mutex<()>, Condvar),
+        ask_waits: &super::finalize::AskWaitIndex,
+    ) {
         loop {
             let mut heap = match sync_lock::lock(&self.heap, "TimerWheel::drive") {
                 Ok(h) => h,
@@ -187,7 +192,7 @@ impl TimerWheel {
                             None => continue,
                         };
                         drop(heap);
-                        self.fire(entry, injector, notify);
+                        self.fire(entry, injector, notify, ask_waits);
                     } else {
                         let wait_for = top.deadline - now;
                         match sync_lock::wait_timeout(
@@ -213,6 +218,7 @@ impl TimerWheel {
         entry: TimerEntry,
         injector: &Injector<Box<Flow>>,
         notify: &(Mutex<()>, Condvar),
+        ask_waits: &super::finalize::AskWaitIndex,
     ) {
         match entry.payload {
             TimerPayload::WakeSleeper(flow) => {
@@ -230,6 +236,9 @@ impl TimerWheel {
                             flow.id, pid,
                             "timer fired for a mailbox owned by a different flow"
                         );
+                        if let Err(e) = ask_waits.remove_asker(flow.id) {
+                            report_fault(e);
+                        }
                         // This deadline still owns the current wait (see
                         // `Mailbox::take_parked_at`): deliver `Unit` as the
                         // "no message arrived in time" result.

@@ -143,6 +143,16 @@ impl MailboxQueue {
             }
         }
     }
+
+    /// System hops (`DOWN`) must not be lost to overflow. Charges still
+    /// apply so later user hops see an honest budget.
+    pub(crate) fn force_push(&mut self, value: Value) {
+        let cost = value.memory_size();
+        let cap = self.limit.max(self.inner.len().saturating_add(1));
+        let _ = reserve_for_push(&mut self.inner, cap);
+        self.bytes = self.bytes.saturating_add(cost);
+        self.inner.push_back(value);
+    }
 }
 
 /// Physical growth: double current `VecDeque` capacity, never past `limit`.

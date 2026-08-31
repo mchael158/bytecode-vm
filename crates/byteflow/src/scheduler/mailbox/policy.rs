@@ -4,8 +4,8 @@
 ///
 /// Parking the **OS worker** on a full mailbox would stall every other flow
 /// on that thread — the opposite of an M:N scheduler. Backpressure that
-/// waits belongs to a future scheduler state (`WAITING_SEND` → runnable
-/// when a slot frees), not to a queue method that holds a worker.
+/// waits belongs to scheduler-level `WAITING_SEND` (one parked sender
+/// woken per freed slot), not to a queue method that holds a worker.
 ///
 /// This revision therefore only offers **non-blocking** overflow:
 ///

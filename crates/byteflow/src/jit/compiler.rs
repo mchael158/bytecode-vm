@@ -674,6 +674,11 @@ fn is_effect_opcode(op: Opcode) -> bool {
             | Opcode::ReceiveMatch
             | Opcode::ReceiveMatchImm
             | Opcode::Ask
+            | Opcode::AskTimeout
+            | Opcode::Monitor
+            | Opcode::Demonitor
+            | Opcode::Link
+            | Opcode::Unlink
             | Opcode::Trap
             | Opcode::Halt
     )

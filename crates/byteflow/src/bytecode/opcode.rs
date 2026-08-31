@@ -91,7 +91,7 @@ pub enum Opcode {
 
     // ---- messaging --------------------------------------------------------
     /// `Send ra, rb` → Atomic Hop: deliver `r[b]` (`Message`) to the Cap in
-    /// `r[a]`. Never blocks (mailboxes are unbounded by default).
+    /// `r[a]`. Never blocks the sender flow (see [`crate::docs::mailbox`]).
     ///
     /// VM requires Cap + Message; worker resolves Cap (SEND), stamps sender
     /// + `reply_cap`, then pushes to the resolved mailbox.
@@ -119,13 +119,29 @@ pub enum Opcode {
     ///    `request_id == request.request_id && sender == resolved_FlowId`.
     /// 5. Write the reply `Message` into `r[a]`.
     ///
-    /// Append-only ABI slot (`0x55`). No timeout variant in this revision.
+    /// Append-only ABI slot (`0x55`).
     Ask = 0x55,
+    /// `Monitor ra, rb` → install a one-way watch on Cap `r[b]`; write
+    /// [`crate::MonitorRef`] as `Int` into `r[a]`.
+    Monitor = 0x56,
+    /// `Demonitor ra` → drop the monitor in `r[a]` (`Int` ref).
+    Demonitor = 0x57,
+    /// `Link ra, rb` → bidirectional link with Cap `r[b]`; write
+    /// [`crate::LinkId`] as `Int` into `r[a]`.
+    Link = 0x58,
+    /// `Unlink ra` → drop the link in `r[a]` (`Int` id).
+    Unlink = 0x59,
+    /// `AskTimeout ra, rb, rc, rd` → like `Ask`, but give up after
+    /// `r[imm]` milliseconds and write `Value::Unit` into `ra`.
+    ///
+    /// Encoding: `a=dest`, `b=cap`, `c=msg`, `imm=millis_reg`.
+    /// Append-only ABI slot (`0x5A`); `Trap` stays `0x60`.
+    AskTimeout = 0x5A,
 
     // ---- diagnostics / safety ------------------------------------------
     /// `Trap imm` → deliberate fault (assertion failure, div-by-zero, bad
     /// opcode encountered by a corrupt/foreign module, capability
-    /// violation). Propagates to the Flow supervisor as `FlowState::Failed`.
+    /// violation). Propagates to the Flow supervisor as [`crate::FlowOutcome::Failed`].
     Trap = 0x60,
     /// `Nop` → no-op, used by the assembler to pad jump targets.
     Nop = 0x61,
@@ -169,6 +185,11 @@ impl Opcode {
             0x53 => ReceiveMatch,
             0x54 => ReceiveMatchImm,
             0x55 => Ask,
+            0x56 => Monitor,
+            0x57 => Demonitor,
+            0x58 => Link,
+            0x59 => Unlink,
+            0x5A => AskTimeout,
             0x60 => Trap,
             0x61 => Nop,
             _ => return None,
@@ -213,6 +234,11 @@ impl std::fmt::Display for Opcode {
             Opcode::ReceiveMatch => "ReceiveMatch",
             Opcode::ReceiveMatchImm => "ReceiveMatchImm",
             Opcode::Ask => "Ask",
+            Opcode::Monitor => "Monitor",
+            Opcode::Demonitor => "Demonitor",
+            Opcode::Link => "Link",
+            Opcode::Unlink => "Unlink",
+            Opcode::AskTimeout => "AskTimeout",
             Opcode::Trap => "Trap",
             Opcode::Nop => "Nop",
         };

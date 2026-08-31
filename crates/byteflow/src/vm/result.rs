@@ -41,12 +41,21 @@ pub enum VmResult {
         timeout: Option<Duration>,
         match_tag: Option<u16>,
     },
-    /// `Ask` — RPC hop to a **capability** target (requires ASK).
+    /// `Ask` / `AskTimeout` — RPC hop to a **capability** target (requires ASK).
     Ask {
         dest_reg: u8,
         target_cap: u64,
         request: Value,
+        timeout: Option<Duration>,
     },
+    /// `Monitor ra, rb` — watch the flow addressed by Cap `r[b]`.
+    Monitor { dest_reg: u8, target_cap: u64 },
+    /// `Demonitor ra` — drop monitor whose ref is `r[a]` (Int).
+    Demonitor { monitor_reg: u8 },
+    /// `Link ra, rb` — bidirectional link with Cap `r[b]`.
+    Link { dest_reg: u8, target_cap: u64 },
+    /// `Unlink ra` — drop link whose id is `r[a]` (Int).
+    Unlink { link_reg: u8 },
     /// A fault occurred; the Flow fails. See [`Fault`].
     Trap(Fault),
 }

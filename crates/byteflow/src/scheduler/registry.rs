@@ -1,0 +1,187 @@
+//! Named registry: `name → CapId` (address), never `name → FlowId`.
+//!
+//! Entries are swept when the **target** flow exits ([`Registry::unregister_flow`]).
+//! A revoked Cap cannot be registered; lookup after exit returns `None`.
+
+use std::collections::HashMap;
+
+use super::capability::CapId;
+use super::error::{LifecycleError, RuntimeError};
+use super::process::FlowId;
+use super::sync_lock;
+
+/// Registry key. Interned as `Box<str>` so lookups do not allocate a `String`
+/// on the happy path when the caller already has a `&str`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RegistryName(Box<str>);
+
+impl RegistryName {
+    pub fn new(name: impl Into<Box<str>>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for RegistryName {
+    fn from(name: &str) -> Self {
+        Self(name.into())
+    }
+}
+
+struct Entry {
+    cap: CapId,
+    flow: FlowId,
+}
+
+pub struct Registry {
+    by_name: HashMap<RegistryName, Entry>,
+    by_flow: HashMap<FlowId, Vec<RegistryName>>,
+}
+
+impl Registry {
+    pub fn new() -> Self {
+        Self {
+            by_name: HashMap::new(),
+            by_flow: HashMap::new(),
+        }
+    }
+
+    pub fn register(
+        &mut self,
+        name: RegistryName,
+        cap: CapId,
+        flow: FlowId,
+    ) -> Result<(), LifecycleError> {
+        if name.as_str().is_empty() {
+            return Err(LifecycleError::EmptyName);
+        }
+        if self.by_name.contains_key(&name) {
+            return Err(LifecycleError::AlreadyRegistered);
+        }
+        self.by_flow
+            .entry(flow)
+            .or_default()
+            .push(name.clone());
+        self.by_name.insert(name, Entry { cap, flow });
+        Ok(())
+    }
+
+    pub fn whereis(&self, name: &str) -> Option<CapId> {
+        self.by_name.get(&RegistryName::from(name)).map(|e| e.cap)
+    }
+
+    pub fn unregister(&mut self, name: &str) -> bool {
+        let key = RegistryName::from(name);
+        match self.by_name.remove(&key) {
+            Some(entry) => {
+                if let Some(names) = self.by_flow.get_mut(&entry.flow) {
+                    names.retain(|n| n != &key);
+                    if names.is_empty() {
+                        self.by_flow.remove(&entry.flow);
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Drop every name that pointed at `flow` (called from finalize).
+    pub fn unregister_flow(&mut self, flow: FlowId) {
+        if let Some(names) = self.by_flow.remove(&flow) {
+            for name in names {
+                self.by_name.remove(&name);
+            }
+        }
+    }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct RegistryStore {
+    inner: std::sync::Mutex<Registry>,
+}
+
+impl RegistryStore {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(Registry::new()),
+        }
+    }
+
+    pub fn register(
+        &self,
+        name: RegistryName,
+        cap: CapId,
+        flow: FlowId,
+    ) -> Result<Result<(), LifecycleError>, RuntimeError> {
+        Ok(sync_lock::lock(&self.inner, "RegistryStore::register")?.register(name, cap, flow))
+    }
+
+    pub fn whereis(&self, name: &str) -> Result<Option<CapId>, RuntimeError> {
+        Ok(sync_lock::lock(&self.inner, "RegistryStore::whereis")?.whereis(name))
+    }
+
+    pub fn unregister(&self, name: &str) -> Result<bool, RuntimeError> {
+        Ok(sync_lock::lock(&self.inner, "RegistryStore::unregister")?.unregister(name))
+    }
+
+    pub fn unregister_flow(&self, flow: FlowId) -> Result<(), RuntimeError> {
+        sync_lock::lock(&self.inner, "RegistryStore::unregister_flow")?.unregister_flow(flow);
+        Ok(())
+    }
+}
+
+impl Default for RegistryStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scheduler::capability::CapId;
+    use crate::scheduler::process::next_flow_id;
+
+    #[test]
+    fn unregister_flow_clears_names() {
+        let mut reg = Registry::new();
+        let flow = next_flow_id();
+        let cap = CapId(42);
+        assert!(reg.register(RegistryName::from("svc"), cap, flow).is_ok());
+        assert_eq!(reg.whereis("svc"), Some(cap));
+        reg.unregister_flow(flow);
+        assert_eq!(reg.whereis("svc"), None);
+    }
+
+    #[test]
+    fn duplicate_name_is_rejected() {
+        let mut reg = Registry::new();
+        let flow = next_flow_id();
+        assert!(reg
+            .register(RegistryName::from("svc"), CapId(1), flow)
+            .is_ok());
+        assert_eq!(
+            reg.register(RegistryName::from("svc"), CapId(2), flow),
+            Err(LifecycleError::AlreadyRegistered)
+        );
+    }
+
+    #[test]
+    fn empty_name_is_rejected() {
+        let mut reg = Registry::new();
+        let flow = next_flow_id();
+        assert_eq!(
+            reg.register(RegistryName::from(""), CapId(1), flow),
+            Err(LifecycleError::EmptyName)
+        );
+    }
+}

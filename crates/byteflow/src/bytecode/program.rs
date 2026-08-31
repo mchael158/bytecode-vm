@@ -327,10 +327,20 @@ impl<'a> Fn<'a> {
     }
 
     /// Self Cap (`SEND` / `ASK` target for this flow).
+    ///
+    /// Despite the opcode name (`SelfPid`), the value is a [`crate::Value::Cap`],
+    /// not a Pid. In BEAM terms this is closer to a **reply address** grant
+    /// than to `self()` — use [`Self::hop_sender`] on a *delivered* hop for
+    /// authenticated origin identity.
     pub fn self_cap(&mut self) -> Reg {
         let cap = self.local();
         self.b.emit_self_pid(cap.0);
         cap
+    }
+
+    /// Alias for [`Self::self_cap`] — preferred name when coming from BEAM.
+    pub fn self_address(&mut self) -> Reg {
+        self.self_cap()
     }
 
     pub fn spawn(&mut self, function: FuncId, argc: u8) -> Reg {
@@ -373,10 +383,44 @@ impl<'a> Fn<'a> {
     }
 
     /// RPC hop: deliver `msg` to `target_cap`, wait for correlated reply.
+    ///
+    /// If the target exits first, dest is a [`crate::TAG_SYS_EXIT`] hop
+    /// (not a hang).
     pub fn ask(&mut self, target_cap: Reg, msg: Reg) -> Reg {
         let reply = self.local();
         self.b.emit_ask(reply.0, target_cap.0, msg.0);
         reply
+    }
+
+    /// Like [`Self::ask`], but writes `Unit` into the dest if `millis` elapses.
+    pub fn ask_timeout(&mut self, target_cap: Reg, msg: Reg, millis: Reg) -> Reg {
+        let reply = self.local();
+        self.b
+            .emit_ask_timeout(reply.0, target_cap.0, msg.0, millis.0);
+        reply
+    }
+
+    /// One-way watch: when the flow addressed by `target_cap` exits, this
+    /// flow receives a [`crate::TAG_SYS_DOWN`] hop. Returns a monitor ref (`Int`).
+    pub fn monitor(&mut self, target_cap: Reg) -> Reg {
+        let dst = self.local();
+        self.b.emit_monitor(dst.0, target_cap.0);
+        dst
+    }
+
+    pub fn demonitor(&mut self, monitor: Reg) {
+        self.b.emit_demonitor(monitor.0);
+    }
+
+    /// Bidirectional link: abnormal exit of either side kills the peer.
+    pub fn link(&mut self, target_cap: Reg) -> Reg {
+        let dst = self.local();
+        self.b.emit_link(dst.0, target_cap.0);
+        dst
+    }
+
+    pub fn unlink(&mut self, link: Reg) {
+        self.b.emit_unlink(link.0);
     }
 
     pub fn trap(&mut self, code: i32) {
@@ -415,8 +459,60 @@ impl<'a> Fn<'a> {
         dst
     }
 
+    /// Build an outgoing Atomic Hop (`request_id`, `tag`, `payload`).
+    ///
+    /// The scheduler overwrites `sender` and mints `reply_cap` on [`Self::send`]
+    /// / [`Self::ask`] — do not forge a sender (see [`crate::docs::security`]).
+    pub fn hop(&mut self, request_id: Reg, tag: i32, payload: Reg) -> Reg {
+        let placeholder = self.load_i32(0);
+        self.make_msg(
+            crate::natives::std_native::MAKE_MSG,
+            placeholder,
+            request_id,
+            tag,
+            payload,
+        )
+    }
+
+    /// Extract authenticated origin from a delivered hop (`Value::Pid`).
+    pub fn hop_sender(&mut self, msg: Reg) -> Reg {
+        self.native1_from(msg, crate::natives::std_native::MSG_SENDER)
+    }
+
+    pub fn hop_request_id(&mut self, msg: Reg) -> Reg {
+        self.native1_from(msg, crate::natives::std_native::MSG_REQUEST_ID)
+    }
+
+    pub fn hop_tag(&mut self, msg: Reg) -> Reg {
+        self.native1_from(msg, crate::natives::std_native::MSG_TAG)
+    }
+
+    pub fn hop_payload(&mut self, msg: Reg) -> Reg {
+        self.native1_from(msg, crate::natives::std_native::MSG_PAYLOAD)
+    }
+
+    /// Reply address grant minted for the original sender (`Value::Cap`).
+    pub fn hop_reply_cap(&mut self, msg: Reg) -> Reg {
+        self.native1_from(msg, crate::natives::std_native::MSG_REPLY_CAP)
+    }
+
+    /// Build a reply hop echoing `request_id` from `req`.
+    pub fn reply_to(&mut self, req: Reg, tag: i32, payload: Reg) -> Reg {
+        let req_id = self.hop_request_id(req);
+        self.hop(req_id, tag, payload)
+    }
+
+    /// Reply to `req` via its `reply_cap` (typical server pattern).
+    pub fn send_reply(&mut self, req: Reg, tag: i32, payload: Reg) {
+        let reply_cap = self.hop_reply_cap(req);
+        let reply = self.reply_to(req, tag, payload);
+        self.send(reply_cap, reply);
+    }
+
     /// Build a [`Value::Message`] via `make_msg` at `native_index`.
     ///
+    /// Prefer [`Self::hop`] for outgoing messages. This low-level helper keeps
+    /// the explicit `sender` slot for security regressions and legacy bytecode.
     /// Index `2` in [`crate::std_native_map`]. Args are packed into a
     /// contiguous four-register window; returns the message register.
     pub fn make_msg(

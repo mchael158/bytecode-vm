@@ -160,6 +160,39 @@ impl ChunkBuilder {
         self.emit(Instruction::abc(Opcode::Ask, dest, target_cap_reg, msg_reg));
     }
 
+    /// Like [`Self::emit_ask`], with a timeout register in `imm`.
+    pub fn emit_ask_timeout(
+        &mut self,
+        dest: u8,
+        target_cap_reg: u8,
+        msg_reg: u8,
+        millis_reg: u8,
+    ) {
+        self.emit(Instruction::new(
+            Opcode::AskTimeout,
+            dest,
+            target_cap_reg,
+            msg_reg,
+            i32::from(millis_reg),
+        ));
+    }
+
+    pub fn emit_monitor(&mut self, dest: u8, target_cap_reg: u8) {
+        self.emit(Instruction::abc(Opcode::Monitor, dest, target_cap_reg, 0));
+    }
+
+    pub fn emit_demonitor(&mut self, monitor_reg: u8) {
+        self.emit(Instruction::abc(Opcode::Demonitor, monitor_reg, 0, 0));
+    }
+
+    pub fn emit_link(&mut self, dest: u8, target_cap_reg: u8) {
+        self.emit(Instruction::abc(Opcode::Link, dest, target_cap_reg, 0));
+    }
+
+    pub fn emit_unlink(&mut self, link_reg: u8) {
+        self.emit(Instruction::abc(Opcode::Unlink, link_reg, 0, 0));
+    }
+
     pub fn emit_trap(&mut self, code: i32) {
         self.emit(Instruction::only_imm(Opcode::Trap, code));
     }

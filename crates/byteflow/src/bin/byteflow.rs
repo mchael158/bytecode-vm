@@ -67,8 +67,8 @@ fn print_help() {
 byteflow — verify, disassemble and run .bf modules (assembled via Program)
 
 USAGE:
-    byteflow demo [ping-pong|atomic|selective|ask|add]
-    byteflow pack  <ping-pong|atomic|add> <out.bf>
+    byteflow demo [ping-pong|atomic|selective|ask|ask-timeout|server-loop|monitor|add]
+    byteflow pack  <ping-pong|atomic|ask|add> <out.bf>
     byteflow verify <file.bf>
     byteflow disasm <file.bf>
     byteflow run    <file.bf> [function]
@@ -143,7 +143,9 @@ fn cmd_demo(name: &str) -> Result<(), ()> {
     // Atomic Hop demos (`ping-pong`) need make_msg / msg_*; `add` does not.
     let natives = match name {
         "ping-pong" | "ping_pong" | "atomic" | "atomic-request-reply"
-        | "selective" | "selective-receive" | "ask" | "ask-reply" => std_native_table(),
+        | "selective" | "selective-receive" | "ask" | "ask-reply"
+        | "ask-timeout" | "server-loop" | "server" | "monitor" | "monitor-down"
+        | "ask-exit" | "ask-target-exits" => std_native_table(),
         _ => NativeTable::empty(),
     };
     run_chunk(&chunk, Some("main"), natives)
@@ -155,10 +157,14 @@ fn demo_chunk(name: &str) -> Result<byteflow::Chunk, ()> {
         "atomic" | "atomic-request-reply" => Ok(samples::atomic_request_reply()),
         "selective" | "selective-receive" => Ok(samples::selective_receive()),
         "ask" | "ask-reply" => Ok(samples::ask_reply()),
+        "ask-timeout" => Ok(samples::ask_timeout_expires()),
+        "ask-exit" | "ask-target-exits" => Ok(samples::ask_target_exits()),
+        "server-loop" | "server" => Ok(samples::server_loop()),
+        "monitor" | "monitor-down" => Ok(samples::monitor_down()),
         "add" | "add-forty-two" | "42" => Ok(add_forty_two()),
         "boom" => Ok(samples::boom()),
         other => {
-            eprintln!("unknown demo {other:?} (try ping-pong, atomic, selective, ask, add)");
+            eprintln!("unknown demo {other:?} (try ping-pong, atomic, selective, ask, ask-timeout, server-loop, monitor, add)");
             Err(())
         }
     }

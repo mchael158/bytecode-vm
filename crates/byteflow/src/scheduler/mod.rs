@@ -20,7 +20,11 @@
 mod capability;
 mod directory;
 mod error;
+mod finalize;
 mod handle;
+mod link;
+mod monitor;
+mod registry;
 #[cfg(feature = "jit")]
 mod jit;
 mod mailbox;
@@ -34,7 +38,10 @@ mod timer;
 mod worker;
 
 pub use capability::{CapId, CapRights};
-pub use error::{fault_count, report_fault, RuntimeError, SpawnError};
+pub use error::{fault_count, report_fault, LifecycleError, RuntimeError, SpawnError};
+pub use link::LinkId;
+pub use monitor::{DownEvent, FlowExitReason, MonitorRef};
+pub use registry::RegistryName;
 pub use handle::FlowHandle;
 pub use mailbox::{
     Delivery, Mailbox, MailboxBytes, MailboxCapacity, MailboxConfig, MailboxFull,
@@ -42,11 +49,11 @@ pub use mailbox::{
 };
 pub use metrics::{RuntimeMetrics, RuntimeMetricsSnapshot};
 pub use process::{
-    next_flow_id, Flow, FlowId, FlowMetrics, FlowOutcome, FlowState, RestartPolicy,
+    next_flow_id, Flow, FlowId, FlowMetrics, FlowOutcome, RestartPolicy,
 };
 pub use runtime::{
     flow_id_from_u64, Runtime, RuntimeConfig, RuntimeSpawner, SendError, DEFAULT_QUANTUM,
 };
 #[cfg(feature = "jit")]
 pub use runtime::JitConfig;
-pub use supervisor::{ChildSpec, Supervisor, SupervisorConfig};
+pub use supervisor::{ChildSpec, RestartStrategy, Supervisor, SupervisorConfig};

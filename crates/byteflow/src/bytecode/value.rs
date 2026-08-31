@@ -1,6 +1,11 @@
 use std::fmt;
 use std::sync::Arc;
 
+/// Reserved Atomic Hop tag for monitor `DOWN` events (not an application tag).
+pub const TAG_SYS_DOWN: u16 = 0xFF01;
+/// Reserved Atomic Hop tag for linked-exit notices.
+pub const TAG_SYS_EXIT: u16 = 0xFF02;
+
 /// Fixed-size envelope carried in mailboxes and registers (**Atomic Hop**).
 ///
 /// # Why this exists (request-reply / typed protocols)
@@ -44,6 +49,54 @@ impl Message {
             tag,
             payload,
         }
+    }
+
+    /// Outgoing hop from host Rust (`sender` / `reply_cap` filled on delivery).
+    pub const fn request(request_id: u64, tag: u16, payload: u64) -> Self {
+        Self::new(0, request_id, tag, payload)
+    }
+
+    /// Reply envelope echoing `request_id` from a received hop (host path).
+    pub fn reply_to(req: &Self, tag: u16, payload: u64) -> Self {
+        Self::new(0, req.request_id, tag, payload)
+    }
+
+    /// Runtime lifecycle hop: monitor `DOWN` (`tag == `[`TAG_SYS_DOWN`]).
+    ///
+    /// `sender` is the dead flow's identity (not a Cap). `request_id` is the
+    /// [`crate::MonitorRef`]. `payload` is [`crate::FlowExitReason`] as `u64`.
+    pub const fn down(monitor: u64, target_flow: u64, reason: u64) -> Self {
+        Self {
+            sender: target_flow,
+            reply_cap: 0,
+            request_id: monitor,
+            tag: TAG_SYS_DOWN,
+            payload: reason,
+        }
+    }
+
+    /// Runtime lifecycle hop: Ask target exited (`tag == `[`TAG_SYS_EXIT`]).
+    ///
+    /// Written into the Ask dest register when the callee dies before
+    /// replying. `payload` is [`crate::FlowExitReason`].
+    pub const fn linked_exit(target_flow: u64, reason: u64) -> Self {
+        Self {
+            sender: target_flow,
+            reply_cap: 0,
+            request_id: 0,
+            tag: TAG_SYS_EXIT,
+            payload: reason,
+        }
+    }
+
+    #[inline]
+    pub const fn is_down(self) -> bool {
+        self.tag == TAG_SYS_DOWN
+    }
+
+    #[inline]
+    pub const fn is_exit(self) -> bool {
+        self.tag == TAG_SYS_EXIT
     }
 
     /// Stamp origin FlowId and attach a reply capability (scheduler only).

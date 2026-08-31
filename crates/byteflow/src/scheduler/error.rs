@@ -65,6 +65,44 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+/// User-facing lifecycle / naming errors (category A).
+///
+/// Distinct from [`RuntimeError`] (infrastructure / poison). Host
+/// `monitor` / `link` / `register_name` return this so a dead FlowId or
+/// a duplicate name is not reported as a poisoned mutex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleError {
+    NoSuchFlow(super::process::FlowId),
+    InvalidCapability,
+    InvalidMonitor,
+    InvalidLink,
+    NotOwner,
+    AlreadyRegistered,
+    AlreadyLinked,
+    EmptyName,
+    SelfRelation,
+    Unavailable,
+}
+
+impl fmt::Display for LifecycleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoSuchFlow(id) => write!(f, "no live flow {id}"),
+            Self::InvalidCapability => write!(f, "unknown or revoked capability"),
+            Self::InvalidMonitor => write!(f, "unknown monitor"),
+            Self::InvalidLink => write!(f, "unknown link"),
+            Self::NotOwner => write!(f, "caller does not own this relation"),
+            Self::AlreadyRegistered => write!(f, "registry name already taken"),
+            Self::AlreadyLinked => write!(f, "flows are already linked"),
+            Self::EmptyName => write!(f, "registry name must be non-empty"),
+            Self::SelfRelation => write!(f, "cannot link or monitor a flow to itself"),
+            Self::Unavailable => write!(f, "runtime table unavailable (poisoned lock)"),
+        }
+    }
+}
+
+impl std::error::Error for LifecycleError {}
+
 /// Record an infrastructure fault (stderr + counter). Does not panic.
 #[cold]
 pub fn report_fault(err: RuntimeError) {
@@ -89,6 +127,10 @@ pub enum SpawnError {
     BadFunction { index: u32, table_size: u32 },
     /// Chunk failed verification before the runtime could start.
     VerifyFailed(String),
+    /// Live flow count would exceed [`crate::RuntimeConfig::max_flows`].
+    FlowLimit { current: usize, max: u32 },
+    /// [`crate::ChildSpec::name`] is already in the runtime registry.
+    NameTaken { name: String },
     /// OS refused to create a worker / timer / supervisor thread.
     ThreadSpawnFailed(String),
     /// `Vm::new` failed for a reason other than a bad function index
@@ -106,6 +148,12 @@ impl fmt::Display for SpawnError {
                 )
             }
             SpawnError::VerifyFailed(msg) => write!(f, "chunk verification failed: {msg}"),
+            SpawnError::FlowLimit { current, max } => {
+                write!(f, "spawn: live flow limit reached ({current}/{max})")
+            }
+            SpawnError::NameTaken { name } => {
+                write!(f, "spawn: registry name {name:?} already taken")
+            }
             SpawnError::ThreadSpawnFailed(msg) => {
                 write!(f, "failed to spawn runtime thread: {msg}")
             }

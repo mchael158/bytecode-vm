@@ -31,5 +31,5 @@ pub use format::{decode, encode, FormatError};
 pub use instruction::Instruction;
 pub use macros::asm_macros;
 pub use opcode::Opcode;
-pub use value::{Message, Value};
+pub use value::{Message, Value, TAG_SYS_DOWN, TAG_SYS_EXIT};
 pub use verify::{verify, VerifyError};

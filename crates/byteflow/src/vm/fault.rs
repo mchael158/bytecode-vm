@@ -8,7 +8,7 @@ use std::fmt;
 /// bug (division by zero, a corrupt jump target that slipped past the
 /// verifier, an out-of-range register) can never take down a worker thread,
 /// let alone the whole runtime. A `Fault` instead becomes
-/// `FlowState::Failed` and is handed to the Flow's supervisor, which
+/// [`crate::FlowOutcome::Failed`] and is handed to the Flow's supervisor, which
 /// decides whether to restart it (design notes §15-16).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Fault {

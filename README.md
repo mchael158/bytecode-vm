@@ -31,6 +31,8 @@ Atomic Hop (`Value::Message`): `cargo run -p byteflow-actors --example atomic_ac
 
 **Design guides** (every example is a doctest, so they cannot drift from the API):
 [atomic-hop](crates/byteflow/docs/atomic-hop.md) ·
+[beam-mapping](crates/byteflow/docs/beam-mapping.md) ·
+[lifecycle](crates/byteflow/docs/lifecycle.md) ·
 [mailbox](crates/byteflow/docs/mailbox.md) ·
 [vm-safety](crates/byteflow/docs/vm-safety.md) ·
 [error-model](crates/byteflow/docs/error-model.md) ·

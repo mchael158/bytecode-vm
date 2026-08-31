@@ -346,16 +346,18 @@ assumptions. Native isolation is therefore outside the VM's trust guarantees.
 
 ## 13. Denial of Service
 
-Byteflow 0.4.x does not yet provide complete resource isolation.
+Byteflow does not provide complete resource isolation.
 
 The following remain known limitations:
 
-- unlimited or insufficiently bounded mailbox growth;
-- unrestricted flow creation where permitted by the host;
-- potentially unbounded outstanding Ask operations;
+- mailbox growth is bounded per inbox (`MailboxConfig`: hop count + byte budget);
+  there is no runtime-wide byte cap across all flows;
+- flow creation is capped only when [`RuntimeConfig::max_flows`](../src/scheduler/runtime.rs) is set (`0` = unlimited);
+- outstanding `Ask` waits are released if the target exits (`TAG_SYS_EXIT`);
+  they are not otherwise quota-limited;
 - native functions that consume arbitrary host resources.
 
-Resource quotas are planned for the quota phase.
+Per-flow native allowlists and finer quotas are planned for the quota phase.
 
 Capability security prevents unauthorized access but does not automatically
 prevent an authorized flow from exhausting resources.
@@ -397,7 +399,8 @@ The intended model is `Value::Cap(CapId)` where CapId is opaque and is not a
 FlowId.
 
 A capability resolves through the runtime directory to `{ FlowId, Rights }`
-(e.g. `SEND`, `ASK`, `LINK`, `ADMIN`).
+(`SEND`, `ASK`, or both). `LINK` / `ADMIN` bits are not minted in this
+revision.
 
 The bytecode-visible capability MUST NOT expose the underlying FlowId.
 

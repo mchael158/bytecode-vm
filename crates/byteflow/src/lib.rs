@@ -18,7 +18,7 @@
 //! | [`FlowHandle`] | Collect an outcome: blocking [`FlowHandle::join`] or a bounded form |
 //! | [`Value::Message`] | **Atomic Hop** envelope — the only value allowed on `Send` / `Ask` |
 //! | [`Value::Cap`] | **FlowCap** address for bytecode delivery (`Send` / `Ask` targets) |
-//! | [`Supervisor`] | Restart policies when a flow fails |
+//! | [`Supervisor`] | OTP strategies (`OneForOne` / `OneForAll` / `RestForOne`) |
 //! | [`std_native_table`] | `print`, `now_ms`, `make_msg`, `msg_*`, `msg_reply_cap` |
 //!
 //! # Atomic Hop (messaging contract)
@@ -35,7 +35,7 @@
 //! - Reply with [`std_native_table`]'s `msg_reply_cap` — **not** `msg_sender`
 //!   (`Pid` is identity, not an address)
 //!
-//! Also: selective receive (`ReceiveMatch`), and `Ask` for correlated RPC.
+//! Also: selective receive (`ReceiveMatch`), `Ask` / `AskTimeout` for correlated RPC.
 //!
 //! # FlowCap (addressing)
 //!
@@ -141,6 +141,8 @@
 //! # Design guides (rendered on docs.rs)
 //!
 //! - [`docs::atomic_hop`] — hop protocol, Cap addressing, natives table
+//! - [`docs::beam_mapping`] — BEAM / OTP mental model → Byteflow equivalents
+//! - [`docs::lifecycle`] — monitors, links, registry, `WAITING_SEND`
 //! - [`docs::mailbox`] — bounded inbox, overflow, lost-wakeup
 //! - [`docs::security`] — threat model, invariants S1–S7, roadmap
 //! - [`docs::error_model`] — fail-closed errors (no `unwrap`), bounded joins
@@ -176,6 +178,14 @@ pub mod docs {
     #[doc = include_str!("../docs/atomic-hop.md")]
     pub mod atomic_hop {}
 
+    /// BEAM / OTP concepts mapped to Byteflow flows, Caps, and Atomic Hop.
+    #[doc = include_str!("../docs/beam-mapping.md")]
+    pub mod beam_mapping {}
+
+    /// Flow lifecycle: monitors, links, registry, WAITING_SEND.
+    #[doc = include_str!("../docs/lifecycle.md")]
+    pub mod lifecycle {}
+
     /// Security model: authenticated sender, FlowCap, invariants S1–S7.
     #[doc = include_str!("../docs/security.md")]
     pub mod security {}
@@ -197,17 +207,17 @@ pub mod docs {
 pub use bytecode::{
     asm_macros, decode, disassemble, encode, verify, Chunk, Fn, FormatError, FuncId, FunctionDef,
     Instruction, Label, Message, Opcode, Program, Reg, RegWindow, Value, VerifyError, ABI_VERSION,
-    MAGIC,
+    MAGIC, TAG_SYS_DOWN, TAG_SYS_EXIT,
 };
-pub use natives::{std_native_map, std_native_table, std_natives};
+pub use natives::{std_native, std_native_map, std_native_table, std_natives};
 pub use scheduler::{
     fault_count, next_flow_id, flow_id_from_u64, report_fault, CapId, CapRights, ChildSpec,
-    Delivery, Mailbox, MailboxBytes, MailboxCapacity, MailboxConfig, MailboxFull,
-    MailboxFullReason, MailboxStats, OverflowPolicy, WaitEpoch,
-    Flow, FlowHandle, FlowId, FlowMetrics, FlowOutcome, FlowState,
-    RestartPolicy, Runtime, RuntimeConfig, RuntimeError, RuntimeMetrics,
-    RuntimeMetricsSnapshot, RuntimeSpawner, SendError, SpawnError, Supervisor,
-    SupervisorConfig, DEFAULT_QUANTUM,
+    Delivery, DownEvent, FlowExitReason, LifecycleError, LinkId, Mailbox, MailboxBytes,
+    MailboxCapacity, MailboxConfig, MailboxFull, MailboxFullReason, MailboxStats,
+    MonitorRef, OverflowPolicy, RegistryName, WaitEpoch, Flow, FlowHandle, FlowId,
+    FlowMetrics, FlowOutcome, RestartPolicy, RestartStrategy, Runtime, RuntimeConfig,
+    RuntimeError, RuntimeMetrics, RuntimeMetricsSnapshot, RuntimeSpawner, SendError,
+    SpawnError, Supervisor, SupervisorConfig, DEFAULT_QUANTUM,
 };
 #[cfg(feature = "jit")]
 pub use scheduler::JitConfig;

@@ -15,7 +15,9 @@ treats mailbox size as a **memory contract**, not a raw `usize`.
 
 There is **no** `Block` policy. Parking an OS worker on a full inbox
 would stall every other flow on that thread. Scheduler-level
-`WAITING_SEND` (sender flow waits until a slot frees) is a later phase.
+`WAITING_SEND` parks the **sender flow** in the target mailbox. Each
+successful pop admits **one** waiter (no wake storm). Host `Runtime::send`
+still returns `MailboxFull` — only bytecode `Send` / `Ask` wait.
 
 ## Why two bounds
 

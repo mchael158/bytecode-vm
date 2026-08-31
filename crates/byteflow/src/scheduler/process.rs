@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::vm::Vm;
 
@@ -37,21 +38,6 @@ static NEXT_FLOW_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn next_flow_id() -> FlowId {
     FlowId(NEXT_FLOW_ID.fetch_add(1, Ordering::Relaxed))
-}
-
-/// Where a flow currently sits in its lifecycle.
-///
-/// Metrics/introspection only — the scheduler's control flow is driven by
-/// *where the [`Flow`] object physically lives* (worker deque, injector,
-/// timer wheel, or parked inside its mailbox).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FlowState {
-    Ready,
-    Running,
-    Waiting,
-    Sleeping,
-    Terminated,
-    Failed,
 }
 
 /// Restart policy consulted by a [`super::supervisor::Supervisor`] when a
@@ -92,7 +78,21 @@ pub struct Flow {
     pub pending_message: Option<crate::bytecode::Value>,
     /// Destination register of the most recent `Receive` / `ReceiveTimeout`.
     pub last_receive_dest: Option<u8>,
+    /// Continuation after a `WAITING_SEND` park is admitted.
+    pub(crate) pending_send: Option<PendingSend>,
     pub(crate) supervisor: Option<super::supervisor::SupervisorLink>,
+}
+
+/// What the worker should do after a parked sender's hop is admitted.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PendingSend {
+    FireAndForget,
+    Ask {
+        dest_reg: u8,
+        expect_request_id: u64,
+        expect_sender: u64,
+        timeout: Option<Duration>,
+    },
 }
 
 /// Terminal outcome of a flow, delivered to whoever holds its
@@ -120,6 +120,7 @@ impl Flow {
             completion,
             pending_message: None,
             last_receive_dest: None,
+            pending_send: None,
             supervisor: None,
         }
     }

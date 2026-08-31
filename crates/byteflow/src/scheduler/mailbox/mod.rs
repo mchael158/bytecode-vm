@@ -16,8 +16,9 @@
 //!
 //! There is **no** `Block` policy. Blocking an OS worker on a full inbox
 //! would stall every other flow on that thread. Overflow is Reject /
-//! DropNewest / DropOldest; scheduler-level `WAITING_SEND` is a later
-//! phase.
+//! DropNewest / DropOldest. Scheduler-level [`Mailbox::park_sender`]
+//! (`WAITING_SEND`) parks the **sender flow** in this mailbox and wakes
+//! **one** waiter per freed slot (no wake storm).
 //!
 //! # Wake
 //!
@@ -33,12 +34,13 @@ mod metrics;
 mod policy;
 mod queue;
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use crate::bytecode::Value;
 
 use super::error::RuntimeError;
-use super::process::Flow;
+use super::process::{Flow, FlowId};
 use super::sync_lock;
 
 pub use capacity::{MailboxBytes, MailboxCapacity};
@@ -159,6 +161,17 @@ struct MailboxInner {
     /// wait can be told apart from the current one. See [`WaitEpoch`].
     wait_epoch: u64,
     stats: MailboxStats,
+    /// Bytecode senders waiting for a free slot (`WAITING_SEND`).
+    /// Woken one-at-a-time from [`Mailbox::admit_waiting_sender`].
+    waiting_senders: VecDeque<WaitingSender>,
+    /// Set by [`Mailbox::close`] during finalize so a late `park_sender`
+    /// cannot land after `drain_waiting_senders` and leak the sender.
+    closed: bool,
+}
+
+struct WaitingSender {
+    flow: Box<Flow>,
+    message: Value,
 }
 
 /// Outcome of pushing a message.
@@ -278,6 +291,8 @@ impl Mailbox {
                 parked_filter: WaitFilter::Any,
                 wait_epoch: 0,
                 stats: MailboxStats::default(),
+                waiting_senders: VecDeque::new(),
+                closed: false,
             }),
             config,
         }
@@ -431,6 +446,96 @@ impl Mailbox {
             None => Ok(None),
         }
     }
+
+    /// Take the current parked receiver regardless of epoch (lifecycle kill).
+    pub(crate) fn take_parked(&self) -> Result<Option<Box<Flow>>, RuntimeError> {
+        let mut inner = sync_lock::lock(&self.inner, "Mailbox::take_parked")?;
+        inner.parked_filter = WaitFilter::Any;
+        Ok(inner.parked.take())
+    }
+
+    /// Enqueue a hop even when the inbox is at a bound (system `DOWN`).
+    pub(crate) fn push_system(&self, value: Value) -> Result<Delivery, RuntimeError> {
+        let mut inner = sync_lock::lock(&self.inner, "Mailbox::push_system")?;
+        if let Some(flow) = inner.parked.take() {
+            if inner.parked_filter.matches(&value) {
+                inner.parked_filter = WaitFilter::Any;
+                inner.stats.dequeued = inner.stats.dequeued.saturating_add(1);
+                inner.stats.enqueued = inner.stats.enqueued.saturating_add(1);
+                return Ok(Delivery::Handoff(flow));
+            }
+            inner.parked = Some(flow);
+        }
+        inner.queue.force_push(value);
+        inner.stats.enqueued = inner.stats.enqueued.saturating_add(1);
+        Ok(Delivery::Queued)
+    }
+
+    /// Close the inbox for new `WAITING_SEND` parks, then drain waiters.
+    ///
+    /// Called from `finalize_flow` **before** unregistering the directory
+    /// so a sender that lost the Full/park race cannot park on a dead inbox.
+    pub(crate) fn close(&self) -> Result<Vec<Flow>, RuntimeError> {
+        let mut inner = sync_lock::lock(&self.inner, "Mailbox::close")?;
+        inner.closed = true;
+        Ok(inner.waiting_senders.drain(..).map(|w| *w.flow).collect())
+    }
+
+    /// Park a bytecode sender whose hop was refused (`WAITING_SEND`).
+    ///
+    /// Never drops `flow`: a closed or poisoned mailbox returns it in
+    /// [`ParkSender::Closed`] so the worker can finalize.
+    pub(crate) fn park_sender(&self, flow: Box<Flow>, message: Value) -> ParkSender {
+        match sync_lock::lock(&self.inner, "Mailbox::park_sender") {
+            Ok(inner) if inner.closed => ParkSender::Closed(flow),
+            Ok(mut inner) => {
+                inner.waiting_senders.push_back(WaitingSender { flow, message });
+                ParkSender::Parked
+            }
+            Err(e) => {
+                super::error::report_fault(e);
+                ParkSender::Closed(flow)
+            }
+        }
+    }
+
+    /// After a pop frees a slot, admit **one** waiting sender (no wake storm).
+    pub(crate) fn admit_waiting_sender(&self) -> Result<Option<Box<Flow>>, RuntimeError> {
+        let mut inner = sync_lock::lock(&self.inner, "Mailbox::admit_waiting_sender")?;
+        if inner.closed {
+            return Ok(None);
+        }
+        let Some(waiter) = inner.waiting_senders.pop_front() else {
+            return Ok(None);
+        };
+        match enqueue_locked(&mut inner, waiter.message.clone(), OverflowPolicy::Reject) {
+            Ok(_) => Ok(Some(waiter.flow)),
+            Err(_) => {
+                inner.waiting_senders.push_front(waiter);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Pull one parked sender out (link-kill of a flow blocked on `WAITING_SEND`).
+    pub(crate) fn take_waiting_sender(
+        &self,
+        sender: FlowId,
+    ) -> Result<Option<Box<Flow>>, RuntimeError> {
+        let mut inner = sync_lock::lock(&self.inner, "Mailbox::take_waiting_sender")?;
+        if let Some(pos) = inner.waiting_senders.iter().position(|w| w.flow.id == sender) {
+            return Ok(inner.waiting_senders.remove(pos).map(|w| w.flow));
+        }
+        Ok(None)
+    }
+
+}
+
+/// Outcome of [`Mailbox::park_sender`].
+pub(crate) enum ParkSender {
+    Parked,
+    /// Inbox already closed (target finalizing) or lock poisoned.
+    Closed(Box<Flow>),
 }
 
 impl Default for Mailbox {
@@ -729,6 +834,34 @@ mod tests {
         assert!(mb.park_match(flow, 1)?.is_ok());
         assert!(matches!(mb.push(msg(1, 7))??, Delivery::Handoff(_)));
         assert_eq!(hop_msg(&mb.try_pop()?.ok_or("queued")?)?.tag, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn waiting_send_admits_one_after_pop() -> TestResult {
+        let mb = tiny_reject(1)?;
+        assert!(matches!(mb.push(msg(1, 1))??, Delivery::Queued));
+        assert!(matches!(
+            mb.park_sender(dummy_flow()?, msg(1, 2)),
+            ParkSender::Parked
+        ));
+        assert!(mb.try_pop()?.is_some());
+        let woken = mb.admit_waiting_sender()?.ok_or("admitted")?;
+        drop(woken);
+        assert_eq!(hop_msg(&mb.try_pop()?.ok_or("second hop")?)?.payload, 2);
+        assert!(mb.admit_waiting_sender()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn close_rejects_late_park_sender() -> TestResult {
+        let mb = tiny_reject(1)?;
+        let leftover = mb.close()?;
+        assert!(leftover.is_empty());
+        match mb.park_sender(dummy_flow()?, msg(1, 1)) {
+            ParkSender::Closed(_) => {}
+            ParkSender::Parked => return Err("closed mailbox must not park a sender".into()),
+        }
         Ok(())
     }
 

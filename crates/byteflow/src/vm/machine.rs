@@ -537,6 +537,88 @@ impl Vm {
                         dest_reg: instr.a,
                         target_cap: cap,
                         request,
+                        timeout: None,
+                    };
+                }
+                Opcode::AskTimeout => {
+                    let target = trap!(self.get_reg(instr.b));
+                    let request = trap!(self.get_reg(instr.c));
+                    let millis_reg = match u8::try_from(instr.imm) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "millis register",
+                                got: "imm-out-of-range",
+                            })
+                        }
+                    };
+                    let millis = trap!(self.get_reg(millis_reg));
+                    let ms = match millis.as_int() {
+                        Some(n) if n >= 0 => n as u64,
+                        _ => 0,
+                    };
+                    let cap = match target.as_cap() {
+                        Some(c) => c,
+                        None => {
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "cap",
+                                got: target.type_name(),
+                            })
+                        }
+                    };
+                    if request.as_message().is_none() {
+                        return VmResult::Trap(Fault::TypeMismatch {
+                            expected: "message",
+                            got: request.type_name(),
+                        });
+                    }
+                    return VmResult::Ask {
+                        dest_reg: instr.a,
+                        target_cap: cap,
+                        request,
+                        timeout: Some(Duration::from_millis(ms)),
+                    };
+                }
+                Opcode::Monitor => {
+                    let target = trap!(self.get_reg(instr.b));
+                    let cap = match target.as_cap() {
+                        Some(c) => c,
+                        None => {
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "cap",
+                                got: target.type_name(),
+                            })
+                        }
+                    };
+                    return VmResult::Monitor {
+                        dest_reg: instr.a,
+                        target_cap: cap,
+                    };
+                }
+                Opcode::Demonitor => {
+                    return VmResult::Demonitor {
+                        monitor_reg: instr.a,
+                    };
+                }
+                Opcode::Link => {
+                    let target = trap!(self.get_reg(instr.b));
+                    let cap = match target.as_cap() {
+                        Some(c) => c,
+                        None => {
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "cap",
+                                got: target.type_name(),
+                            })
+                        }
+                    };
+                    return VmResult::Link {
+                        dest_reg: instr.a,
+                        target_cap: cap,
+                    };
+                }
+                Opcode::Unlink => {
+                    return VmResult::Unlink {
+                        link_reg: instr.a,
                     };
                 }
                 Opcode::Trap => return VmResult::Trap(Fault::Explicit(instr.imm)),

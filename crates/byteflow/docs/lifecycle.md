@@ -1,0 +1,83 @@
+# Flow lifecycle (monitors, links, registry)
+
+Byteflow coordinates **exit** in one place: `finalize_flow` (iterative
+work list — not recursion). The VM only produces
+[`FlowOutcome`](../src/scheduler/process.rs); the runtime revokes Caps,
+delivers `DOWN`, propagates links, and sweeps the registry.
+
+`FlowExitReason` is an explicit argument to finalize, not inferred from
+the join string. A linked kill therefore reports `Link` on `DOWN`, not
+`Fault`.
+
+## Identity vs address
+
+| Type | Role |
+|------|------|
+| [`FlowId`](../src/scheduler/process.rs) | Identity. Never reused. Host `monitor` / `link` take this. |
+| [`CapId`](../src/scheduler/capability.rs) | Address. Revoked when the **target** exits. Bytecode uses Caps. |
+
+There is no generation on Caps: a dead target's Caps stop resolving
+(`CapTable::revoke_target`). A guessed CapId never grants Send/Ask.
+
+## Monitors (`A ──monitor──> B`)
+
+`Runtime::monitor(owner, target)` or bytecode `Fn::monitor(cap)` creates a
+[`MonitorRef`]. When `target` exits, `owner` receives an Atomic Hop:
+
+```text
+tag        = TAG_SYS_DOWN (0xFF01)
+request_id = MonitorRef
+sender     = target FlowId  (identity, not a Cap)
+payload    = FlowExitReason as u64
+```
+
+Selective receive: `receive_match_imm(TAG_SYS_DOWN)`.
+
+## Links (`A <──────────> B`)
+
+Abnormal exit (`Fault`, `Link`, …) **kills** the peer (cooperative: parked
+flows are taken out of the mailbox; running flows see a kill signal at the
+next quantum). `Normal` (clean `return` / `Exit`) only drops the link.
+
+## Registry
+
+`register_name(name, CapId)` stores a **Cap**, never a FlowId.
+`whereis` returns that Cap. Finalize unregisters every name for the dead
+flow.
+
+## Ask vs target death
+
+An `Ask` / `AskTimeout` parked for a reply is indexed on the **target**.
+When that flow finalizes, the asker is taken off its mailbox and resumed
+with [`TAG_SYS_EXIT`](../src/bytecode/value.rs) (`Message::linked_exit`:
+`sender` = dead FlowId, `payload` = `FlowExitReason`). This is not a hang
+and is distinct from `AskTimeout` writing `Unit`.
+
+## `WAITING_SEND`
+
+Bytecode `Send` / `Ask` against a full `Reject` inbox **park the sender**
+in the target mailbox. Each pop admits **one** waiter (no wake storm).
+Host `Runtime::send` still returns `SendError::MailboxFull`.
+
+`Mailbox::close` runs before directory unregister so a sender that lost
+the Full/park race cannot park on a dead inbox (that would leak the flow).
+
+## Kill
+
+`Runtime::kill(id)` is cooperative: a parked receiver / `WAITING_SEND`
+finalizes immediately (`FlowExitReason::Killed`); a running flow dies at
+the next quantum.
+
+## Supervisor strategies
+
+Host [`Supervisor`](../src/scheduler/supervisor.rs) supports
+`OneForOne`, `OneForAll`, and `RestForOne`. Sibling abort uses
+`FlowExitReason::Supervisor` and an `expected_shutdown` flag so those
+exits do not start another cascade. Intensity still counts the triggering
+restart, not the sibling kills.
+
+## Resource governor
+
+[`RuntimeConfig::max_flows`](../src/scheduler/runtime.rs) (`0` = unlimited)
+is checked on every host and bytecode `spawn`. Over the cap →
+`SpawnError::FlowLimit`.
