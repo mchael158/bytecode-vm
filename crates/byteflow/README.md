@@ -217,7 +217,7 @@ byteflow run    <file.bf> [function]
 
 ---
 
-## Status (v0.8)
+## Status (v0.8.1)
 
 **Included:** register ISA + `Program`/`Fn` assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, **bounded mailboxes** (`MailboxConfig`: 256 hops + 4 MiB / Reject by default), Atomic Hop, FlowCap, monitors / links / registry, `WAITING_SEND`, `AskTimeout`, `RuntimeConfig.max_flows`, OTP supervisor strategies, std natives, CLI, examples, fail-closed error model, optional trace JIT (`feature = "jit"`).
 

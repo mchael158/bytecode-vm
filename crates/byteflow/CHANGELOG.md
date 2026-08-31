@@ -2,7 +2,7 @@
 
 All notable changes to **byteflow-actors** are documented here.
 
-## [Unreleased]
+## [0.8.1] — 2026-08-30
 
 ### Added
 
