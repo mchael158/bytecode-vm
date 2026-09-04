@@ -233,16 +233,21 @@ FlowId** behind the target Cap — never to a CapId.
 
 ---
 
-## 7. FlowCap — Current Version (0.5.x)
+## 7. FlowCap — Current Version (0.9.x)
 
-Bytecode `Send` / `Ask` require [`Value::Cap`](crate::Value::Cap). A CapId is
-opaque and resolves through the runtime `CapTable` to
-`{ FlowId, CapRights }` (`SEND`, `ASK`).
+Bytecode `Send` / `Ask` require [`Value::Cap`](crate::Value::Cap). A [`CapId`](crate::CapId)
+is an opaque **128-bit CSPRNG token** — not a counter, not a [`FlowId`].
+It resolves through the runtime [`CapTable`](crate::Capability) to
+`{ holder, target, rights }` (`SEND`, `ASK`).
+
+Resolution is always `resolve(cap, current_flow, required_rights)`. Knowing the
+bits, or holding a copy in a register, is **not** enough: the calling flow must
+be the registered **holder** with sufficient rights.
 
 [`Value::Pid`](crate::Value::Pid) remains for **identity** inside authenticated messages
 (`Message.sender` / `msg_sender`). It is **not** an ambient address.
 
-Outgoing hops also mint `Message.reply_cap` with **SEND**-only rights so a
+Outgoing hops mint `Message.reply_cap` with **SEND**-only rights so a
 receiver can answer without knowing or forging a Pid address.
 
 `SelfPid` and bytecode `Spawn` write a Cap (`SEND|ASK`) into the destination
@@ -250,16 +255,23 @@ register — not a raw Pid.
 
 Host `Runtime::send(FlowId, …)` remains a trusted host path (no Cap required).
 
+Cap tables are **per-runtime**: a token minted in Runtime A never resolves in
+Runtime B.
+
+### Untrusted constant pool (0.9)
+
+By default, [`verify`](crate::verify) and [`decode`](crate::decode) reject
+`Cap`, `Pid`, and `Message` values in the bytecode constant pool
+([`TrustLevel::Untrusted`]). Only host assemblers that intentionally embed
+authority-bearing constants should pass [`TrustLevel::Trusted`].
+
 ---
 
 ## 8. Message Construction
 
-The current `make_msg` native may accept a sender field for compatibility with
-the existing Value/Message ABI.
-
-That field MUST be considered untrusted metadata.
-
-The sender field supplied by `make_msg` is never authoritative.
+The current `make_msg` native does not take a sender. A 4-arg legacy encoding
+is accepted only to ignore the first operand — it is never copied into
+`Message.sender`.
 
 For outgoing Send and Ask operations:
 
@@ -283,15 +295,16 @@ A native function executes with authority granted by the host's native table.
 Bytecode must not be able to manufacture native authority merely by providing
 a numeric native index.
 
-The current native-index ABI is preserved in 0.4.x.
+Native authorization is currently host-configured **and** gated per flow:
 
-Native capabilities and per-flow native allowlists are planned for a later
-security phase.
+- host `Runtime::spawn` mints a root Cap with [`CapRights::NATIVE`] plus a
+  full [`NativeMask`] over the attached [`NativeTable`];
+- bytecode `Spawn` attenuates that mask through [`Cap::attenuate`] (the only
+  derivation path);
+- `CALL_NATIVE` runs [`check_native_call`] / [`check_native_gate`] **before**
+  indexing the function-pointer table.
 
-Until then:
-
-- NativeTable configuration = trusted
-- native index supplied by bytecode = untrusted input
+A numeric native index is still not a capability by itself (S7).
 
 ---
 
@@ -391,20 +404,23 @@ because it originated outside bytecode.
 
 ---
 
-## 16. Future Capability Model
+## 16. Capability Model (0.9 — implemented)
 
-The target security architecture is object-capability based.
+The security architecture is object-capability based:
 
-The intended model is `Value::Cap(CapId)` where CapId is opaque and is not a
-FlowId.
+`Value::Cap(CapId)` where [`CapId`](crate::CapId) is an opaque 128-bit CSPRNG
+token — **not** a [`FlowId`].
 
-A capability resolves through the runtime directory to `{ FlowId, Rights }`
-(`SEND`, `ASK`, or both). `LINK` / `ADMIN` bits are not minted in this
-revision.
+A capability resolves through the per-runtime directory to
+`LINK` / `MONITOR` / `ADMIN` bits are minted: addressing Caps carry
+`LINK|MONITOR`; `ADMIN` requires [`CapTarget::Scheduler`] and is never in
+the default root set.
 
 The bytecode-visible capability MUST NOT expose the underlying FlowId.
 
-Capability creation, delegation and attenuation belong to the trusted runtime.
+Capability creation, delegation, attenuation, and revocation belong to the
+trusted runtime. [`CapTable::revoke_flow`] removes every entry held by or
+targeting an exiting flow.
 
 ---
 
@@ -443,8 +459,9 @@ authenticated identity only and does not grant delivery authority.
 
 ### S7 — Native index is not inherently a capability
 
-Native authorization is currently host-configured and is not yet represented
-as a first-class bytecode capability.
+Native authorization is a [`CapRights::NATIVE`] bit plus a [`NativeMask`] on
+the flow's self-authority. `CALL_NATIVE` is denied unless both pass. The
+index operand is untrusted input, never an ambient grant.
 
 ---
 
@@ -454,13 +471,18 @@ as a first-class bytecode capability.
 
 Authenticated sender stamping on bytecode `Send` / `Ask`.
 
-### Phase 2 (done — 0.5.x)
+### Phase 2 (done — 0.5.x → 0.9)
 
 Flow capabilities: `Value::Cap` for Send/Ask; `reply_cap` grant; Pid = identity.
+0.9 closes the model: random 128-bit ids, holder + rights resolution,
+untrusted constant-pool rejection, and full cap sweep on flow exit.
 
-### Phase 3
+### Phase 3 (done — 0.9)
 
-Native capabilities and resource quotas.
+Native allowlists, per-flow quotas (CPU / memory / spawn-send rate),
+`DELEGATE`, confined `SPAWN`, `LINK`/`MONITOR`/`ADMIN` rights, and
+`make_msg` without a forgeable sender. All derivation goes through
+[`Cap::attenuate`].
 
 ### Phase 4
 

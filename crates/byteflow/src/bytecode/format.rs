@@ -2,11 +2,14 @@ use super::chunk::{Chunk, FunctionDef, ABI_VERSION, MAGIC};
 use super::instruction::Instruction;
 use super::opcode::Opcode;
 use super::value::Value;
+use super::verify::TrustLevel;
 
 const MAX_NAME: u32 = 64 * 1024;
 const MAX_ITEMS: u32 = 1_000_000;
 /// Max length for [`Value::Str`] / [`Value::Bytes`] constant payloads.
 const MAX_BLOB: u32 = 1_048_576;
+/// Nested `Message.payload` depth (defense against hostile `.bf` files).
+const MAX_VALUE_DEPTH: u32 = 16;
 
 /// Why a `.bf` buffer failed to decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +21,8 @@ pub enum FormatError {
     BadUtf8,
     UnknownValueTag(u8),
     UnknownOpcode { at: usize, byte: u8 },
+    ForbiddenConstant(super::verify::ConstantKind),
+    ValueTooNested,
 }
 
 impl std::fmt::Display for FormatError {
@@ -36,6 +41,10 @@ impl std::fmt::Display for FormatError {
             FormatError::UnknownOpcode { at, byte } => {
                 write!(f, "unknown opcode 0x{byte:02X} at instruction {at}")
             }
+            FormatError::ForbiddenConstant(kind) => {
+                write!(f, "untrusted module must not embed {kind} in the constant pool")
+            }
+            FormatError::ValueTooNested => write!(f, "value nesting exceeds decoder limit"),
         }
     }
 }
@@ -70,9 +79,15 @@ pub fn encode(chunk: &Chunk) -> Vec<u8> {
     out
 }
 
-/// Decode a BFV0 module. Rejects unknown opcodes at decode time so a
-/// foreign file can never become a jump-table index.
+/// Decode a BFV0 module. Untrusted by default: Cap / Pid / Message constants
+/// are rejected (see [`decode_with`]).
 pub fn decode(bytes: &[u8]) -> Result<Chunk, FormatError> {
+    decode_with(bytes, TrustLevel::Untrusted)
+}
+
+/// Decode with an explicit trust level. Trusted decode is for host-packed
+/// modules that may embed authority tags in the constant pool.
+pub fn decode_with(bytes: &[u8], trust: TrustLevel) -> Result<Chunk, FormatError> {
     let mut r = Reader { data: bytes, pos: 0 };
     let magic = r.read_array::<4>()?;
     if magic != MAGIC {
@@ -86,7 +101,7 @@ pub fn decode(bytes: &[u8]) -> Result<Chunk, FormatError> {
     let n_const = r.read_count("constants")?;
     let mut constants = Vec::with_capacity(n_const as usize);
     for _ in 0..n_const {
-        constants.push(r.read_value()?);
+        constants.push(r.read_value(trust, 0)?);
     }
     let n_fn = r.read_count("functions")?;
     let mut functions = Vec::with_capacity(n_fn as usize);
@@ -145,17 +160,17 @@ fn write_value(out: &mut Vec<u8>, value: &Value) {
             out.extend_from_slice(&p.to_le_bytes());
         }
         Value::Message(m) => {
-            // Tag 5 — ABI v3 layout (includes reply_cap).
+            // Tag 5 — ABI v5 layout (reply_cap is 128-bit, payload is nested).
             out.push(5);
             out.extend_from_slice(&m.sender.to_le_bytes());
-            out.extend_from_slice(&m.reply_cap.to_le_bytes());
+            out.extend_from_slice(&m.reply_cap.as_u128().to_le_bytes());
             out.extend_from_slice(&m.request_id.to_le_bytes());
             out.extend_from_slice(&m.tag.to_le_bytes());
-            out.extend_from_slice(&m.payload.to_le_bytes());
+            write_value(out, m.payload.as_ref());
         }
         Value::Cap(c) => {
             out.push(6);
-            out.extend_from_slice(&c.to_le_bytes());
+            out.extend_from_slice(&c.as_u128().to_le_bytes());
         }
         Value::Str(s) => {
             out.push(7);
@@ -223,6 +238,10 @@ impl<'a> Reader<'a> {
         Ok(u64::from_le_bytes(self.read_array()?))
     }
 
+    fn read_u128(&mut self) -> Result<u128, FormatError> {
+        Ok(u128::from_le_bytes(self.read_array()?))
+    }
+
     fn read_f64(&mut self) -> Result<f64, FormatError> {
         Ok(f64::from_le_bytes(self.read_array()?))
     }
@@ -247,28 +266,47 @@ impl<'a> Reader<'a> {
         String::from_utf8(bytes.to_vec()).map_err(|_| FormatError::BadUtf8)
     }
 
-    fn read_value(&mut self) -> Result<Value, FormatError> {
+    fn read_value(&mut self, trust: TrustLevel, depth: u32) -> Result<Value, FormatError> {
+        if depth > MAX_VALUE_DEPTH {
+            return Err(FormatError::ValueTooNested);
+        }
         match self.read_u8()? {
             0 => Ok(Value::Unit),
             1 => Ok(Value::Bool(self.read_u8()? != 0)),
             2 => Ok(Value::Int(self.read_i64()?)),
             3 => Ok(Value::Float(self.read_f64()?)),
-            4 => Ok(Value::Pid(self.read_u64()?)),
+            4 => {
+                if trust == TrustLevel::Untrusted {
+                    return Err(FormatError::ForbiddenConstant(
+                        super::verify::ConstantKind::ProcessId,
+                    ));
+                }
+                Ok(Value::Pid(self.read_u64()?))
+            }
             5 => {
+                if trust == TrustLevel::Untrusted {
+                    return Err(FormatError::ForbiddenConstant(
+                        super::verify::ConstantKind::Message,
+                    ));
+                }
                 let sender = self.read_u64()?;
-                let reply_cap = self.read_u64()?;
+                let reply_cap = super::cap::CapId::from_raw(self.read_u128()?);
                 let request_id = self.read_u64()?;
                 let tag = self.read_u16()?;
-                let payload = self.read_u64()?;
-                Ok(Value::Message(super::value::Message {
-                    sender,
-                    reply_cap,
-                    request_id,
-                    tag,
-                    payload,
-                }))
+                let payload = self.read_value(trust, depth + 1)?;
+                Ok(Value::Message(
+                    super::value::Message::new(sender, request_id, tag, payload)
+                        .authenticate(sender, reply_cap),
+                ))
             }
-            6 => Ok(Value::Cap(self.read_u64()?)),
+            6 => {
+                if trust == TrustLevel::Untrusted {
+                    return Err(FormatError::ForbiddenConstant(
+                        super::verify::ConstantKind::Capability,
+                    ));
+                }
+                Ok(Value::Cap(super::cap::CapId::from_raw(self.read_u128()?)))
+            }
             7 => {
                 let bytes = self.read_blob("str")?;
                 let s = std::str::from_utf8(bytes).map_err(|_| FormatError::BadUtf8)?;
@@ -293,7 +331,7 @@ mod tests {
     use super::*;
     use crate::bytecode::builder::ChunkBuilder;
     use crate::bytecode::opcode::Opcode;
-    use crate::bytecode::verify::verify;
+    use crate::bytecode::verify::{verify, TrustLevel};
 
 
     #[test]
@@ -322,17 +360,36 @@ mod tests {
         use super::super::value::Message;
         let mut b = ChunkBuilder::new("msg-const");
         b.begin_function("main", 0, 1);
-        let k = b.const_(Value::Message(Message::new(1, 2, 3, 4)));
+        let k = b.const_(Value::Message(Message::new(1, 2, 3, 4u64)));
         b.emit_load_const(0, k);
         b.emit_return(0);
         let original = b.finish();
-        let decoded = decode(&encode(&original))?;
+        let decoded = decode_with(&encode(&original), TrustLevel::Trusted)?;
         assert_eq!(decoded.constants, original.constants);
-        assert_eq!(
-            decoded.constants[0],
-            Value::Message(Message::new(1, 2, 3, 4))
-        );
+        let got = decoded.constants[0]
+            .as_message()
+            .ok_or(FormatError::Truncated)?;
+        assert_eq!(got.sender, 1);
+        assert_eq!(got.request_id, 2);
+        assert_eq!(got.tag, 3);
+        assert_eq!(got.payload.as_ref(), &Value::Int(4));
         Ok(())
+    }
+
+    #[test]
+    fn untrusted_decode_rejects_cap_constant() {
+        use crate::bytecode::cap::CapId;
+        let mut b = ChunkBuilder::new("cap-const");
+        b.begin_function("main", 0, 1);
+        let k = b.const_(Value::Cap(CapId::from_raw(1)));
+        b.emit_load_const(0, k);
+        b.emit_return(0);
+        let bytes = encode(&b.finish());
+        assert!(matches!(
+            decode(&bytes),
+            Err(FormatError::ForbiddenConstant(_))
+        ));
+        assert!(decode_with(&bytes, TrustLevel::Trusted).is_ok());
     }
 
     #[test]

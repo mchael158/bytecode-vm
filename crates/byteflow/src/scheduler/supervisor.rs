@@ -304,7 +304,7 @@ fn register_child_name(inner: &Inner, id: FlowId, name: &str) -> Result<(), Spaw
         .spawner
         .shared
         .caps
-        .mint(id, super::capability::CapRights::SEND_ASK)
+        .mint(id, id, super::capability::CapRights::ADDRESSING)
         .map_err(|e| {
             report_fault(e);
             SpawnError::VmInit("cap mint failed (poisoned lock)".into())

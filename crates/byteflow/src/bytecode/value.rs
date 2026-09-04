@@ -1,107 +1,92 @@
 use std::fmt;
 use std::sync::Arc;
 
+use super::cap::CapId;
+
 /// Reserved Atomic Hop tag for monitor `DOWN` events (not an application tag).
 pub const TAG_SYS_DOWN: u16 = 0xFF01;
 /// Reserved Atomic Hop tag for linked-exit notices.
 pub const TAG_SYS_EXIT: u16 = 0xFF02;
 
-/// Fixed-size envelope carried in mailboxes and registers (**Atomic Hop**).
+/// Envelope carried in mailboxes and registers (**Atomic Hop**).
 ///
-/// # Why this exists (request-reply / typed protocols)
-///
-/// `Receive` delivers a single [`Value`] — not `{sender, Value}`. Without an
-/// envelope, a server flow cannot learn who sent a request, and two clients
-/// cannot safely share a `request_id` space.
+/// `payload` is a [`Value`] behind [`Arc`] so hops can carry `Int`, `Str`,
+/// `Bytes`, or nested messages. Mailbox byte budgets charge
+/// [`Value::memory_size`] of the whole hop, including the payload tree.
 ///
 /// # Security
 ///
 /// - **`sender`**: FlowId stamped by the scheduler on bytecode `Send` / `Ask`
 ///   (invariant **S1**). Not a capability.
-/// - **`reply_cap`**: CapId minted at the same boundary with **SEND**-only
-///   rights so the recipient can answer without ambient Pid addressing
-///   (phase 2). Zero means “no reply grant” (host-injected hops may omit it).
+/// - **`reply_cap`**: [`CapId`] minted at the hop boundary with **SEND**-only
+///   rights, **holder = recipient**. [`CapId::NONE`] means “no reply grant”.
 ///
 /// See `docs/security.md`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Message {
     /// Authenticated origin FlowId (`0` = trusted host / non-flow).
     pub sender: u64,
-    /// Capability granting **SEND** back to [`Self::sender`], or `0`.
-    pub reply_cap: u64,
+    /// Capability granting **SEND** back to [`Self::sender`], or [`CapId::NONE`].
+    pub reply_cap: CapId,
     /// Client correlation token; echoed on replies (`Ask` / **S2**).
     pub request_id: u64,
     /// Protocol discriminator (opaque to the VM).
     pub tag: u16,
-    /// Small protocol payload.
-    pub payload: u64,
+    /// Application body (shared so hop clones are cheap).
+    pub payload: Arc<Value>,
 }
 
 impl Message {
     /// Build an envelope. `sender` / `reply_cap` are placeholders until a
-    /// bytecode hop is authenticated by the scheduler (`reply_cap` typically
-    /// `0` here).
-    pub const fn new(sender: u64, request_id: u64, tag: u16, payload: u64) -> Self {
+    /// bytecode hop is authenticated by the scheduler.
+    pub fn new(sender: u64, request_id: u64, tag: u16, payload: impl Into<Value>) -> Self {
         Self {
             sender,
-            reply_cap: 0,
+            reply_cap: CapId::NONE,
             request_id,
             tag,
-            payload,
+            payload: Arc::new(payload.into()),
         }
     }
 
     /// Outgoing hop from host Rust (`sender` / `reply_cap` filled on delivery).
-    pub const fn request(request_id: u64, tag: u16, payload: u64) -> Self {
+    pub fn request(request_id: u64, tag: u16, payload: impl Into<Value>) -> Self {
         Self::new(0, request_id, tag, payload)
     }
 
     /// Reply envelope echoing `request_id` from a received hop (host path).
-    pub fn reply_to(req: &Self, tag: u16, payload: u64) -> Self {
+    pub fn reply_to(req: &Self, tag: u16, payload: impl Into<Value>) -> Self {
         Self::new(0, req.request_id, tag, payload)
     }
 
     /// Runtime lifecycle hop: monitor `DOWN` (`tag == `[`TAG_SYS_DOWN`]).
-    ///
-    /// `sender` is the dead flow's identity (not a Cap). `request_id` is the
-    /// [`crate::MonitorRef`]. `payload` is [`crate::FlowExitReason`] as `u64`.
-    pub const fn down(monitor: u64, target_flow: u64, reason: u64) -> Self {
-        Self {
-            sender: target_flow,
-            reply_cap: 0,
-            request_id: monitor,
-            tag: TAG_SYS_DOWN,
-            payload: reason,
-        }
+    pub fn down(monitor: u64, target_flow: u64, reason: u64) -> Self {
+        Self::new(
+            target_flow,
+            monitor,
+            TAG_SYS_DOWN,
+            Value::Int(reason as i64),
+        )
     }
 
     /// Runtime lifecycle hop: Ask target exited (`tag == `[`TAG_SYS_EXIT`]).
-    ///
-    /// Written into the Ask dest register when the callee dies before
-    /// replying. `payload` is [`crate::FlowExitReason`].
-    pub const fn linked_exit(target_flow: u64, reason: u64) -> Self {
-        Self {
-            sender: target_flow,
-            reply_cap: 0,
-            request_id: 0,
-            tag: TAG_SYS_EXIT,
-            payload: reason,
-        }
+    pub fn linked_exit(target_flow: u64, reason: u64) -> Self {
+        Self::new(target_flow, 0, TAG_SYS_EXIT, Value::Int(reason as i64))
     }
 
     #[inline]
-    pub const fn is_down(self) -> bool {
+    pub fn is_down(&self) -> bool {
         self.tag == TAG_SYS_DOWN
     }
 
     #[inline]
-    pub const fn is_exit(self) -> bool {
+    pub fn is_exit(&self) -> bool {
         self.tag == TAG_SYS_EXIT
     }
 
     /// Stamp origin FlowId and attach a reply capability (scheduler only).
     #[inline]
-    pub(crate) fn authenticate(mut self, sender: u64, reply_cap: u64) -> Self {
+    pub(crate) fn authenticate(mut self, sender: u64, reply_cap: CapId) -> Self {
         self.sender = sender;
         self.reply_cap = reply_cap;
         self
@@ -112,7 +97,7 @@ impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "msg{{from=flow#{}, reply=cap#{}, id={}, tag={}, payload={}}}",
+            "msg{{from=flow#{}, reply={}, id={}, tag={}, payload={}}}",
             self.sender, self.reply_cap, self.request_id, self.tag, self.payload
         )
     }
@@ -120,12 +105,11 @@ impl fmt::Display for Message {
 
 /// A dynamically-tagged runtime value.
 ///
-/// [`Value::Cap`] is an unforgeable address for `Send` / `Ask` (phase 2).
-/// [`Value::Pid`] remains for **identity** inside authenticated messages
-/// (`Message.sender` / `msg_sender`), not for ambient addressing.
+/// [`Value::Cap`] is an opaque [`CapId`] for `Send` / `Ask`. Authority lives
+/// in the runtime [`crate::CapTable`], keyed by holder — not in this tag.
+/// [`Value::Pid`] remains for **identity** inside authenticated messages.
 ///
-/// [`Value::Str`] / [`Value::Bytes`] are heap payloads shared via [`Arc`] so
-/// register moves and mailbox hops clone the handle, not the buffer.
+/// [`Value::Str`] / [`Value::Bytes`] are heap payloads shared via [`Arc`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Unit,
@@ -136,8 +120,8 @@ pub enum Value {
     Pid(u64),
     /// Atomic Hop envelope. See [`Message`].
     Message(Message),
-    /// Unforgeable capability (`CapId` as `u64`). Required for `Send` / `Ask`.
-    Cap(u64),
+    /// Opaque capability token. Required for `Send` / `Ask`.
+    Cap(CapId),
     /// UTF-8 text (constant pool, natives, host).
     Str(Arc<str>),
     /// Opaque byte buffer (constant pool, natives, host).
@@ -187,7 +171,7 @@ impl Value {
     }
 
     #[inline]
-    pub fn as_cap(&self) -> Option<u64> {
+    pub fn as_cap(&self) -> Option<CapId> {
         match self {
             Value::Cap(c) => Some(*c),
             _ => None,
@@ -195,9 +179,9 @@ impl Value {
     }
 
     #[inline]
-    pub fn as_message(&self) -> Option<Message> {
+    pub fn as_message(&self) -> Option<&Message> {
         match self {
-            Value::Message(m) => Some(*m),
+            Value::Message(m) => Some(m),
             _ => None,
         }
     }
@@ -222,36 +206,27 @@ impl Value {
     /// Bytes this value is **charged** for against a mailbox byte budget
     /// (see [`crate::MailboxBytes`]).
     ///
-    /// # This is a charge model, not an RSS measurement
-    ///
-    /// [`Value::Str`] / [`Value::Bytes`] are `Arc`-shared: the same buffer
-    /// cloned into N mailboxes exists once in memory, but each mailbox is
-    /// charged the full length. That over-counts on purpose — a budget that
-    /// under-counts shared payloads is not a bound at all, since a single
-    /// producer could fan one large `Arc` out to every inbox and stay
-    /// "within budget" everywhere while the host pays once per distinct
-    /// buffer it keeps alive.
-    ///
-    /// The inline `size_of::<Value>()` term is included so a flood of
-    /// scalar hops is also bounded, not just blob hops.
+    /// [`Value::Str`] / [`Value::Bytes`] / hop payloads are `Arc`-shared: the
+    /// same buffer cloned into N mailboxes exists once in memory, but each
+    /// mailbox is charged the full length. That over-counts on purpose.
     #[inline]
     pub fn memory_size(&self) -> usize {
         std::mem::size_of::<Self>() + self.heap_size()
     }
 
     /// Heap bytes owned (transitively) by this value, excluding the enum
-    /// itself. Zero for every scalar variant.
+    /// itself.
     #[inline]
     pub fn heap_size(&self) -> usize {
         match self {
             Value::Str(s) => s.len(),
             Value::Bytes(b) => b.len(),
+            Value::Message(m) => m.payload.memory_size(),
             Value::Unit
             | Value::Bool(_)
             | Value::Int(_)
             | Value::Float(_)
             | Value::Pid(_)
-            | Value::Message(_)
             | Value::Cap(_) => 0,
         }
     }
@@ -280,7 +255,7 @@ impl fmt::Display for Value {
             Value::Float(x) => write!(f, "{x}"),
             Value::Pid(p) => write!(f, "flow#{p}"),
             Value::Message(m) => write!(f, "{m}"),
-            Value::Cap(c) => write!(f, "cap#{c}"),
+            Value::Cap(c) => write!(f, "{c}"),
             Value::Str(s) => write!(f, "{s}"),
             Value::Bytes(b) => write!(f, "bytes[{}]", b.len()),
         }
@@ -290,6 +265,16 @@ impl fmt::Display for Value {
 impl From<i64> for Value {
     fn from(v: i64) -> Self {
         Value::Int(v)
+    }
+}
+impl From<i32> for Value {
+    fn from(v: i32) -> Self {
+        Value::Int(i64::from(v))
+    }
+}
+impl From<u64> for Value {
+    fn from(v: u64) -> Self {
+        Value::Int(v as i64)
     }
 }
 impl From<bool> for Value {
@@ -305,6 +290,11 @@ impl From<f64> for Value {
 impl From<Message> for Value {
     fn from(m: Message) -> Self {
         Value::Message(m)
+    }
+}
+impl From<CapId> for Value {
+    fn from(c: CapId) -> Self {
+        Value::Cap(c)
     }
 }
 impl From<&str> for Value {
@@ -334,25 +324,34 @@ mod tests {
 
     #[test]
     fn message_is_truthy_and_round_trips_helpers() {
-        let m = Message::new(7, 99, 10, 1);
-        let v = Value::Message(m);
+        let m = Message::new(7, 99, 10, 1u64);
+        let v = Value::Message(m.clone());
         assert!(v.is_truthy());
-        assert_eq!(v.as_message(), Some(m));
+        assert_eq!(v.as_message(), Some(&m));
         assert_eq!(v.type_name(), "message");
+        assert_eq!(m.payload.as_ref(), &Value::Int(1));
     }
 
     #[test]
     fn authenticate_stamps_sender_and_reply_cap() {
-        let m = Message::new(999, 1, 2, 3).authenticate(42, 7);
+        let reply = CapId::from_raw(7);
+        let m = Message::new(999, 1, 2, 3u64).authenticate(42, reply);
         assert_eq!(m.sender, 42);
-        assert_eq!(m.reply_cap, 7);
+        assert_eq!(m.reply_cap, reply);
         assert_eq!(m.request_id, 1);
     }
 
     #[test]
+    fn str_payload_is_charged_on_the_hop() {
+        let hop = Value::Message(Message::new(1, 1, 1, Value::str("hello")));
+        assert!(hop.heap_size() >= 5);
+    }
+
+    #[test]
     fn cap_is_truthy() {
-        assert!(Value::Cap(1).is_truthy());
-        assert_eq!(Value::Cap(3).as_cap(), Some(3));
+        let cap = CapId::from_raw(3);
+        assert!(Value::Cap(cap).is_truthy());
+        assert_eq!(Value::Cap(cap).as_cap(), Some(cap));
     }
 
     #[test]
@@ -369,7 +368,6 @@ mod tests {
         assert!(b.is_truthy());
         assert!(!Value::bytes([]).is_truthy());
 
-        // Str also exposes UTF-8 bytes via as_bytes.
         assert_eq!(s.as_bytes(), Some(b"hi".as_slice()));
     }
 

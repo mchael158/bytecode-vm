@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::bytecode::Value;
+use crate::bytecode::{Cap, CapRights, NativeIdx, NativeMask, RevocationCell, Value};
 
 use super::fault::Fault;
 
@@ -204,6 +204,7 @@ pub fn expect_message(
 ) -> Result<crate::Message, Fault> {
     expect_arg(args, index, fn_name)?
         .as_message()
+        .cloned()
         .ok_or(Fault::NativeError(format!(
             "{fn_name}: argument {index} is not a message"
         )))
@@ -217,13 +218,126 @@ pub fn expect_message(
 pub fn expect_u64(args: &[Value], index: usize, fn_name: &str) -> Result<u64, Fault> {
     match expect_arg(args, index, fn_name)? {
         Value::Pid(p) => Ok(*p),
-        Value::Cap(c) => Ok(*c),
         Value::Int(i) if *i >= 0 => Ok(*i as u64),
         Value::Bool(b) => Ok(u64::from(*b)),
         other => Err(Fault::NativeError(format!(
-            "{fn_name}: argument {index} is not a non-negative int/pid/cap (got {})",
+            "{fn_name}: argument {index} is not a non-negative int/pid (got {})",
             other.type_name()
         ))),
+    }
+}
+
+/// Per-flow native allowlist snapshot, checked before indexing the table.
+#[derive(Clone, Debug)]
+pub struct NativeGate {
+    pub has_native: bool,
+    pub mask: NativeMask,
+    pub authority_epoch: u64,
+    pub flow_cell: Arc<RevocationCell>,
+    pub native_epoch: u64,
+    pub native_cell: Arc<RevocationCell>,
+}
+
+impl NativeGate {
+    /// No native right — unit tests and chunks that never call out.
+    pub fn deny(native_count: usize) -> Self {
+        Self {
+            has_native: false,
+            mask: NativeMask::empty(native_count),
+            authority_epoch: 0,
+            flow_cell: Arc::new(RevocationCell::new()),
+            native_epoch: 0,
+            native_cell: Arc::new(RevocationCell::new()),
+        }
+    }
+
+    pub fn from_authority(
+        cap: &Cap,
+        flow_cell: Arc<RevocationCell>,
+        native_cell: Arc<RevocationCell>,
+        native_count: usize,
+    ) -> Self {
+        let mask = match &cap.native_mask {
+            Some(m) => m.clone(),
+            None => NativeMask::empty(native_count),
+        };
+        Self {
+            has_native: cap.rights.contains(CapRights::NATIVE),
+            mask,
+            authority_epoch: cap.epoch(),
+            flow_cell,
+            native_epoch: native_cell.epoch(),
+            native_cell,
+        }
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.flow_cell.epoch() == self.authority_epoch
+            && self.native_cell.epoch() == self.native_epoch
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeCallError {
+    NoNativeRight,
+    IndexNotAllowlisted(NativeIdx),
+    IndexOutOfRange(NativeIdx),
+    Revoked,
+}
+
+impl std::fmt::Display for NativeCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NativeCallError::NoNativeRight => f.write_str("CALL_NATIVE: flow lacks NATIVE right"),
+            NativeCallError::IndexNotAllowlisted(idx) => {
+                write!(f, "CALL_NATIVE: index {idx} not on allowlist")
+            }
+            NativeCallError::IndexOutOfRange(idx) => {
+                write!(f, "CALL_NATIVE: index {idx} out of range")
+            }
+            NativeCallError::Revoked => f.write_str("CALL_NATIVE: capability revoked"),
+        }
+    }
+}
+
+impl std::error::Error for NativeCallError {}
+
+/// Pure check — call from `CALL_NATIVE` **before** indexing `table.entries`.
+pub fn check_native_call(
+    cap: &Cap,
+    table: &NativeTable,
+    idx: NativeIdx,
+) -> Result<(), NativeCallError> {
+    if (idx as usize) >= table.len() {
+        return Err(NativeCallError::IndexOutOfRange(idx));
+    }
+    if !cap.rights.contains(CapRights::NATIVE) {
+        return Err(NativeCallError::NoNativeRight);
+    }
+    match &cap.native_mask {
+        Some(mask) if mask.allows(idx) => Ok(()),
+        _ => Err(NativeCallError::IndexNotAllowlisted(idx)),
+    }
+}
+
+pub fn check_native_gate(
+    gate: &NativeGate,
+    table: &NativeTable,
+    idx: NativeIdx,
+) -> Result<(), NativeCallError> {
+    if (idx as usize) >= table.len() {
+        return Err(NativeCallError::IndexOutOfRange(idx));
+    }
+    if !gate.is_live() {
+        return Err(NativeCallError::Revoked);
+    }
+    if !gate.has_native {
+        return Err(NativeCallError::NoNativeRight);
+    }
+    if gate.mask.allows(idx) {
+        Ok(())
+    } else {
+        Err(NativeCallError::IndexNotAllowlisted(idx))
     }
 }
 
@@ -261,5 +375,21 @@ mod tests {
             .register("x", |_| Ok(Value::Unit))
             .and_then(|b| b.register("x", |_| Ok(Value::Unit)));
         assert!(matches!(result, Err(NativeTableError::DuplicateName(_))));
+    }
+
+    #[test]
+    fn denies_unlisted_index_even_with_native_right() {
+        use crate::bytecode::{CapTarget, RevocationCell};
+
+        let cell = RevocationCell::new();
+        let mask = NativeMask::from_indices(16, &[2, 4]);
+        let cap = Cap::root(CapTarget::Flow(1), CapRights::NATIVE, Some(mask), &cell);
+        let table = NativeTable {
+            entries: Vec::new(),
+        };
+        assert!(matches!(
+            check_native_call(&cap, &table, 4),
+            Err(NativeCallError::IndexOutOfRange(_))
+        ));
     }
 }

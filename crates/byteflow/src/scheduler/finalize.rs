@@ -198,7 +198,10 @@ fn finalize_one(shared: &Shared, mut pending: PendingExit, work: &mut Vec<Pendin
 
     wake_orphaned_asks(shared, id, reason);
 
-    if let Err(e) = shared.caps.revoke_target(id) {
+    if let Err(e) = shared.caps.revoke_flow(id) {
+        report_fault(e);
+    }
+    if let Err(e) = shared.quotas.remove(id) {
         report_fault(e);
     }
     if let Err(e) = shared.directory.unregister(id) {

@@ -1,6 +1,71 @@
 use super::chunk::Chunk;
 use super::opcode::Opcode;
+use super::value::Value;
 use std::fmt;
+
+/// Whether the chunk may contain authority-bearing constants.
+///
+/// Default is [`TrustLevel::Untrusted`] (fail closed). Host assemblers that
+/// intentionally embed `Cap` / `Pid` / `Message` in the pool must pass
+/// [`TrustLevel::Trusted`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustLevel {
+    Trusted,
+    Untrusted,
+}
+
+/// Knob for [`verify_with`]. Default trust is untrusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifyConfig {
+    pub trust: TrustLevel,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            trust: TrustLevel::Untrusted,
+        }
+    }
+}
+
+/// Constant-pool tags that untrusted modules must not embed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstantKind {
+    Capability,
+    ProcessId,
+    Message,
+}
+
+impl fmt::Display for ConstantKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConstantKind::Capability => f.write_str("capability"),
+            ConstantKind::ProcessId => f.write_str("pid"),
+            ConstantKind::Message => f.write_str("message"),
+        }
+    }
+}
+
+fn validate_constant(value: &Value, trust: TrustLevel, index: usize) -> Result<(), VerifyError> {
+    if trust == TrustLevel::Trusted {
+        return Ok(());
+    }
+    match value {
+        Value::Cap(_) => Err(VerifyError::ForbiddenConstant {
+            index,
+            kind: ConstantKind::Capability,
+        }),
+        Value::Pid(_) => Err(VerifyError::ForbiddenConstant {
+            index,
+            kind: ConstantKind::ProcessId,
+        }),
+        Value::Message(_) => Err(VerifyError::ForbiddenConstant {
+            index,
+            kind: ConstantKind::Message,
+        }),
+        _ => Ok(()),
+    }
+}
 
 /// Why a [`Chunk`] failed verification.
 ///
@@ -30,6 +95,8 @@ pub enum VerifyError {
         arity: u8,
         num_registers: u8,
     },
+    /// Untrusted chunk embedded a Cap, Pid, or Message in the constant pool.
+    ForbiddenConstant { index: usize, kind: ConstantKind },
 }
 
 impl fmt::Display for VerifyError {
@@ -59,6 +126,10 @@ impl fmt::Display for VerifyError {
                 f,
                 "function {function} declares arity {arity} but only {num_registers} registers"
             ),
+            VerifyError::ForbiddenConstant { index, kind } => write!(
+                f,
+                "untrusted constant[{index}] must not embed {kind}"
+            ),
         }
     }
 }
@@ -84,8 +155,17 @@ impl std::error::Error for VerifyError {}
 /// (and this `Chunk`'s) knowledge. An out-of-range `CallNative` is instead
 /// caught at runtime as `Fault::BadNative`.
 pub fn verify(chunk: &Chunk) -> Result<(), VerifyError> {
+    verify_with(chunk, VerifyConfig::default())
+}
+
+/// Like [`verify`], with an explicit [`VerifyConfig`].
+pub fn verify_with(chunk: &Chunk, config: VerifyConfig) -> Result<(), VerifyError> {
     if chunk.functions.is_empty() {
         return Err(VerifyError::EmptyFunctionTable);
+    }
+
+    for (index, value) in chunk.constants.iter().enumerate() {
+        validate_constant(value, config.trust, index)?;
     }
 
     let len = chunk.code.len();
@@ -218,5 +298,37 @@ mod tests {
         });
         chunk.code.push(Instruction::only_imm(Opcode::Jump, 999));
         assert!(matches!(verify(&chunk), Err(VerifyError::JumpOutOfRange { .. })));
+    }
+
+    #[test]
+    fn untrusted_rejects_cap_pid_message_constants() {
+        use crate::bytecode::cap::CapId;
+        use crate::bytecode::value::Message;
+        for (value, kind) in [
+            (crate::bytecode::value::Value::Cap(CapId::from_raw(1)), ConstantKind::Capability),
+            (crate::bytecode::value::Value::Pid(7), ConstantKind::ProcessId),
+            (
+                crate::bytecode::value::Value::Message(Message::new(1, 2, 3, 4u64)),
+                ConstantKind::Message,
+            ),
+        ] {
+            let mut b = ChunkBuilder::new("forge");
+            b.begin_function("main", 0, 1);
+            let k = b.const_(value);
+            b.emit_load_const(0, k);
+            b.emit_return(0);
+            let chunk = b.finish();
+            assert_eq!(
+                verify(&chunk),
+                Err(VerifyError::ForbiddenConstant { index: 0, kind })
+            );
+            assert!(verify_with(
+                &chunk,
+                VerifyConfig {
+                    trust: TrustLevel::Trusted
+                }
+            )
+            .is_ok());
+        }
     }
 }

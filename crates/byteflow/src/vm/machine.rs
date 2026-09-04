@@ -5,7 +5,7 @@ use crate::bytecode::{Chunk, Instruction, Opcode, Value};
 
 use super::fault::Fault;
 use super::frame::Frame;
-use super::native::NativeTable;
+use super::native::{check_native_gate, NativeGate, NativeTable};
 use super::result::VmResult;
 
 /// Hard limit on call nesting. Frames are heap-allocated, so
@@ -25,6 +25,7 @@ pub const MAX_CALL_DEPTH: usize = 4096;
 pub struct Vm {
     chunk: Arc<Chunk>,
     natives: Arc<NativeTable>,
+    native_gate: NativeGate,
     frames: Vec<Frame>,
     /// Lifetime instruction counter, exposed for `FlowMetrics` (design
     /// notes §26).
@@ -36,20 +37,26 @@ impl Vm {
     /// `chunk.functions`) with the given arguments loaded into `r0..argc`.
     /// `natives` is the FFI table `Opcode::CallNative` dispatches through —
     /// pass [`NativeTable::empty`] if the chunk never calls out to Rust.
+    ///
+    /// Native calls are **denied** until [`Self::with_native_gate`] installs
+    /// an allowlist (the runtime does this from the flow's attenuated Cap).
     pub fn new(chunk: Arc<Chunk>, natives: Arc<NativeTable>, function: u32, args: &[Value]) -> Result<Self, Fault> {
+        let gate = NativeGate::deny(natives.len());
+        Self::with_native_gate(chunk, natives, gate, function, args)
+    }
+
+    pub fn with_native_gate(
+        chunk: Arc<Chunk>,
+        natives: Arc<NativeTable>,
+        native_gate: NativeGate,
+        function: u32,
+        args: &[Value],
+    ) -> Result<Self, Fault> {
         let def = chunk
             .function(function)
             .ok_or(Fault::BadFunction { index: function, table_size: chunk.functions.len() as u32 })?;
         let mut frame = Frame::new(function, def.num_registers, None);
         frame.pc = def.entry as usize;
-        // Checked, not `frame.registers[i] = ...`: the loop is bounded by
-        // `arity` while the register file is sized by `num_registers`, and a
-        // chunk declaring `arity > num_registers` is structurally possible.
-        // `crate::bytecode::verify` now rejects that statically, but `Vm::new`
-        // is public and reachable without it — and an index panic here fires
-        // on the *caller's* thread (the embedder's, or a worker's via
-        // `Opcode::Spawn`), outside the `catch_unwind` that isolates
-        // `Vm::run`. A fault keeps it a flow-level failure.
         for (i, arg) in args.iter().enumerate().take(def.arity as usize) {
             match frame.registers.get_mut(i) {
                 Some(slot) => *slot = arg.clone(),
@@ -61,7 +68,13 @@ impl Vm {
                 }
             }
         }
-        Ok(Vm { chunk, natives, frames: vec![frame], instructions_executed: 0 })
+        Ok(Vm {
+            chunk,
+            natives,
+            native_gate,
+            frames: vec![frame],
+            instructions_executed: 0,
+        })
     }
 
     pub fn instructions_executed(&self) -> u64 {
@@ -373,6 +386,18 @@ impl Vm {
                     let native_index = instr.imm as u32;
                     let argc = instr.b;
                     let dst = instr.a;
+                    if let Err(err) = check_native_gate(&self.native_gate, &self.natives, native_index)
+                    {
+                        return VmResult::Trap(match err {
+                            crate::vm::native::NativeCallError::IndexOutOfRange(index) => {
+                                Fault::BadNative {
+                                    index,
+                                    table_size: self.natives.len() as u32,
+                                }
+                            }
+                            other => Fault::NativeDenied(other.to_string()),
+                        });
+                    }
                     let native_fn = match self.natives.get(native_index) {
                         Some(f) => f.clone(),
                         None => {
@@ -422,7 +447,12 @@ impl Vm {
                             self.get_reg(trap!(reg_at(instr.a, u16::from(i) + 1)))
                         ));
                     }
-                    return VmResult::Spawn { function: instr.imm as u32, args, dest_reg: instr.a };
+                    return VmResult::Spawn {
+                        function: instr.imm as u32,
+                        args,
+                        dest_reg: instr.a,
+                        requested_rights: crate::bytecode::CapRights::from_u8(instr.c),
+                    };
                 }
                 Opcode::Yield => return VmResult::Yield,
                 Opcode::Sleep => {
@@ -619,6 +649,38 @@ impl Vm {
                 Opcode::Unlink => {
                     return VmResult::Unlink {
                         link_reg: instr.a,
+                    };
+                }
+                Opcode::Delegate => {
+                    let src = trap!(self.get_reg(instr.b));
+                    let src_cap = match src.as_cap() {
+                        Some(c) => c,
+                        None => {
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "cap",
+                                got: src.type_name(),
+                            })
+                        }
+                    };
+                    let want_native_cap = if instr.c == 255 {
+                        None
+                    } else {
+                        let v = trap!(self.get_reg(instr.c));
+                        match v.as_cap() {
+                            Some(c) => Some(c),
+                            None => {
+                                return VmResult::Trap(Fault::TypeMismatch {
+                                    expected: "cap",
+                                    got: v.type_name(),
+                                })
+                            }
+                        }
+                    };
+                    return VmResult::Delegate {
+                        dest_reg: instr.a,
+                        src_cap,
+                        want_rights: crate::bytecode::CapRights::from_bits(instr.imm as u32),
+                        want_native_cap,
                     };
                 }
                 Opcode::Trap => return VmResult::Trap(Fault::Explicit(instr.imm)),

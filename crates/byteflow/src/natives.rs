@@ -19,13 +19,13 @@
 //!
 //! | Index | Name | Role |
 //! |------:|------|------|
-//! | 0 | `print` | host stdout log line (flow-visible) |
+//! | 0 | `print` | host [`crate::OutputSink`] (CLI uses stdout) |
 //! | 1 | `now_ms` | wall-clock millis as `Value::Int` |
-//! | 2 | `make_msg` | build [`crate::Message`] from four scalars (**untrusted** `sender`) |
+//! | 2 | `make_msg` | build [`crate::Message`]; no sender operand (stamped on `Send`) |
 //! | 3 | `msg_sender` | extract `sender` → `Value::Pid` (authenticated **after** delivery) |
 //! | 4 | `msg_request_id` | extract `request_id` → `Value::Int` |
 //! | 5 | `msg_tag` | extract `tag` → `Value::Int` |
-//! | 6 | `msg_payload` | extract `payload` → `Value::Int` |
+//! | 6 | `msg_payload` | extract `payload` → any [`crate::Value`] |
 //! | 7 | `msg_reply_cap` | extract `reply_cap` → `Value::Cap` (SEND grant) |
 //!
 //! # `CallNative` argument layout
@@ -41,7 +41,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::bytecode::{Message, Value};
-use crate::vm::{expect_message, expect_u64, Fault, NativeTable};
+use crate::output::{OutputSink, StdoutSink};
+use crate::vm::{expect_arg, expect_message, expect_u64, Fault, NativeTable};
 
 /// Stable `CallNative` indices for [`std_native_table`]. Bytecode embeds these
 /// once assembled — append only; never renumber.
@@ -74,28 +75,21 @@ pub fn std_native_map() -> HashMap<String, u32> {
     ])
 }
 
-/// Default FFI table: print, clock, and Message make/unpack.
-///
-/// Pass this to [`crate::Runtime::with_natives`] (or
-/// `with_natives_and_config`) whenever the chunk emits the Message helpers
-/// or `print` / `now_ms`. Chunks that never `CallNative` can keep
-/// [`crate::NativeTable::empty`].
+/// Default FFI table with [`StdoutSink`]. Prefer [`std_native_table_with`]
+/// in embedders that must not touch stdout.
 pub fn std_native_table() -> Arc<NativeTable> {
+    std_native_table_with(Arc::new(StdoutSink))
+}
+
+/// Std natives with an explicit print sink (`NullSink` in tests / libraries).
+pub fn std_native_table_with(output: Arc<dyn OutputSink>) -> Arc<NativeTable> {
     let built = NativeTable::builder()
-        .register("print", |args| {
-            // Space-separated Display forms, trailing newline — mirrors a
-            // tiny "println!("{:?}", …)" for bytecode without allocating a
-            // format string in the VM.
-            let mut first = true;
-            for value in args {
-                if !first {
-                    print!(" ");
-                }
-                print!("{value}");
-                first = false;
+        .register("print", {
+            let output = Arc::clone(&output);
+            move |args| {
+                output.write(args);
+                Ok(Value::Unit)
             }
-            println!();
-            Ok(Value::Unit)
         })
         .and_then(|b| {
             b.register("now_ms", |_| {
@@ -109,38 +103,31 @@ pub fn std_native_table() -> Arc<NativeTable> {
         })
         .and_then(|b| {
             b.register("make_msg", |args| {
-                // Args: sender, request_id, tag, payload — each Int≥0, Pid, Cap, or Bool.
-                // Tag must fit `u16` (protocol discriminator width on the wire).
-                //
-                // # Security (crates.io contract)
-                //
-                // The first argument is retained so existing `.bf` modules and
-                // samples keep a stable CallNative layout (indices 0–6 frozen;
-                // 7 = msg_reply_cap appended). It is **not** an authentication
-                // primitive:
-                //
-                // - Before `Send` / `Ask`, `sender` is ordinary register data.
-                // - At delivery, the worker stamps `Message.sender` and mints
-                //   `reply_cap` (`Message::authenticate`).
-                // - After a hop is received, `msg_sender` / `msg_reply_cap`
-                //   reflect runtime identity and the SEND grant (S1 + FlowCap).
-                //
-                // Host code that only builds messages in memory (never sends)
-                // still sees the constructed field unchanged.
-                let sender = expect_u64(args, 0, "make_msg")?;
-                let request_id = expect_u64(args, 1, "make_msg")?;
-                let tag = expect_u64(args, 2, "make_msg")?;
-                let payload = expect_u64(args, 3, "make_msg")?;
+                // 3-arg form: (request_id, tag, payload).
+                // 4-arg legacy: (sender, request_id, tag, payload) — the sender
+                // operand is discarded. Message.sender is always 0 here;
+                // only authenticate_outgoing_message / send() writes identity.
+                let (request_id, tag, payload) = if args.len() >= 4 {
+                    (
+                        expect_u64(args, 1, "make_msg")?,
+                        expect_u64(args, 2, "make_msg")?,
+                        expect_arg(args, 3, "make_msg")?.clone(),
+                    )
+                } else {
+                    (
+                        expect_u64(args, 0, "make_msg")?,
+                        expect_u64(args, 1, "make_msg")?,
+                        expect_arg(args, 2, "make_msg")?.clone(),
+                    )
+                };
                 let tag = u16::try_from(tag).map_err(|_| {
                     Fault::NativeError(format!("make_msg: tag {tag} does not fit in u16"))
                 })?;
-                Ok(Value::Message(Message::new(sender, request_id, tag, payload)))
+                Ok(Value::Message(Message::new(0, request_id, tag, payload)))
             })
         })
         .and_then(|b| {
             b.register("msg_sender", |args| {
-                // After mailbox delivery this is the runtime-stamped origin.
-                // Identity only — not a Send/Ask address (use `msg_reply_cap`).
                 Ok(Value::Pid(expect_message(args, 0, "msg_sender")?.sender))
             })
         })
@@ -158,9 +145,7 @@ pub fn std_native_table() -> Arc<NativeTable> {
         })
         .and_then(|b| {
             b.register("msg_payload", |args| {
-                Ok(Value::Int(
-                    expect_message(args, 0, "msg_payload")?.payload as i64,
-                ))
+                Ok(expect_message(args, 0, "msg_payload")?.payload.as_ref().clone())
             })
         })
         .and_then(|b| {
@@ -170,8 +155,6 @@ pub fn std_native_table() -> Arc<NativeTable> {
                 ))
             })
         });
-    // Unique sequential names cannot hit DuplicateName / SlotOccupied.
-    // Empty table on Err: fail-closed (CallNative → BadNative), never panic.
     match built {
         Ok(b) => b.build(),
         Err(_) => NativeTable::empty(),
@@ -227,27 +210,29 @@ mod tests {
         Ok(())
     }
 
+    use crate::bytecode::CapId;
+
     #[test]
     fn make_msg_and_unpack_round_trip() -> Result<(), Box<dyn std::error::Error>> {
         let table = std_native_table();
         let make = table.get(2).ok_or("make_msg")?;
         let msg = make(&[
-            Value::Pid(9),
             Value::Int(3),
             Value::Int(7),
             Value::Int(42),
         ])?;
-        assert_eq!(msg.as_message(), Some(Message::new(9, 3, 7, 42)));
+        let expected = Message::new(0, 3, 7, 42);
+        assert_eq!(msg.as_message(), Some(&expected));
         let sender = table.get(3).ok_or("msg_sender")?;
         let req = table.get(4).ok_or("msg_request_id")?;
         let tag = table.get(5).ok_or("msg_tag")?;
         let payload = table.get(6).ok_or("msg_payload")?;
         let cap = table.get(7).ok_or("msg_reply_cap")?;
-        assert_eq!(sender(std::slice::from_ref(&msg))?, Value::Pid(9));
+        assert_eq!(sender(std::slice::from_ref(&msg))?, Value::Pid(0));
         assert_eq!(req(std::slice::from_ref(&msg))?, Value::Int(3));
         assert_eq!(tag(std::slice::from_ref(&msg))?, Value::Int(7));
         assert_eq!(payload(std::slice::from_ref(&msg))?, Value::Int(42));
-        assert_eq!(cap(std::slice::from_ref(&msg))?, Value::Cap(0));
+        assert_eq!(cap(std::slice::from_ref(&msg))?, Value::Cap(CapId::NONE));
         Ok(())
     }
 
@@ -262,7 +247,7 @@ mod tests {
             Value::Float(1.5),
             Value::Pid(7),
             Value::Message(Message::new(1, 2, 3, 4)),
-            Value::Cap(9),
+            Value::Cap(CapId::from_raw(9)),
             Value::str("hello"),
             Value::bytes([1u8, 2, 3]),
         ];

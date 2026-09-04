@@ -344,14 +344,31 @@ impl<'a> Fn<'a> {
     }
 
     pub fn spawn(&mut self, function: FuncId, argc: u8) -> Reg {
+        self.spawn_with_rights(function, argc, crate::bytecode::CapRights::FLOW)
+    }
+
+    /// Spawn a child that receives only `rights` ⊆ parent authority.
+    pub fn spawn_with_rights(&mut self, function: FuncId, argc: u8, rights: crate::bytecode::CapRights) -> Reg {
         let cap = self.local();
-        self.spawn_at(cap, function, argc);
+        self.b.emit_spawn_with_rights(cap.0, function, argc, rights);
         cap
+    }
+
+    /// Spawn with `rights = NONE` (confined by default).
+    pub fn spawn_confined(&mut self, function: FuncId, argc: u8) -> Reg {
+        self.spawn_with_rights(function, argc, crate::bytecode::CapRights::NONE)
     }
 
     /// Spawn into an explicit destination register (e.g. `reg(255)`).
     pub fn spawn_at(&mut self, dst: Reg, function: FuncId, argc: u8) {
         self.b.emit_spawn(dst.0, function, argc);
+    }
+
+    /// Attenuate `src` into a new Cap (rights mask is an immediate).
+    pub fn delegate(&mut self, src: Reg, rights: crate::bytecode::CapRights) -> Reg {
+        let dst = self.local();
+        self.b.emit_delegate(dst.0, src.0, rights);
+        dst
     }
 
     pub fn send(&mut self, target_cap: Reg, msg: Reg) {
@@ -464,10 +481,8 @@ impl<'a> Fn<'a> {
     /// The scheduler overwrites `sender` and mints `reply_cap` on [`Self::send`]
     /// / [`Self::ask`] — do not forge a sender (see [`crate::docs::security`]).
     pub fn hop(&mut self, request_id: Reg, tag: i32, payload: Reg) -> Reg {
-        let placeholder = self.load_i32(0);
         self.make_msg(
             crate::natives::std_native::MAKE_MSG,
-            placeholder,
             request_id,
             tag,
             payload,
@@ -511,11 +526,26 @@ impl<'a> Fn<'a> {
 
     /// Build a [`Value::Message`] via `make_msg` at `native_index`.
     ///
-    /// Prefer [`Self::hop`] for outgoing messages. This low-level helper keeps
-    /// the explicit `sender` slot for security regressions and legacy bytecode.
-    /// Index `2` in [`crate::std_native_map`]. Args are packed into a
-    /// contiguous four-register window; returns the message register.
+    /// There is no sender operand — the scheduler stamps identity on `Send`.
+    /// A 4-arg legacy encoding is still accepted by the native (first arg
+    /// discarded) so forged-sender regressions keep compiling.
     pub fn make_msg(
+        &mut self,
+        native_index: u32,
+        request_id: Reg,
+        tag: i32,
+        payload: Reg,
+    ) -> Reg {
+        let w = self.window(3);
+        self.mov(w.at(0), request_id);
+        self.set(w.at(1), tag);
+        self.mov(w.at(2), payload);
+        self.native_n(w.base(), native_index, 3);
+        w.base()
+    }
+
+    /// Legacy 4-arg `make_msg` (sender slot is ignored by the native).
+    pub fn make_msg_legacy_sender(
         &mut self,
         native_index: u32,
         sender: Reg,

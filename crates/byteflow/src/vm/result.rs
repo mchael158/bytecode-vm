@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::bytecode::Value;
+use crate::bytecode::{CapId, Value};
 
 use super::fault::Fault;
 
@@ -30,11 +30,12 @@ pub enum VmResult {
         function: u32,
         args: Vec<Value>,
         dest_reg: u8,
+        requested_rights: crate::bytecode::CapRights,
     },
     /// `SelfPid` — write a **self Cap** (`SEND|ASK`) into `dest_reg`.
     SelfPid { dest_reg: u8 },
     /// `Send` — Atomic Hop to a **capability** target (requires SEND).
-    Send { target_cap: u64, message: Value },
+    Send { target_cap: CapId, message: Value },
     /// `Receive` / `ReceiveTimeout` / `ReceiveMatch` / `ReceiveMatchImm`.
     Receive {
         dest_reg: u8,
@@ -44,18 +45,25 @@ pub enum VmResult {
     /// `Ask` / `AskTimeout` — RPC hop to a **capability** target (requires ASK).
     Ask {
         dest_reg: u8,
-        target_cap: u64,
+        target_cap: CapId,
         request: Value,
         timeout: Option<Duration>,
     },
     /// `Monitor ra, rb` — watch the flow addressed by Cap `r[b]`.
-    Monitor { dest_reg: u8, target_cap: u64 },
+    Monitor { dest_reg: u8, target_cap: CapId },
     /// `Demonitor ra` — drop monitor whose ref is `r[a]` (Int).
     Demonitor { monitor_reg: u8 },
     /// `Link ra, rb` — bidirectional link with Cap `r[b]`.
-    Link { dest_reg: u8, target_cap: u64 },
+    Link { dest_reg: u8, target_cap: CapId },
     /// `Unlink ra` — drop link whose id is `r[a]` (Int).
     Unlink { link_reg: u8 },
+    /// `Delegate ra, rb` — attenuate Cap `r[b]` into `r[a]`.
+    Delegate {
+        dest_reg: u8,
+        src_cap: CapId,
+        want_rights: crate::bytecode::CapRights,
+        want_native_cap: Option<CapId>,
+    },
     /// A fault occurred; the Flow fails. See [`Fault`].
     Trap(Fault),
 }

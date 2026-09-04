@@ -8,9 +8,10 @@ Hardware (`byteflow-hw`) was removed from the monorepo — do not restore it her
 Byteflow's concurrent unit is a **flow** (`Flow`, `FlowId`, `FlowHandle`, `FlowOutcome`) — not an “actor” API surface.
 
 Wire identity still uses `Value::Pid` (FlowId as `u64`) inside messages.
-**Addressing** for bytecode `Send` / `Ask` uses `Value::Cap` (FlowCap, ABI v4).
+**Addressing** for bytecode `Send` / `Ask` uses `Value::Cap` (FlowCap, ABI v5).
 Scalars include `Value::Str` / `Value::Bytes` in the constant pool; hops remain
-`Message`-only.
+`Message`-only. Untrusted `.bf` loads reject `Cap` / `Pid` / `Message` in the
+pool unless [`TrustLevel::Trusted`](../src/bytecode/verify.rs) is set.
 
 ## What “Atomic Hop” means
 
@@ -21,14 +22,16 @@ Message { sender, reply_cap, request_id, tag, payload }
 ```
 
 - **sender** — authenticated origin FlowId (stamped by the worker)
-- **reply_cap** — SEND-only Cap back to the sender (minted at stamp time)
+- **reply_cap** — SEND-only Cap back to the sender (128-bit CSPRNG id, minted at stamp time)
 - **request_id** — client correlation token (echoed on reply)
 - **tag** — protocol discriminator (opaque to the VM)
-- **payload** — small `u64` body
+- **payload** — arbitrary [`Value`](../src/bytecode/value.rs) (nested scalars, blobs, etc.)
 
 **Authenticated sender (security S1):** bytecode `Send` / `Ask` overwrite
 `Message.sender` and attach `reply_cap` before delivery.
-The `make_msg` sender argument is untrusted metadata — see
+The `make_msg` native has **no sender operand** (3-arg: request_id, tag,
+payload). A 4-arg legacy form discards the first register and still writes
+`sender = 0`. Only `Send` / `Ask` stamp identity — see
 [`security.md`](security.md).
 
 **FlowCap (security S6):** bytecode `Send` / `Ask` targets must be `Value::Cap`.
@@ -83,14 +86,15 @@ Stable indices in [`natives.rs`](../src/natives.rs):
 |----:|------|----------------|
 | 0 | `print` | values… → `Unit` (flow-visible log) |
 | 1 | `now_ms` | → `Int` |
-| 2 | `make_msg` | sender, request_id, tag, payload → `Message` |
+| 2 | `make_msg` | request_id, tag, payload → `Message` (`sender` stamped on Send) |
 | 3 | `msg_sender` | msg → `Pid` (identity) |
 | 4 | `msg_request_id` | msg → `Int` |
 | 5 | `msg_tag` | msg → `Int` |
-| 6 | `msg_payload` | msg → `Int` |
+| 6 | `msg_payload` | msg → any `Value` |
 | 7 | `msg_reply_cap` | msg → `Cap` (SEND grant) |
 
-Runtime must use `Runtime::with_natives(chunk, std_native_table())` (or `with_natives_and_config`).
+Runtime must use `Runtime::with_natives(chunk, std_native_table())`,
+[`Runtime::with_std_natives_and_config`](../src/scheduler/runtime.rs), or a custom table.
 
 ## Sample + refresh
 

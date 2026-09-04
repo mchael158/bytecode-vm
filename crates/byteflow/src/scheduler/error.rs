@@ -42,6 +42,10 @@ pub enum RuntimeError {
     /// would blame the runtime for destroying a flow that in fact completed
     /// normally and was already observed.
     AlreadyCollected(&'static str),
+    /// OS CSPRNG failed while minting a capability.
+    EntropyFailed,
+    /// CSPRNG produced colliding ids beyond the retry budget (should not happen).
+    CapIdCollision,
 }
 
 impl fmt::Display for RuntimeError {
@@ -58,6 +62,12 @@ impl fmt::Display for RuntimeError {
             }
             RuntimeError::AlreadyCollected(where_) => {
                 write!(f, "{where_}: outcome was already collected")
+            }
+            RuntimeError::EntropyFailed => {
+                write!(f, "capability CSPRNG unavailable")
+            }
+            RuntimeError::CapIdCollision => {
+                write!(f, "could not allocate a unique capability id")
             }
         }
     }
@@ -126,9 +136,15 @@ pub enum SpawnError {
     /// `function` index is outside the runtime chunk's function table.
     BadFunction { index: u32, table_size: u32 },
     /// Chunk failed verification before the runtime could start.
-    VerifyFailed(String),
+    VerifyFailed(crate::bytecode::VerifyError),
+    /// Spawn arguments contained an unknown or unusable capability.
+    InvalidCapability,
+    /// Scheduler table poisoned (fail closed).
+    Unavailable,
     /// Live flow count would exceed [`crate::RuntimeConfig::max_flows`].
     FlowLimit { current: usize, max: u32 },
+    /// Bytecode spawn failed the quota / SPAWN-right / attenuation check.
+    SpawnDenied(String),
     /// [`crate::ChildSpec::name`] is already in the runtime registry.
     NameTaken { name: String },
     /// OS refused to create a worker / timer / supervisor thread.
@@ -147,10 +163,15 @@ impl fmt::Display for SpawnError {
                     "spawn: function index {index} out of range (table size {table_size})"
                 )
             }
-            SpawnError::VerifyFailed(msg) => write!(f, "chunk verification failed: {msg}"),
+            SpawnError::VerifyFailed(err) => write!(f, "chunk verification failed: {err}"),
+            SpawnError::InvalidCapability => {
+                write!(f, "spawn: argument capability is unknown or not held")
+            }
+            SpawnError::Unavailable => write!(f, "spawn: runtime table unavailable"),
             SpawnError::FlowLimit { current, max } => {
                 write!(f, "spawn: live flow limit reached ({current}/{max})")
             }
+            SpawnError::SpawnDenied(msg) => write!(f, "spawn: {msg}"),
             SpawnError::NameTaken { name } => {
                 write!(f, "spawn: registry name {name:?} already taken")
             }

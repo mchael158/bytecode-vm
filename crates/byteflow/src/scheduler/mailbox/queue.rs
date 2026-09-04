@@ -193,10 +193,14 @@ mod tests {
         Value::bytes(vec![0u8; len])
     }
 
-    fn hop_payload(q: &mut MailboxQueue) -> Result<u64, &'static str> {
+    fn hop_payload_int(msg: &Message) -> i64 {
+        msg.payload.as_int().unwrap_or(0)
+    }
+
+    fn hop_payload(q: &mut MailboxQueue) -> Result<i64, &'static str> {
         match q.take(WaitFilter::Any) {
             Some(v) => match v.as_message() {
-                Some(m) => Ok(m.payload),
+                Some(m) => Ok(hop_payload_int(m)),
                 None => Err("expected Message"),
             },
             None => Err("queue empty"),
@@ -279,13 +283,15 @@ mod tests {
     #[test]
     fn selective_take_refunds_the_right_charge() {
         let mut q = MailboxQueue::new(64, ROOMY);
-        let _ = q.enqueue(hop(1), OverflowPolicy::Reject);
+        let first = hop(1);
+        let first_cost = first.memory_size();
+        let _ = q.enqueue(first, OverflowPolicy::Reject);
         let _ = q.enqueue(blob(3000), OverflowPolicy::Reject);
         let _ = q.enqueue(hop(2), OverflowPolicy::Reject);
         let charged = q.bytes();
         // Tag 1 matches the Message hops, never the blob.
         assert!(q.take(WaitFilter::Tag(1)).is_some());
-        assert_eq!(q.bytes(), charged - std::mem::size_of::<Value>());
+        assert_eq!(q.bytes(), charged - first_cost);
         assert_eq!(q.len(), 2);
     }
 

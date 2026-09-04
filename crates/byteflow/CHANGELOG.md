@@ -2,6 +2,52 @@
 
 All notable changes to **byteflow-actors** are documented here.
 
+## [0.9.0] — 2026-09-02
+
+### Breaking
+
+- **ABI v5:** `CapId` is a 128-bit CSPRNG token (was `u64`). `Message.reply_cap`
+  is `CapId`. `Message.payload` is a nested [`Value`] (was `u64` scalar).
+- **`CapTable::resolve(cap, holder, rights)`** — resolution requires the calling
+  flow to *hold* the token with sufficient rights (`SEND` / `ASK`).
+- **`SpawnError::VerifyFailed`** is now [`VerifyError`] (no `String`).
+- **Untrusted load is fail-closed:** `verify` / `decode` reject `Cap`, `Pid`,
+  and `Message` in the constant pool unless [`TrustLevel::Trusted`] is set.
+- **`RuntimeConfig::trust`** defaults to [`TrustLevel::Untrusted`].
+- **`msg_payload` native** returns the full [`Value`] payload (not always `Int`).
+
+### Added
+
+- [`CapId::random`] — OS CSPRNG minting; `CapId::NONE` for host hops without reply.
+- **Holder model:** each capability records `{ holder, target, rights }`;
+  [`CapTable::revoke_flow`] sweeps caps held by or targeting an exiting flow.
+- [`TrustLevel`] + [`VerifyConfig`] for load-time constant-pool policy.
+- [`decode_with`] mirrors verifier trust when loading `.bf` files.
+- [`OutputSink`], [`NullSink`] (default), [`StdoutSink`]; [`RuntimeConfig::output`]
+  for embedder-controlled `print`.
+- [`Runtime::with_std_natives_and_config`] — std natives + configurable print sink.
+- [`Runtime::grant_cap`] — host mints a cap for one flow to address another.
+- Integration tests in `tests/security_caps.rs`.
+- **Phase 3:** [`Cap::attenuate`] is the sole grant-derivation path.
+  [`NativeMask`] + `CALL_NATIVE` gate (S7), [`FlowQuota`], `Opcode::Delegate`,
+  confined spawn (`rights = NONE` unless requested), `LINK`/`MONITOR`/`ADMIN`
+  rights, `make_msg` ignores any sender operand.
+
+### Changed
+
+- Outgoing hops mint `reply_cap` with **SEND-only** rights (attenuation).
+- [`Runtime`] `Drop` requests shutdown if the embedder forgot to call it.
+- Mailbox byte budget uses [`Value::memory_size`] on nested `Message.payload`.
+
+[`Value`]: https://docs.rs/byteflow-actors/latest/byteflow/enum.Value.html
+[`VerifyError`]: https://docs.rs/byteflow-actors/latest/byteflow/enum.VerifyError.html
+[`TrustLevel`]: https://docs.rs/byteflow-actors/latest/byteflow/enum.TrustLevel.html
+[`CapId::random`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.CapId.html
+[`OutputSink`]: https://docs.rs/byteflow-actors/latest/byteflow/trait.OutputSink.html
+[`NullSink`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.NullSink.html
+[`StdoutSink`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.StdoutSink.html
+[`decode_with`]: https://docs.rs/byteflow-actors/latest/byteflow/fn.decode_with.html
+
 ## [0.8.1] — 2026-08-30
 
 ### Added

@@ -23,6 +23,7 @@ mod error;
 mod finalize;
 mod handle;
 mod link;
+mod link_admin;
 mod monitor;
 mod registry;
 #[cfg(feature = "jit")]
@@ -31,13 +32,19 @@ mod mailbox;
 mod metrics;
 pub(crate) mod oneshot;
 mod process;
+mod quota;
 mod runtime;
+mod spawn;
+mod delegate;
 mod supervisor;
 mod sync_lock;
 mod timer;
 mod worker;
 
-pub use capability::{CapId, CapRights};
+pub use capability::{CapError, CapRights, Capability};
+pub use quota::{FlowQuota, QuotaConfig, QuotaError};
+pub use delegate::{exec_delegate, DelegateError};
+pub use link_admin::{check_admin, check_link, check_monitor, AdminError, LinkError};
 pub use error::{fault_count, report_fault, LifecycleError, RuntimeError, SpawnError};
 pub use link::LinkId;
 pub use monitor::{DownEvent, FlowExitReason, MonitorRef};

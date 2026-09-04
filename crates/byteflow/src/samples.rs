@@ -236,7 +236,7 @@ pub fn forged_sender_send() -> Chunk {
         let forged = f.load_i32(999);
         let req_id = f.load_i32(1);
         let zero = f.load_i32(0);
-        let req = f.make_msg(N_MAKE_MSG, forged, req_id, TAG_REQ, zero);
+        let req = f.make_msg_legacy_sender(N_MAKE_MSG, forged, req_id, TAG_REQ, zero);
         f.send(server_cap, req);
         let reply = f.receive();
         let out = f.hop_payload(reply);
@@ -259,7 +259,7 @@ pub fn forged_sender_ask() -> Chunk {
         let forged = f.load_i32(999);
         let req_id = f.load_i32(1);
         let zero = f.load_i32(0);
-        let req = f.make_msg(N_MAKE_MSG, forged, req_id, TAG_REQ, zero);
+        let req = f.make_msg_legacy_sender(N_MAKE_MSG, forged, req_id, TAG_REQ, zero);
         let reply = f.ask(server_cap, req);
         let out = f.hop_payload(reply);
         f.return_(out);
@@ -329,7 +329,8 @@ pub fn boom() -> Chunk {
 mod tests {
     use super::*;
     use crate::{
-        decode, encode, std_native_table, verify, FlowOutcome, Runtime, RuntimeConfig, Value,
+        bytecode::CapId, decode, encode, std_native_table, verify, FlowOutcome, Runtime,
+        RuntimeConfig, Value,
     };
 
     fn tiny(chunk: Chunk) -> Result<Runtime, crate::SpawnError> {
@@ -495,12 +496,12 @@ mod tests {
         let outcome = rt.spawn(idx, &[])?.join();
         rt.shutdown();
         match outcome {
-            FlowOutcome::Completed(Value::Int(n)) => {
+            FlowOutcome::Completed(Value::Pid(n)) => {
                 assert_ne!(n, 999, "forged make_msg sender must not survive Send");
                 assert!(n >= 1, "authenticated sender must be a live flow id");
                 Ok(())
             }
-            other => Err(format!("expected Completed(Int), got {other:?}").into()),
+            other => Err(format!("expected Completed(Pid), got {other:?}").into()),
         }
     }
 
@@ -513,12 +514,12 @@ mod tests {
         let outcome = rt.spawn(idx, &[])?.join();
         rt.shutdown();
         match outcome {
-            FlowOutcome::Completed(Value::Int(n)) => {
+            FlowOutcome::Completed(Value::Pid(n)) => {
                 assert_ne!(n, 999, "forged make_msg sender must not survive Ask");
                 assert!(n >= 1, "authenticated sender must be a live flow id");
                 Ok(())
             }
-            other => Err(format!("expected Completed(Int), got {other:?}").into()),
+            other => Err(format!("expected Completed(Pid), got {other:?}").into()),
         }
     }
 
@@ -527,10 +528,9 @@ mod tests {
         let mut p = Program::new("bad-cap-target");
         p.function("main", 0, |f| {
             let bad_cap = f.load_i32(99);
-            let sender = f.load_i32(0);
             let req_id = f.load_i32(1);
             let payload = f.load_i32(1);
-            let msg = f.make_msg(N_MAKE_MSG, sender, req_id, TAG_PING, payload);
+            let msg = f.hop(req_id, TAG_PING, payload);
             f.send(bad_cap, msg);
             f.return_(msg);
         });
@@ -595,7 +595,7 @@ mod tests {
         let client = rt.function_index("client").ok_or("client")?;
         let server_h = rt.spawn(server, &[])?;
         let server_cap = rt.mint_cap(server_h.id())?;
-        rt.spawn(client, &[Value::Cap(server_cap.as_u64())])?;
+        rt.spawn(client, &[Value::Cap(server_cap)])?;
         let outcome = server_h.join();
         rt.shutdown();
         assert!(
@@ -684,7 +684,7 @@ mod tests {
     #[test]
     fn forged_cap_cannot_be_registered() -> Result<(), Box<dyn std::error::Error>> {
         let rt = tiny(add_forty_two())?;
-        let err = rt.register_name("svc", crate::CapId(99_999));
+        let err = rt.register_name("svc", CapId::from_raw(99_999));
         rt.shutdown();
         assert_eq!(err, Err(crate::LifecycleError::InvalidCapability));
         Ok(())

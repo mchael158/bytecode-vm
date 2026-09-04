@@ -9,13 +9,13 @@ use super::process::Flow;
 use super::runtime::Shared;
 
 /// Run one scheduling quantum, using the shared JIT runtime when enabled.
-pub fn run_flow_quantum(flow: &mut Flow, shared: &Shared) -> VmResult {
+pub fn run_flow_quantum(flow: &mut Flow, shared: &Shared, budget: u32) -> VmResult {
     let Some(jit) = shared.jit.as_ref() else {
-        return flow.vm.run(shared.quantum);
+        return flow.vm.run(budget);
     };
     run_vm_with_jit_runtime(
         &mut flow.vm,
-        shared.quantum,
+        budget,
         jit,
         Some(&shared.metrics),
     )

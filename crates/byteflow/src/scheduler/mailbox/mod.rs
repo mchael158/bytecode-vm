@@ -610,11 +610,15 @@ mod tests {
         )))
     }
 
-    fn hop(sender: u64, request_id: u64, tag: u16, payload: u64) -> Value {
+    fn hop_payload_int(msg: &Message) -> i64 {
+        msg.payload.as_int().unwrap_or(0)
+    }
+
+    fn hop(sender: u64, request_id: u64, tag: u16, payload: impl Into<Value>) -> Value {
         Value::Message(Message::new(sender, request_id, tag, payload))
     }
 
-    fn msg(tag: u16, payload: u64) -> Value {
+    fn msg(tag: u16, payload: impl Into<Value>) -> Value {
         hop(1, 1, tag, payload)
     }
 
@@ -626,8 +630,8 @@ mod tests {
         )))
     }
 
-    fn hop_msg(value: &Value) -> Result<Message, Box<dyn std::error::Error>> {
-        value.as_message().ok_or("expected Message hop".into())
+    fn hop_msg(value: &Value) -> Result<&Message, Box<dyn std::error::Error>> {
+        value.as_message().ok_or_else(|| "expected Message hop".into())
     }
 
     #[test]
@@ -637,13 +641,13 @@ mod tests {
         mb.push(msg(1, 42))??;
         mb.push(msg(9, 2))??;
         let got = mb.try_pop_match(1)?.ok_or("match")?;
-        assert_eq!(hop_msg(&got)?.payload, 42);
+        assert_eq!(hop_payload_int(hop_msg(&got)?), 42);
         assert_eq!(
             hop_msg(&mb.try_pop()?.ok_or("first leftover")?)?.tag,
             9
         );
         assert_eq!(
-            hop_msg(&mb.try_pop()?.ok_or("second leftover")?)?.payload,
+            hop_payload_int(hop_msg(&mb.try_pop()?.ok_or("second leftover")?)?),
             2
         );
         Ok(())
@@ -670,7 +674,7 @@ mod tests {
             expect_sender: Some(10),
         };
         let got = mb.try_pop_filter(filter)?.ok_or("id=1")?;
-        assert_eq!(hop_msg(&got)?.payload, 42);
+        assert_eq!(hop_payload_int(hop_msg(&got)?), 42);
         let left = mb.try_pop()?.ok_or("leftover")?;
         assert_eq!(hop_msg(&left)?.request_id, 2);
         Ok(())
@@ -848,7 +852,7 @@ mod tests {
         assert!(mb.try_pop()?.is_some());
         let woken = mb.admit_waiting_sender()?.ok_or("admitted")?;
         drop(woken);
-        assert_eq!(hop_msg(&mb.try_pop()?.ok_or("second hop")?)?.payload, 2);
+        assert_eq!(hop_payload_int(hop_msg(&mb.try_pop()?.ok_or("second hop")?)?), 2);
         assert!(mb.admit_waiting_sender()?.is_none());
         Ok(())
     }

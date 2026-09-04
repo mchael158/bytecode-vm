@@ -61,8 +61,8 @@ impl fmt::Display for Instruction {
             }
             Opcode::Spawn => write!(
                 f,
-                "{} r{}, fn[{}], argc={}",
-                self.op, self.a, self.imm, self.b
+                "{} r{}, fn[{}], argc={}, rights={:#x}",
+                self.op, self.a, self.imm, self.b, self.c
             ),
             Opcode::Send => write!(f, "{} r{}, r{}", self.op, self.a, self.b),
             Opcode::ReceiveTimeout | Opcode::ReceiveMatch => {
@@ -83,6 +83,11 @@ impl fmt::Display for Instruction {
                 write!(f, "{} r{}, r{}", self.op, self.a, self.b)
             }
             Opcode::Demonitor | Opcode::Unlink => write!(f, "{} r{}", self.op, self.a),
+            | Opcode::Delegate => write!(
+                f,
+                "{} r{}, r{}, rights={:#x}, native=r{}",
+                self.op, self.a, self.b, self.imm as u32, self.c
+            ),
             Opcode::Trap => write!(f, "{} {}", self.op, self.imm),
         }
     }

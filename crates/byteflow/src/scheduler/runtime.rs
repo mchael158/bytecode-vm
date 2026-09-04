@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-use crate::bytecode::{Chunk, Value};
-use crate::vm::{NativeTable, Vm};
+use crate::bytecode::{Cap, CapRights, CapTarget, Chunk, NativeMask, Value};
+use crate::vm::{NativeGate, NativeTable, Vm};
 use crossbeam_deque::{Injector, Stealer, Worker as LocalDeque};
 
 use super::directory::Directory;
@@ -44,6 +44,14 @@ pub struct RuntimeConfig {
     /// Hard cap on concurrently live flows (`0` = unlimited).
     /// Checked on every host and bytecode `spawn`.
     pub max_flows: u32,
+    /// Constant-pool trust for [`crate::verify_with`] at runtime construction.
+    /// Default is [`crate::TrustLevel::Untrusted`] (fail closed).
+    pub trust: crate::bytecode::TrustLevel,
+    /// Where bytecode `print` (native index 0) writes when using
+    /// [`crate::std_native_table_with`]. Ignored if you supply your own table.
+    pub output: Arc<dyn crate::OutputSink>,
+    /// Per-flow CPU / memory / spawn-send rate budgets.
+    pub quota: super::quota::QuotaConfig,
     /// Trace JIT settings (`feature = "jit"`). Ignored when the feature is off.
     #[cfg(feature = "jit")]
     pub jit: JitConfig,
@@ -76,6 +84,9 @@ impl Default for RuntimeConfig {
             quantum: DEFAULT_QUANTUM,
             mailbox: MailboxConfig::DEFAULT,
             max_flows: 0,
+            trust: crate::bytecode::TrustLevel::Untrusted,
+            output: Arc::new(crate::output::NullSink),
+            quota: super::quota::QuotaConfig::default(),
             #[cfg(feature = "jit")]
             jit: JitConfig::default(),
         }
@@ -102,6 +113,8 @@ pub struct Shared {
     pub(crate) quantum: u32,
     pub(crate) mailbox: MailboxConfig,
     pub(crate) max_flows: u32,
+    pub(crate) quota: super::quota::QuotaConfig,
+    pub(crate) quotas: super::quota::QuotaTable,
     pub(crate) monitors: super::monitor::MonitorStore,
     pub(crate) links: super::link::LinkStore,
     pub(crate) registry: super::registry::RegistryStore,
@@ -129,6 +142,7 @@ pub struct Runtime {
     natives: Arc<NativeTable>,
     workers: Vec<JoinHandle<()>>,
     timer_thread: Option<JoinHandle<()>>,
+    trust: crate::bytecode::TrustLevel,
 }
 
 impl Runtime {
@@ -153,6 +167,19 @@ impl Runtime {
         Self::with_natives_and_config(chunk, NativeTable::empty(), config)
     }
 
+    /// Like [`Runtime::with_config`] but wires [`crate::std_native_table_with`]
+    /// using [`RuntimeConfig::output`] for the `print` native.
+    pub fn with_std_natives_and_config(
+        chunk: Chunk,
+        config: RuntimeConfig,
+    ) -> Result<Self, SpawnError> {
+        Self::with_natives_and_config(
+            chunk,
+            crate::std_native_table_with(Arc::clone(&config.output)),
+            config,
+        )
+    }
+
     /// Verify `chunk`, spawn the worker pool + timer thread, and return a
     /// live [`Runtime`].
     ///
@@ -165,7 +192,13 @@ impl Runtime {
         natives: Arc<NativeTable>,
         config: RuntimeConfig,
     ) -> Result<Self, SpawnError> {
-        crate::bytecode::verify(&chunk).map_err(|e| SpawnError::VerifyFailed(e.to_string()))?;
+        crate::bytecode::verify_with(
+            &chunk,
+            crate::bytecode::VerifyConfig {
+                trust: config.trust,
+            },
+        )
+        .map_err(SpawnError::VerifyFailed)?;
         let chunk = Arc::new(chunk);
         let workers_n = config.workers.max(1);
 
@@ -192,6 +225,8 @@ impl Runtime {
             quantum: config.quantum,
             mailbox: config.mailbox,
             max_flows: config.max_flows,
+            quota: config.quota,
+            quotas: super::quota::QuotaTable::new(),
             monitors: super::monitor::MonitorStore::new(),
             links: super::link::LinkStore::new(),
             registry: super::registry::RegistryStore::new(),
@@ -233,6 +268,7 @@ impl Runtime {
             natives,
             workers,
             timer_thread: Some(timer_thread),
+            trust: config.trust,
         })
     }
 
@@ -248,6 +284,8 @@ impl Runtime {
             function,
             args,
             RestartPolicy::Never,
+            None,
+            None,
             None,
         )
     }
@@ -349,11 +387,25 @@ impl Runtime {
     }
 
     /// Mint a SEND|ASK Cap for a live flow (host equivalent of `SelfPid`).
-    pub fn mint_cap(&self, flow: FlowId) -> Result<super::capability::CapId, super::error::LifecycleError> {
+    pub fn mint_cap(&self, flow: FlowId) -> Result<crate::bytecode::CapId, super::error::LifecycleError> {
         self.require_live(flow)?;
         self.shared
             .caps
-            .mint(flow, super::capability::CapRights::SEND_ASK)
+            .mint(flow, flow, super::capability::CapRights::ADDRESSING)
+            .map_err(|e| self.unavailable(e))
+    }
+
+    /// Mint a Cap held by `holder` targeting `target` (host introduction).
+    pub fn grant_cap(
+        &self,
+        holder: FlowId,
+        target: FlowId,
+    ) -> Result<crate::bytecode::CapId, super::error::LifecycleError> {
+        self.require_live(holder)?;
+        self.require_live(target)?;
+        self.shared
+            .caps
+            .mint(holder, target, super::capability::CapRights::ADDRESSING)
             .map_err(|e| self.unavailable(e))
     }
 
@@ -439,18 +491,22 @@ impl Runtime {
     pub fn register_name(
         &self,
         name: &str,
-        cap: super::capability::CapId,
+        cap: crate::bytecode::CapId,
     ) -> Result<(), super::error::LifecycleError> {
-        let entry = match self.shared.caps.resolve(cap) {
+        let entry = match self.shared.caps.lookup(cap) {
             Ok(Some(e)) => e,
             Ok(None) => return Err(super::error::LifecycleError::InvalidCapability),
             Err(e) => return Err(self.unavailable(e)),
         };
-        self.require_live(entry.flow)?;
+        let target = match entry.target() {
+            Some(id) => id,
+            None => return Err(super::error::LifecycleError::InvalidCapability),
+        };
+        self.require_live(target)?;
         match self.shared.registry.register(
             super::registry::RegistryName::from(name),
             cap,
-            entry.flow,
+            target,
         ) {
             Ok(inner) => inner,
             Err(e) => Err(self.unavailable(e)),
@@ -458,7 +514,7 @@ impl Runtime {
     }
 
     /// Look up a registered Cap, or `None` if the name is free / was swept.
-    pub fn whereis(&self, name: &str) -> Result<Option<super::capability::CapId>, super::error::LifecycleError> {
+    pub fn whereis(&self, name: &str) -> Result<Option<crate::bytecode::CapId>, super::error::LifecycleError> {
         self.shared
             .registry
             .whereis(name)
@@ -473,6 +529,66 @@ impl Runtime {
         Ok(())
     }
 
+    /// Mint a scheduler ADMIN cap for a live flow (host introduction).
+    pub fn mint_admin_cap(
+        &self,
+        holder: FlowId,
+    ) -> Result<crate::bytecode::CapId, super::error::LifecycleError> {
+        self.require_live(holder)?;
+        let cap = crate::bytecode::Cap::root(
+            crate::bytecode::CapTarget::Scheduler,
+            CapRights::ADMIN,
+            None,
+            self.shared.caps.scheduler_cell().as_ref(),
+        );
+        self.shared
+            .caps
+            .grant(holder, cap)
+            .map_err(|e| self.unavailable(e))
+    }
+
+    /// Kill `target` only if `holder` presents a live ADMIN scheduler cap.
+    pub fn admin_kill(
+        &self,
+        holder: FlowId,
+        cap: crate::bytecode::CapId,
+        target: FlowId,
+    ) -> Result<(), super::error::LifecycleError> {
+        self.require_admin(holder, cap)?;
+        self.kill(target)
+    }
+
+    /// Top up `target`'s CPU budget. Requires a live ADMIN scheduler cap.
+    pub fn admin_top_up_cpu(
+        &self,
+        holder: FlowId,
+        cap: crate::bytecode::CapId,
+        target: FlowId,
+        extra: i64,
+    ) -> Result<(), super::error::LifecycleError> {
+        self.require_admin(holder, cap)?;
+        let quota = match self.shared.quotas.get(target) {
+            Ok(Some(q)) => q,
+            Ok(None) => return Err(super::error::LifecycleError::NoSuchFlow(target)),
+            Err(e) => return Err(self.unavailable(e)),
+        };
+        quota.top_up_cpu(extra);
+        Ok(())
+    }
+
+    fn require_admin(
+        &self,
+        holder: FlowId,
+        cap: crate::bytecode::CapId,
+    ) -> Result<(), super::error::LifecycleError> {
+        let entry = match self.shared.caps.resolve(cap, holder, CapRights::ADMIN) {
+            Ok(e) => e,
+            Err(_) => return Err(super::error::LifecycleError::InvalidCapability),
+        };
+        super::link_admin::check_admin(&entry.cap, self.shared.caps.scheduler_cell().as_ref())
+            .map_err(|_| super::error::LifecycleError::InvalidCapability)
+    }
+
     /// Remove a name without waiting for the flow to exit. `false` if unknown.
     pub fn unregister_name(&self, name: &str) -> Result<bool, super::error::LifecycleError> {
         self.shared
@@ -485,7 +601,13 @@ impl Runtime {
     /// drop JIT traces. Live flows and bytecode `Spawn` keep the parent's
     /// existing `Vm` chunk.
     pub fn reload_chunk(&mut self, chunk: Chunk) -> Result<(), SpawnError> {
-        crate::bytecode::verify(&chunk).map_err(|e| SpawnError::VerifyFailed(e.to_string()))?;
+        crate::bytecode::verify_with(
+            &chunk,
+            crate::bytecode::VerifyConfig {
+                trust: self.trust,
+            },
+        )
+        .map_err(SpawnError::VerifyFailed)?;
         let chunk = Arc::new(chunk);
         self.chunk = chunk.clone();
         #[cfg(feature = "jit")]
@@ -495,6 +617,18 @@ impl Runtime {
         Ok(())
     }
 
+    /// Signal workers and the timer to stop. Does **not** join threads —
+    /// use [`Self::shutdown`] for a deterministic join. [`Drop`] only signals.
+    fn request_shutdown(&self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.shared.timer.shutdown();
+        let (lock, cvar) = &self.shared.notify;
+        match super::sync_lock::lock(lock, "Runtime::request_shutdown") {
+            Ok(_g) => cvar.notify_all(),
+            Err(e) => super::error::report_fault(e),
+        }
+    }
+
     /// Stop accepting new scheduling work and join every worker + the timer
     /// thread. Processes that are mid-quantum are allowed to reach their
     /// next natural suspension point; this does **not** forcibly abort
@@ -502,20 +636,20 @@ impl Runtime {
     /// mid-instruction — see design notes §11 on why preemption here is
     /// cooperative/budgeted rather than signal-based).
     pub fn shutdown(mut self) {
-        self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.timer.shutdown();
-        {
-            let (lock, cvar) = &self.shared.notify;
-            match super::sync_lock::lock(lock, "Runtime::shutdown") {
-                Ok(_g) => cvar.notify_all(),
-                Err(e) => super::error::report_fault(e),
-            }
-        }
+        self.request_shutdown();
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
         if let Some(t) = self.timer_thread.take() {
             let _ = t.join();
+        }
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if !self.shared.shutdown.load(Ordering::Acquire) {
+            self.request_shutdown();
         }
     }
 }
@@ -558,6 +692,15 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
+/// Context for a bytecode `Spawn`: parent self-authority is attenuated into
+/// the child. Host spawn passes `None` and mints a trusted root instead.
+pub(crate) struct BytecodeSpawn<'a> {
+    pub authority: &'a Cap,
+    pub cell: &'a crate::bytecode::RevocationCell,
+    pub quota: &'a super::quota::FlowQuota,
+    pub requested_rights: CapRights,
+}
+
 /// Shared machinery behind `Runtime::spawn` and `RuntimeSpawner::spawn`
 /// (and, transitively, `Supervisor`): build a fresh `Flow` (VM +
 /// mailbox + completion channel), register it in the directory, and push
@@ -574,6 +717,8 @@ pub(crate) fn spawn_on(
     args: &[Value],
     restart_policy: RestartPolicy,
     supervisor: Option<SupervisorLink>,
+    parent: Option<FlowId>,
+    bytecode: Option<BytecodeSpawn<'_>>,
 ) -> Result<FlowHandle, SpawnError> {
     if shared.max_flows > 0 {
         let current = shared.directory.len();
@@ -585,21 +730,81 @@ pub(crate) fn spawn_on(
         }
     }
     let id = super::process::next_flow_id();
-    let vm = Vm::new(chunk.clone(), natives.clone(), function, args)?;
+    let cell = shared
+        .caps
+        .bind_flow(id)
+        .map_err(|_| SpawnError::Unavailable)?;
+    let authority = match bytecode {
+        None => Cap::root(
+            CapTarget::Flow(id.as_u64()),
+            CapRights::ROOT,
+            Some(NativeMask::full(natives.len())),
+            cell.as_ref(),
+        ),
+        Some(ctx) => super::spawn::exec_spawn_authority(
+            ctx.authority,
+            ctx.cell,
+            ctx.quota,
+            id.as_u64(),
+            ctx.requested_rights,
+            None,
+            cell.as_ref(),
+        )
+        .map_err(|e| SpawnError::SpawnDenied(e.to_string()))?,
+    };
+    let args = grant_caps_in_args(shared, parent, id, args)?;
+    let gate = NativeGate::from_authority(
+        &authority,
+        Arc::clone(&cell),
+        shared.caps.native_cell(),
+        natives.len(),
+    );
+    let vm = Vm::with_native_gate(chunk.clone(), natives.clone(), gate, function, args.as_slice())?;
     let mailbox = Arc::new(Mailbox::with_config(shared.mailbox));
     if let Err(e) = shared.directory.register(id, mailbox.clone()) {
         super::error::report_fault(e);
-        return Err(SpawnError::VmInit(
-            "directory register failed (poisoned lock)".into(),
-        ));
+        return Err(SpawnError::Unavailable);
+    }
+    let quota = Arc::new(super::quota::FlowQuota::from_config(shared.quota));
+    if let Err(e) = shared.quotas.insert(id, Arc::clone(&quota)) {
+        super::error::report_fault(e);
+        return Err(SpawnError::Unavailable);
     }
     let (tx, rx) = super::oneshot::channel();
     let mut flow = Box::new(Flow::new(id, vm, mailbox, restart_policy, tx));
+    flow.authority = authority;
+    flow.cell = cell;
+    flow.quota = quota;
     flow.supervisor = supervisor;
     RuntimeMetrics::inc(&shared.metrics.processes_spawned);
     shared.injector.push(flow);
     wake_workers(shared);
     Ok(FlowHandle { id, receiver: rx })
+}
+
+fn grant_caps_in_args(
+    shared: &Shared,
+    parent: Option<FlowId>,
+    child: FlowId,
+    args: &[Value],
+) -> Result<Vec<Value>, SpawnError> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            Value::Cap(id) => {
+                let granted = match parent {
+                    None => shared.caps.reissue_for(*id, child),
+                    Some(p) => shared.caps.delegate(*id, p, child),
+                };
+                match granted {
+                    Ok(cap) => out.push(Value::Cap(cap)),
+                    Err(_) => return Err(SpawnError::InvalidCapability),
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn wake_workers(shared: &Shared) {
@@ -637,6 +842,8 @@ impl RuntimeSpawner {
             args,
             restart_policy,
             None,
+            None,
+            None,
         )
     }
 
@@ -655,6 +862,8 @@ impl RuntimeSpawner {
             args,
             restart_policy,
             Some(supervisor),
+            None,
+            None,
         )
     }
 

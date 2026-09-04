@@ -152,7 +152,7 @@
 //!
 //! - Not a replacement for Tokio / async Rust (no `.await` IO loop)
 //! - Not a distributed cluster runtime (single process, in-memory mailboxes)
-//! - Not a full object-capability OS (native quotas / Cap attenuation come later)
+//! - Not a full object-capability OS (no distributed revocation / Cap persistence)
 //!
 //! Host owns I/O and policy. Byteflow owns cheap concurrency and hop delivery.
 #![deny(unsafe_code)]
@@ -161,6 +161,7 @@
 pub mod bytecode;
 pub mod log;
 pub mod natives;
+pub mod output;
 pub mod samples;
 pub mod scheduler;
 pub mod vm;
@@ -205,25 +206,30 @@ pub mod docs {
 }
 
 pub use bytecode::{
-    asm_macros, decode, disassemble, encode, verify, Chunk, Fn, FormatError, FuncId, FunctionDef,
-    Instruction, Label, Message, Opcode, Program, Reg, RegWindow, Value, VerifyError, ABI_VERSION,
-    MAGIC, TAG_SYS_DOWN, TAG_SYS_EXIT,
+    asm_macros, decode, decode_with, disassemble, encode, verify, verify_with, Cap, CapId,
+    CapIdError, CapRights, CapTarget, Chunk, Fn, ConstantKind, FormatError, FuncId, FunctionDef,
+    Instruction, Label, Message, NativeIdx, NativeMask, Opcode, Program, Reg, RegWindow,
+    RevocationCell, TrustLevel, Value, VerifyConfig, VerifyError, ABI_VERSION, MAGIC,
+    TAG_SYS_DOWN, TAG_SYS_EXIT,
 };
-pub use natives::{std_native, std_native_map, std_native_table, std_natives};
+pub use output::{NullSink, OutputSink, StdoutSink};
+pub use natives::{std_native, std_native_map, std_native_table, std_native_table_with, std_natives};
 pub use scheduler::{
-    fault_count, next_flow_id, flow_id_from_u64, report_fault, CapId, CapRights, ChildSpec,
-    Delivery, DownEvent, FlowExitReason, LifecycleError, LinkId, Mailbox, MailboxBytes,
+    fault_count, next_flow_id, flow_id_from_u64, report_fault, CapError, Capability,
+    ChildSpec, Delivery, DownEvent, FlowExitReason, FlowQuota, LifecycleError, LinkId, Mailbox, MailboxBytes,
     MailboxCapacity, MailboxConfig, MailboxFull, MailboxFullReason, MailboxStats,
-    MonitorRef, OverflowPolicy, RegistryName, WaitEpoch, Flow, FlowHandle, FlowId,
+    MonitorRef, OverflowPolicy, QuotaConfig, QuotaError, RegistryName, WaitEpoch, Flow, FlowHandle, FlowId,
     FlowMetrics, FlowOutcome, RestartPolicy, RestartStrategy, Runtime, RuntimeConfig,
     RuntimeError, RuntimeMetrics, RuntimeMetricsSnapshot, RuntimeSpawner, SendError,
-    SpawnError, Supervisor, SupervisorConfig, DEFAULT_QUANTUM,
+    SpawnError, Supervisor, SupervisorConfig, DEFAULT_QUANTUM, check_admin, check_link,
+    check_monitor, exec_delegate, AdminError, DelegateError, LinkError,
 };
 #[cfg(feature = "jit")]
 pub use scheduler::JitConfig;
 pub use vm::{
-    expect_arg, expect_bool, expect_int, expect_message, expect_u64, Fault, NativeFn,
-    NativeResult, NativeTable, NativeTableBuilder, NativeTableError, Vm, VmResult, MAX_CALL_DEPTH,
+    expect_arg, expect_bool, expect_int, expect_message, expect_u64, check_native_call,
+    Fault, NativeCallError, NativeFn, NativeGate, NativeResult, NativeTable, NativeTableBuilder,
+    NativeTableError, Vm, VmResult, MAX_CALL_DEPTH,
 };
 
 #[cfg(feature = "jit")]

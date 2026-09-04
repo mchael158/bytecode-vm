@@ -12,7 +12,8 @@ pub const MAGIC: [u8; 4] = *b"BFV0";
 /// v2: [`Value::Message`] wire tag `5`.
 /// v3: `Message.reply_cap`; [`Value::Cap`] wire tag `6` (FlowCap).
 /// v4: [`Value::Str`] tag `7`, [`Value::Bytes`] tag `8`.
-pub const ABI_VERSION: u32 = 4;
+/// v5: CapId is 128-bit; `Message.payload` is a nested [`Value`].
+pub const ABI_VERSION: u32 = 5;
 
 /// A callable entry point inside a [`Chunk`]: either bytecode-defined or a
 /// slot reserved for a native (Rust) function registered with the runtime

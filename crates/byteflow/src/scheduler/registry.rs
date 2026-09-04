@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use super::capability::CapId;
+use crate::bytecode::CapId;
 use super::error::{LifecycleError, RuntimeError};
 use super::process::FlowId;
 use super::sync_lock;
@@ -148,14 +148,14 @@ impl Default for RegistryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::capability::CapId;
+    use crate::bytecode::CapId;
     use crate::scheduler::process::next_flow_id;
 
     #[test]
     fn unregister_flow_clears_names() {
         let mut reg = Registry::new();
         let flow = next_flow_id();
-        let cap = CapId(42);
+        let cap = CapId::from_raw(42);
         assert!(reg.register(RegistryName::from("svc"), cap, flow).is_ok());
         assert_eq!(reg.whereis("svc"), Some(cap));
         reg.unregister_flow(flow);
@@ -167,10 +167,10 @@ mod tests {
         let mut reg = Registry::new();
         let flow = next_flow_id();
         assert!(reg
-            .register(RegistryName::from("svc"), CapId(1), flow)
+            .register(RegistryName::from("svc"), CapId::from_raw(1), flow)
             .is_ok());
         assert_eq!(
-            reg.register(RegistryName::from("svc"), CapId(2), flow),
+            reg.register(RegistryName::from("svc"), CapId::from_raw(2), flow),
             Err(LifecycleError::AlreadyRegistered)
         );
     }
@@ -180,7 +180,7 @@ mod tests {
         let mut reg = Registry::new();
         let flow = next_flow_id();
         assert_eq!(
-            reg.register(RegistryName::from(""), CapId(1), flow),
+            reg.register(RegistryName::from(""), CapId::from_raw(1), flow),
             Err(LifecycleError::EmptyName)
         );
     }

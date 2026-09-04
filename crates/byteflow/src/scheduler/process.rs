@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::bytecode::{Cap, CapRights, CapTarget, RevocationCell};
 use crate::vm::Vm;
 
 use super::mailbox::Mailbox;
@@ -81,6 +82,10 @@ pub struct Flow {
     /// Continuation after a `WAITING_SEND` park is admitted.
     pub(crate) pending_send: Option<PendingSend>,
     pub(crate) supervisor: Option<super::supervisor::SupervisorLink>,
+    /// Self-authority (rights + native mask). Derived only via [`Cap::attenuate`].
+    pub(crate) authority: Cap,
+    pub(crate) cell: Arc<RevocationCell>,
+    pub(crate) quota: Arc<super::quota::FlowQuota>,
 }
 
 /// What the worker should do after a parked sender's hop is admitted.
@@ -111,6 +116,13 @@ impl Flow {
         restart_policy: RestartPolicy,
         completion: oneshot::Sender<FlowOutcome>,
     ) -> Self {
+        let cell = Arc::new(RevocationCell::new());
+        let authority = Cap::root(
+            CapTarget::Flow(id.as_u64()),
+            CapRights::NONE,
+            None,
+            cell.as_ref(),
+        );
         Self {
             id,
             vm,
@@ -122,6 +134,11 @@ impl Flow {
             last_receive_dest: None,
             pending_send: None,
             supervisor: None,
+            authority,
+            cell,
+            quota: Arc::new(super::quota::FlowQuota::from_config(
+                super::quota::QuotaConfig::default(),
+            )),
         }
     }
 

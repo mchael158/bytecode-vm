@@ -106,7 +106,35 @@ impl ChunkBuilder {
     }
 
     pub fn emit_spawn(&mut self, dst: u8, function: u32, argc: u8) {
-        self.emit(Instruction::new(Opcode::Spawn, dst, argc, 0, function as i32));
+        self.emit_spawn_with_rights(dst, function, argc, crate::bytecode::CapRights::FLOW);
+    }
+
+    /// Bytecode spawn with an explicit rights request (`instr.c`). `NONE` is
+    /// confined: the child inherits no power until a later `Delegate`.
+    pub fn emit_spawn_with_rights(
+        &mut self,
+        dst: u8,
+        function: u32,
+        argc: u8,
+        rights: crate::bytecode::CapRights,
+    ) {
+        self.emit(Instruction::new(
+            Opcode::Spawn,
+            dst,
+            argc,
+            rights.bits_u8(),
+            function as i32,
+        ));
+    }
+
+    pub fn emit_delegate(&mut self, dst: u8, src_cap: u8, rights: crate::bytecode::CapRights) {
+        self.emit(Instruction::new(
+            Opcode::Delegate,
+            dst,
+            src_cap,
+            255,
+            rights.bits() as i32,
+        ));
     }
 
     pub fn emit_yield(&mut self) {

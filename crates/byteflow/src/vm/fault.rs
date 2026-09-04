@@ -10,7 +10,7 @@ use std::fmt;
 /// let alone the whole runtime. A `Fault` instead becomes
 /// [`crate::FlowOutcome::Failed`] and is handed to the Flow's supervisor, which
 /// decides whether to restart it (design notes §15-16).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Fault {
     DivideByZero,
     RegisterOutOfRange { reg: u8, frame_size: u8 },
@@ -42,7 +42,11 @@ pub enum Fault {
     /// A native function returned an error (host-side failure — I/O,
     /// invalid argument the Rust side rejected, capability denied, etc).
     /// The message is native-function-defined.
+    /// Host-side native refused the call (FFI error string).
     NativeError(String),
+    /// S7: CALL_NATIVE failed the allowlist / NATIVE-right / revocation check
+    /// before the function pointer was touched.
+    NativeDenied(String),
     /// Explicit `Trap` opcode, e.g. an assertion emitted by a compiler.
     Explicit(i32),
     /// Broken VM invariant (e.g. empty frame stack while running). Category D
@@ -76,6 +80,7 @@ impl fmt::Display for Fault {
                 write!(f, "native function index {index} out of range (table size {table_size})")
             }
             Fault::NativeError(msg) => write!(f, "native function error: {msg}"),
+            Fault::NativeDenied(msg) => write!(f, "{msg}"),
             Fault::Explicit(code) => write!(f, "explicit trap (code {code})"),
             Fault::Invariant(msg) => write!(f, "vm invariant broken: {msg}"),
         }

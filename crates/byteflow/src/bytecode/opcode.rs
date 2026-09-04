@@ -137,6 +137,13 @@ pub enum Opcode {
     /// Encoding: `a=dest`, `b=cap`, `c=msg`, `imm=millis_reg`.
     /// Append-only ABI slot (`0x5A`); `Trap` stays `0x60`.
     AskTimeout = 0x5A,
+    /// `Delegate ra, rb, rights, rc?` → write an attenuated Cap into `r[a]`.
+    ///
+    /// `r[b]` is the source Cap; `imm` is the requested rights mask;
+    /// `c = 255` means no extra native-mask narrowing. The scheduler
+    /// calls `Cap::attenuate` — the only derivation path.
+    /// Append-only ABI slot (`0x5B`); `Trap` stays `0x60`.
+    Delegate = 0x5B,
 
     // ---- diagnostics / safety ------------------------------------------
     /// `Trap imm` → deliberate fault (assertion failure, div-by-zero, bad
@@ -190,6 +197,7 @@ impl Opcode {
             0x58 => Link,
             0x59 => Unlink,
             0x5A => AskTimeout,
+            0x5B => Delegate,
             0x60 => Trap,
             0x61 => Nop,
             _ => return None,
@@ -239,6 +247,7 @@ impl std::fmt::Display for Opcode {
             Opcode::Link => "Link",
             Opcode::Unlink => "Unlink",
             Opcode::AskTimeout => "AskTimeout",
+            Opcode::Delegate => "Delegate",
             Opcode::Trap => "Trap",
             Opcode::Nop => "Nop",
         };

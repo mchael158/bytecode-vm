@@ -679,6 +679,7 @@ fn is_effect_opcode(op: Opcode) -> bool {
             | Opcode::Demonitor
             | Opcode::Link
             | Opcode::Unlink
+            | Opcode::Delegate
             | Opcode::Trap
             | Opcode::Halt
     )
