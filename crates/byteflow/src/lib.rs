@@ -18,8 +18,10 @@
 //! | [`FlowHandle`] | Collect an outcome: blocking [`FlowHandle::join`] or a bounded form |
 //! | [`Value::Message`] | **Atomic Hop** envelope — the only value allowed on `Send` / `Ask` |
 //! | [`Value::Cap`] | **FlowCap** address for bytecode delivery (`Send` / `Ask` targets) |
+//! | [`Cap`] / [`CapRights`] / [`NativeMask`] | Holder + rights; [`Cap::attenuate`] is the only grant path |
+//! | [`QuotaConfig`] / [`FlowQuota`] | Per-flow CPU / heap / spawn-send budgets |
 //! | [`Supervisor`] | OTP strategies (`OneForOne` / `OneForAll` / `RestForOne`) |
-//! | [`std_native_table`] | `print`, `now_ms`, `make_msg`, `msg_*`, `msg_reply_cap` |
+//! | [`std_native_table`] | `print`, `now_ms`, `make_msg` (3-arg), `msg_*`, `msg_reply_cap` |
 //!
 //! # Atomic Hop (messaging contract)
 //!
@@ -46,12 +48,18 @@
 //!
 //! Host [`Runtime::send`] still takes [`FlowId`] (trusted embedder path).
 //!
-//! # Values (ABI v4)
+//! Caps resolve only for the **holder** with sufficient rights. Derive a
+//! weaker grant with [`Fn::delegate`] / [`Cap::attenuate`] — never by
+//! copying a `CapId`. Host spawn is `ROOT`; bytecode [`Fn::spawn_confined`]
+//! starts at `NONE`.
+//!
+//! # Values (ABI v5)
 //!
 //! `Unit | Bool | Int | Float | Pid | Message | Cap | Str | Bytes`
 //!
-//! `Str` / `Bytes` are `Arc`-backed for cheap register/mailbox clones. They
-//! are **not** Atomic Hops by themselves.
+//! `CapId` is a 128-bit CSPRNG token. `Message.payload` is a nested
+//! [`Value`]. `Str` / `Bytes` are `Arc`-backed for cheap register/mailbox
+//! clones. They are **not** Atomic Hops by themselves.
 //!
 //! # Quick start — scalar
 //!
@@ -144,7 +152,7 @@
 //! - [`docs::beam_mapping`] — BEAM / OTP mental model → Byteflow equivalents
 //! - [`docs::lifecycle`] — monitors, links, registry, `WAITING_SEND`
 //! - [`docs::mailbox`] — bounded inbox, overflow, lost-wakeup
-//! - [`docs::security`] — threat model, invariants S1–S7, roadmap
+//! - [`docs::security`] — threat model, invariants S1–S7, Phase 3 (0.9.2)
 //! - [`docs::error_model`] — fail-closed errors (no `unwrap`), bounded joins
 //! - [`docs::vm_safety`] — trust boundary: `verify` vs per-step `Fault`
 //!

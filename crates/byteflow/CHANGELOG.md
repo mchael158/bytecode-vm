@@ -2,6 +2,47 @@
 
 All notable changes to **byteflow-actors** are documented here.
 
+## [0.9.2] — 2026-09-04
+
+Security Phase 3: attenuation is the only grant path, natives and lifecycle
+rights are gated, and each flow carries fail-closed quotas.
+
+### Added
+
+- [`Cap::attenuate`] — sole grant-derivation path (AND of rights and
+  [`NativeMask`]). Bytecode [`Opcode::Delegate`] (`0x5B`; `Trap` stays `0x60`)
+  and confined spawn both go through it.
+- [`NativeGate`] + [`check_native_call`] — `CALL_NATIVE` is denied unless the
+  flow holds `NATIVE` and the index bit in its mask. Host `Runtime::spawn`
+  still mints a full mask; bytecode spawn attenuates.
+- [`QuotaConfig`] / [`FlowQuota`] — per-flow CPU budget (distinct from the
+  scheduler quantum), heap charge, and spawn/send token buckets. Defaults stay
+  generous; tighten via [`RuntimeConfig::quota`].
+- `LINK` / `MONITOR` / `ADMIN` rights: addressing Caps carry `LINK|MONITOR`;
+  [`Runtime::admin_kill`] / [`Runtime::admin_top_up_cpu`] require a scheduler
+  ADMIN Cap. No ADMIN opcode in the ISA.
+- [`Fn::spawn_confined`] — child rights `NONE` unless the parent delegates.
+- `make_msg` is 3-arg (`request_id`, `tag`, `payload`); `sender = 0` until
+  `Send` / `Ask` stamp. Legacy 4-arg encoding discards the first operand.
+
+### Changed
+
+- `RECEIVE` requires `CapRights::RECV`.
+- SEND/ASK charge `FlowQuota` (`alloc` on enqueue, `free` on deliver).
+- Interpreter and JIT honor the remaining CPU budget as the slice length.
+
+[`Cap::attenuate`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.Cap.html
+[`NativeMask`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.NativeMask.html
+[`NativeGate`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.NativeGate.html
+[`check_native_call`]: https://docs.rs/byteflow-actors/latest/byteflow/fn.check_native_call.html
+[`QuotaConfig`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.QuotaConfig.html
+[`FlowQuota`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.FlowQuota.html
+[`RuntimeConfig::quota`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.RuntimeConfig.html
+[`Opcode::Delegate`]: https://docs.rs/byteflow-actors/latest/byteflow/enum.Opcode.html
+[`Fn::spawn_confined`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.Fn.html
+[`Runtime::admin_kill`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.Runtime.html
+[`Runtime::admin_top_up_cpu`]: https://docs.rs/byteflow-actors/latest/byteflow/struct.Runtime.html
+
 ## [0.9.0] — 2026-09-02
 
 ### Breaking
@@ -28,10 +69,6 @@ All notable changes to **byteflow-actors** are documented here.
 - [`Runtime::with_std_natives_and_config`] — std natives + configurable print sink.
 - [`Runtime::grant_cap`] — host mints a cap for one flow to address another.
 - Integration tests in `tests/security_caps.rs`.
-- **Phase 3:** [`Cap::attenuate`] is the sole grant-derivation path.
-  [`NativeMask`] + `CALL_NATIVE` gate (S7), [`FlowQuota`], `Opcode::Delegate`,
-  confined spawn (`rights = NONE` unless requested), `LINK`/`MONITOR`/`ADMIN`
-  rights, `make_msg` ignores any sender operand.
 
 ### Changed
 

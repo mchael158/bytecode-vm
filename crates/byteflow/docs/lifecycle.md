@@ -14,15 +14,18 @@ the join string. A linked kill therefore reports `Link` on `DOWN`, not
 | Type | Role |
 |------|------|
 | [`FlowId`](../src/scheduler/process.rs) | Identity. Never reused. Host `monitor` / `link` take this. |
-| [`CapId`](../src/scheduler/capability.rs) | Address. Revoked when the **target** exits. Bytecode uses Caps. |
+| [`CapId`](../src/bytecode/cap.rs) | Address. 128-bit CSPRNG token. Bytecode uses Caps. |
 
-There is no generation on Caps: a dead target's Caps stop resolving
-(`CapTable::revoke_target`). A guessed CapId never grants Send/Ask.
+There is no generation on Caps: a dead flow's Caps stop resolving
+([`CapTable::revoke_flow`](../src/scheduler/capability.rs) bumps the epoch
+and sweeps every entry **held by or targeting** that flow). A guessed
+`CapId` never grants Send/Ask. `LINK` / `MONITOR` require those bits on
+the addressing Cap; `ADMIN` is a scheduler Cap, never a default spawn grant.
 
 ## Monitors (`A ──monitor──> B`)
 
 `Runtime::monitor(owner, target)` or bytecode `Fn::monitor(cap)` creates a
-[`MonitorRef`]. When `target` exits, `owner` receives an Atomic Hop:
+[`MonitorRef`](crate::MonitorRef). When `target` exits, `owner` receives an Atomic Hop:
 
 ```text
 tag        = TAG_SYS_DOWN (0xFF01)
@@ -81,3 +84,9 @@ restart, not the sibling kills.
 [`RuntimeConfig::max_flows`](../src/scheduler/runtime.rs) (`0` = unlimited)
 is checked on every host and bytecode `spawn`. Over the cap →
 `SpawnError::FlowLimit`.
+
+Each flow also carries a [`FlowQuota`](../src/scheduler/quota.rs) from
+[`RuntimeConfig::quota`](../src/scheduler/runtime.rs): remaining CPU
+(distinct from the scheduler *quantum*), heap charge, and spawn/send token
+buckets. Exhaustion fails closed (`QuotaError`). An ADMIN Cap can
+[`Runtime::admin_top_up_cpu`](../src/scheduler/runtime.rs).

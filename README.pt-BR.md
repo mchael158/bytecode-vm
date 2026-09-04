@@ -5,11 +5,11 @@
 
 [English](README.md) · [Português (Brasil)](README.pt-BR.md)
 
-Concorrência embutível em Rust: bytecode com **`Program`** / **`Fn`**, **flows**, mailboxes, **Atomic Hop** (`Value::Message` só no `Send`) e supervisor — **uma única crate**.
+Concorrência embutível em Rust: bytecode com **`Program`** / **`Fn`**, **flows**, mailboxes, **Atomic Hop** (`Value::Message` só no `Send`), FlowCap (ABI v5) com atenuação e quotas por flow, e supervisor — **uma única crate**.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.8"
+byteflow-actors = "0.9.2"
 ```
 
 ```rust
@@ -29,6 +29,8 @@ Atomic Hop (`Value::Message`): `cargo run -p byteflow-actors --example atomic_ac
 
 **Guias de design** (todo exemplo é um doctest, então não podem divergir da API):
 [atomic-hop](crates/byteflow/docs/atomic-hop.md) ·
+[beam-mapping](crates/byteflow/docs/beam-mapping.md) ·
+[lifecycle](crates/byteflow/docs/lifecycle.md) ·
 [mailbox](crates/byteflow/docs/mailbox.md) ·
 [vm-safety](crates/byteflow/docs/vm-safety.md) ·
 [error-model](crates/byteflow/docs/error-model.md) ·

@@ -29,7 +29,7 @@ It is **not** a Tokio replacement, not a distributed cluster, and not a JVM.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.8"
+byteflow-actors = "0.9.2"
 ```
 
 ```rust
@@ -116,7 +116,7 @@ joiner with a failure rather than leaving it parked forever — see
 
 ### Std natives (`print`, `now_ms`, `make_msg`, …)
 
-Stable indices: **`print = 0`**, **`now_ms = 1`**, **`make_msg = 2`**, **`msg_*` = 3–6**, **`msg_reply_cap = 7`**.
+Stable indices: **`print = 0`**, **`now_ms = 1`**, **`make_msg = 2`** (3-arg: request_id, tag, payload; sender stamped on `Send`/`Ask`), **`msg_*` = 3–6**, **`msg_reply_cap = 7`**.
 
 ```rust
 use byteflow::{std_native_table, Program, Runtime};
@@ -162,15 +162,15 @@ Hop-heavy code uses helpers such as `make_msg`, `native1_from`, `send`, `receive
 | Layer | Responsibility |
 |---|---|
 | **Bytecode** | ISA, `Program` / `Fn`, BFV0 (`.bf`) encode/decode, static `verify` |
-| **VM** | One flow: registers, call stack, cooperative quantum, `CallNative` |
-| **Scheduler** | M:N workers, **bounded** FIFO mailboxes (park/wake), timer, supervisor |
+| **VM** | One flow: registers, call stack, cooperative slice (`min(quantum, CPU quota)`), `CallNative` (gated) |
+| **Scheduler** | M:N workers, **bounded** FIFO mailboxes (park/wake), CapTable, quotas, timer, supervisor |
 | **JIT** (feature `jit`) | Trace JIT for hot loops via Cranelift |
 | **Facade** | Public API + std natives + samples + `byteflow` CLI |
 
 **Flow lifecycle (sketch):**
 
-1. Worker runs at most `quantum` instructions (default 10 000).  
-2. `Yield` / budget → run queue (stealable).  
+1. Worker runs at most `min(quantum, remaining CPU quota)` instructions (default quantum 10 000).  
+2. `Yield` / budget → run queue (stealable). CPU quota exhaustion fails the flow (`QuotaError`).  
 3. `Sleep` → timer thread → injector.  
 4. Empty `Receive` → flow parks **inside its mailbox**; the next Atomic Hop wakes under the same lock (no lost wakeup).  
 5. `Fault` / `Trap` → `FlowOutcome::Failed` → supervisor (`Always` / `OnFailure` / `Never`; default intensity 3 / 5s).
@@ -212,14 +212,17 @@ byteflow run    <file.bf> [function]
 - Blocking APIs are bounded by choice: `try_join` / `join_timeout` / `join_deadline`, and an abandoned flow wakes its joiner instead of hanging it.
 - Values today: `Unit | Bool | Int | Float | Pid | Message | Cap | Str | Bytes`.
 - **Atomic Hop:** only `Value::Message` may cross `Send`.
-- **FlowCap:** bytecode `Send`/`Ask` targets are `Value::Cap`; replies use `msg_reply_cap`.
-- **Security:** authenticated hop sender + FlowCap — see [`docs/security.md`](docs/security.md).
+- **FlowCap (ABI v5):** 128-bit CSPRNG `CapId`; holder + rights resolution; [`Cap::attenuate`](https://docs.rs/byteflow-actors/latest/byteflow/struct.Cap.html) is the only grant path (`Fn::delegate`, confined spawn).
+- **Natives (S7):** `CALL_NATIVE` is gated by `CapRights::NATIVE` + [`NativeMask`](https://docs.rs/byteflow-actors/latest/byteflow/struct.NativeMask.html) before the table is indexed.
+- **Quotas:** per-flow CPU / heap / spawn-send buckets via [`QuotaConfig`](https://docs.rs/byteflow-actors/latest/byteflow/struct.QuotaConfig.html) (`RuntimeConfig::quota`). Distinct from the scheduler quantum.
+- **`make_msg`:** 3-arg (`request_id`, `tag`, `payload`); `sender` is stamped only on `Send` / `Ask`.
+- **Security:** authenticated hop sender + FlowCap + Phase 3 gates — see [`docs/security.md`](docs/security.md).
 
 ---
 
-## Status (v0.8.1)
+## Status (v0.9.2)
 
-**Included:** register ISA + `Program`/`Fn` assembler, BFV0 (ABI v4 / `Message` + `Cap` + `Str`/`Bytes`), verifier, per-flow VM, M:N scheduler, **bounded mailboxes** (`MailboxConfig`: 256 hops + 4 MiB / Reject by default), Atomic Hop, FlowCap, monitors / links / registry, `WAITING_SEND`, `AskTimeout`, `RuntimeConfig.max_flows`, OTP supervisor strategies, std natives, CLI, examples, fail-closed error model, optional trace JIT (`feature = "jit"`).
+**Included:** register ISA + `Program`/`Fn` assembler, BFV0 (**ABI v5**: 128-bit `CapId`, nested `Message.payload`), verifier (`TrustLevel::Untrusted` rejects `Cap`/`Pid`/`Message` in the constant pool), per-flow VM, M:N scheduler, **bounded mailboxes** (`MailboxConfig`: 256 hops + 4 MiB / Reject by default), Atomic Hop, FlowCap holder model, `Cap::attenuate` / `Opcode::Delegate`, `NativeMask` gate on `CALL_NATIVE`, per-flow quotas, `LINK`/`MONITOR`/`ADMIN`, `Fn::spawn_confined`, 3-arg `make_msg`, monitors / links / registry, `WAITING_SEND`, `AskTimeout`, `RuntimeConfig.max_flows`, OTP supervisor strategies, [`OutputSink`](https://docs.rs/byteflow-actors/latest/byteflow/trait.OutputSink.html) for `print`, std natives, CLI, examples, fail-closed error model, optional trace JIT (`feature = "jit"`).
 
 **Not yet:** Criterion benches, distribution, `trap_exit`.
 

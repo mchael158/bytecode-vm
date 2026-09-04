@@ -8,7 +8,7 @@ Hardware (`byteflow-hw`) was removed from the monorepo — do not restore it her
 Byteflow's concurrent unit is a **flow** (`Flow`, `FlowId`, `FlowHandle`, `FlowOutcome`) — not an “actor” API surface.
 
 Wire identity still uses `Value::Pid` (FlowId as `u64`) inside messages.
-**Addressing** for bytecode `Send` / `Ask` uses `Value::Cap` (FlowCap, ABI v5).
+**Addressing** for bytecode `Send` / `Ask` uses `Value::Cap` (FlowCap, ABI v5 / 0.9.2).
 Scalars include `Value::Str` / `Value::Bytes` in the constant pool; hops remain
 `Message`-only. Untrusted `.bf` loads reject `Cap` / `Pid` / `Message` in the
 pool unless [`TrustLevel::Trusted`](../src/bytecode/verify.rs) is set.

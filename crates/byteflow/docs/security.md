@@ -146,7 +146,7 @@ authenticated origin of the hop.
 This means the following bytecode behavior is intentionally ineffective:
 
 ```text
-make_msg(
+make_msg_legacy_sender(
     sender = victim_flow,
     request_id = 1,
     tag = REQUEST,
@@ -154,8 +154,11 @@ make_msg(
 )
 ```
 
-followed by `Send(...)`. The receiver MUST observe `sender = actual_sender_flow`
-and never `sender = victim_flow`.
+followed by `Send(...)`. The native discards the sender operand
+(`Message.sender = 0`); the worker then stamps the real origin. The
+receiver MUST observe `sender = actual_sender_flow` and never
+`sender = victim_flow`. Current `make_msg` is 3-arg and never accepts a
+sender at all.
 
 Host-side [`Runtime::send`](../src/scheduler/runtime.rs) remains a **trusted**
 injection path: the host may choose `sender` (including `0` for non-flow
@@ -233,12 +236,12 @@ FlowId** behind the target Cap — never to a CapId.
 
 ---
 
-## 7. FlowCap — Current Version (0.9.x)
+## 7. FlowCap — Current Version (0.9.2)
 
 Bytecode `Send` / `Ask` require [`Value::Cap`](crate::Value::Cap). A [`CapId`](crate::CapId)
-is an opaque **128-bit CSPRNG token** — not a counter, not a [`FlowId`].
-It resolves through the runtime [`CapTable`](crate::Capability) to
-`{ holder, target, rights }` (`SEND`, `ASK`).
+is an opaque **128-bit CSPRNG token** — not a counter, not a [`FlowId`](crate::FlowId).
+It resolves through the runtime capability table ([`Capability`](crate::Capability)) to
+`{ holder, target, rights, native_mask, epoch }`.
 
 Resolution is always `resolve(cap, current_flow, required_rights)`. Knowing the
 bits, or holding a copy in a register, is **not** enough: the calling flow must
@@ -262,8 +265,8 @@ Runtime B.
 
 By default, [`verify`](crate::verify) and [`decode`](crate::decode) reject
 `Cap`, `Pid`, and `Message` values in the bytecode constant pool
-([`TrustLevel::Untrusted`]). Only host assemblers that intentionally embed
-authority-bearing constants should pass [`TrustLevel::Trusted`].
+([`TrustLevel::Untrusted`](crate::TrustLevel::Untrusted)). Only host assemblers that intentionally embed
+authority-bearing constants should pass [`TrustLevel::Trusted`](crate::TrustLevel::Trusted).
 
 ---
 
@@ -281,9 +284,6 @@ runtime_sender = current_flow.id
 
 always wins.
 
-Future versions may remove the sender argument from `make_msg` entirely.
-That is an API cleanup, not a prerequisite for sender authentication.
-
 ---
 
 ## 9. Native Authority
@@ -297,11 +297,11 @@ a numeric native index.
 
 Native authorization is currently host-configured **and** gated per flow:
 
-- host `Runtime::spawn` mints a root Cap with [`CapRights::NATIVE`] plus a
-  full [`NativeMask`] over the attached [`NativeTable`];
-- bytecode `Spawn` attenuates that mask through [`Cap::attenuate`] (the only
+- host `Runtime::spawn` mints a root Cap with [`CapRights::NATIVE`](crate::CapRights::NATIVE) plus a
+  full [`NativeMask`](crate::NativeMask) over the attached [`NativeTable`](crate::NativeTable);
+- bytecode `Spawn` attenuates that mask through [`Cap::attenuate`](crate::Cap::attenuate) (the only
   derivation path);
-- `CALL_NATIVE` runs [`check_native_call`] / [`check_native_gate`] **before**
+- `CALL_NATIVE` runs [`check_native_call`](crate::check_native_call) **before**
   indexing the function-pointer table.
 
 A numeric native index is still not a capability by itself (S7).
@@ -370,10 +370,14 @@ The following remain known limitations:
   they are not otherwise quota-limited;
 - native functions that consume arbitrary host resources.
 
-Per-flow native allowlists and finer quotas are planned for the quota phase.
+Per-flow [`QuotaConfig`](crate::QuotaConfig) (CPU, heap, spawn/send rate)
+and [`NativeMask`](crate::NativeMask) allowlists are enforced as of 0.9.2.
+Defaults are generous so existing samples keep passing; sandboxed modules
+must tighten `RuntimeConfig::quota` and spawn rights. There is still no
+runtime-wide byte cap across all flows.
 
 Capability security prevents unauthorized access but does not automatically
-prevent an authorized flow from exhausting resources.
+prevent an authorized flow from exhausting a budget it was granted.
 
 ---
 
@@ -404,23 +408,28 @@ because it originated outside bytecode.
 
 ---
 
-## 16. Capability Model (0.9 — implemented)
+## 16. Capability Model (0.9.2 — implemented)
 
 The security architecture is object-capability based:
 
 `Value::Cap(CapId)` where [`CapId`](crate::CapId) is an opaque 128-bit CSPRNG
-token — **not** a [`FlowId`].
+token — **not** a [`FlowId`](crate::FlowId).
 
 A capability resolves through the per-runtime directory to
-`LINK` / `MONITOR` / `ADMIN` bits are minted: addressing Caps carry
-`LINK|MONITOR`; `ADMIN` requires [`CapTarget::Scheduler`] and is never in
-the default root set.
+`{ holder, target, rights, epoch }`. Resolution requires the calling flow
+to hold the token with sufficient rights.
+
+`LINK` / `MONITOR` / `ADMIN` bits are minted as follows: addressing Caps
+carry `LINK|MONITOR`; `ADMIN` requires [`CapTarget::Scheduler`](crate::CapTarget::Scheduler) and is
+never in the default root set.
 
 The bytecode-visible capability MUST NOT expose the underlying FlowId.
 
 Capability creation, delegation, attenuation, and revocation belong to the
-trusted runtime. [`CapTable::revoke_flow`] removes every entry held by or
-targeting an exiting flow.
+trusted runtime. [`Cap::attenuate`](crate::Cap::attenuate) is the **only**
+grant-derivation path (AND of rights and [`NativeMask`](crate::NativeMask)).
+The runtime capability table removes every entry held by or targeting an
+exiting flow (`revoke_flow`).
 
 ---
 
@@ -459,7 +468,7 @@ authenticated identity only and does not grant delivery authority.
 
 ### S7 — Native index is not inherently a capability
 
-Native authorization is a [`CapRights::NATIVE`] bit plus a [`NativeMask`] on
+Native authorization is a [`CapRights::NATIVE`](crate::CapRights::NATIVE) bit plus a [`NativeMask`](crate::NativeMask) on
 the flow's self-authority. `CALL_NATIVE` is denied unless both pass. The
 index operand is untrusted input, never an ambient grant.
 
@@ -477,12 +486,12 @@ Flow capabilities: `Value::Cap` for Send/Ask; `reply_cap` grant; Pid = identity.
 0.9 closes the model: random 128-bit ids, holder + rights resolution,
 untrusted constant-pool rejection, and full cap sweep on flow exit.
 
-### Phase 3 (done — 0.9)
+### Phase 3 (done — 0.9.2)
 
 Native allowlists, per-flow quotas (CPU / memory / spawn-send rate),
 `DELEGATE`, confined `SPAWN`, `LINK`/`MONITOR`/`ADMIN` rights, and
 `make_msg` without a forgeable sender. All derivation goes through
-[`Cap::attenuate`].
+[`Cap::attenuate`](crate::Cap::attenuate).
 
 ### Phase 4
 

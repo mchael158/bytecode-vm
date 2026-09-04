@@ -6,11 +6,11 @@
 
 [English](README.md) · [Português (Brasil)](README.pt-BR.md)
 
-Embeddable concurrency for Rust: register bytecode via **`Program`** / **`Fn`**, **flows**, mailboxes, **Atomic Hop** (`Value::Message` only on `Send`), and a supervisor — **one crate**.
+Embeddable concurrency for Rust: register bytecode via **`Program`** / **`Fn`**, **flows**, mailboxes, **Atomic Hop** (`Value::Message` only on `Send`), FlowCap (ABI v5) with attenuation and per-flow quotas, and a supervisor — **one crate**.
 
 ```toml
 [dependencies]
-byteflow-actors = "0.8"
+byteflow-actors = "0.9.2"
 ```
 
 ```rust

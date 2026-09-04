@@ -44,9 +44,12 @@ BEAM messages are arbitrary terms. Byteflow **Atomic Hop** is a fixed envelope:
 Message { sender, reply_cap, request_id, tag, payload }
 ```
 
-- `payload` is a single `u64` today — encode richer data via tags + natives.
+- `payload` is a nested [`Value`](../src/bytecode/value.rs) (ABI v5) — scalars,
+  `Str` / `Bytes`, or another hop.
 - `sender` is **authenticated by the runtime** on bytecode `Send` / `Ask`.
-  Do not forge it with `make_msg` (see [`samples::forged_sender_send`](../src/samples.rs)).
+  `make_msg` has no sender operand (3-arg: request_id, tag, payload). A
+  leftover 4-arg encoding is ignored — see
+  [`samples::forged_sender_send`](../src/samples.rs).
 
 ### Typical server loop (BEAM-style)
 
@@ -75,7 +78,9 @@ Sample: [`samples::server_loop`](../src/samples.rs).
 | **monitors** `{'DOWN', ...}` | `Runtime::monitor` / `Fn::monitor` → `TAG_SYS_DOWN` hop |
 | **OTP supervisor strategies** | Host `Supervisor` + `RestartStrategy` (`OneForOne` / `OneForAll` / `RestForOne`) |
 | **`register` / `whereis`** | `Runtime::register_name` / `whereis` (Cap, not FlowId) |
-| **`exit(Pid, kill)`** | `Runtime::kill` (cooperative) |
+| **`exit(Pid, kill)`** | `Runtime::kill` (cooperative) or `Runtime::admin_kill` (ADMIN Cap) |
+| **capability pass** | `Fn::delegate` / `Cap::attenuate` (AND of rights + native mask) |
+| **confined spawn** | `Fn::spawn_confined` (child rights `NONE`) |
 
 ## What BEAM has that Byteflow does not (yet)
 
@@ -116,14 +121,15 @@ self()              →  hop_sender on received msg; self_address() for Cap
 receive             →  receive() / receive_match_imm(TAG)
 call                →  ask(cap, hop(...)) / ask_timeout(cap, hop, ms)
 reply               →  send_reply(req, TAG_REP, payload)
-spawn               →  spawn(fn) → Cap
+spawn               →  spawn(fn) → Cap; spawn_confined(fn) → Cap with rights NONE
 register/whereis    →  Runtime::register_name / whereis; ChildSpec.name also registers
-link/monitor        →  Fn::link / Fn::monitor; DOWN via TAG_SYS_DOWN
+link/monitor        →  Fn::link / Fn::monitor (need LINK / MONITOR on the addressing Cap)
+delegate            →  Fn::delegate(cap, rights) → weaker Cap
 ```
 
 ## Further reading
 
 - [`atomic-hop.md`](atomic-hop.md) — protocol details
 - [`mailbox.md`](mailbox.md) — bounded queues, overflow
-- [`security.md`](security.md) — S1 authenticated sender, S6 FlowCap
+- [`security.md`](security.md) — S1 authenticated sender, S6 FlowCap, S7 native mask
 - [`samples.rs`](../src/samples.rs) — runnable specs
