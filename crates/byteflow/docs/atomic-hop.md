@@ -22,17 +22,24 @@ Message { sender, reply_cap, request_id, tag, payload }
 ```
 
 - **sender** — authenticated origin FlowId (stamped by the worker)
-- **reply_cap** — SEND-only Cap back to the sender (128-bit CSPRNG id, minted at stamp time)
-- **request_id** — client correlation token (echoed on reply)
+- **reply_cap** — SEND-only Cap back to the sender. One live token per
+  `(recipient, sender)` pair (`CapTable::mint_or_reuse`); correlation is
+  `request_id`, not a fresh Cap per hop.
+- **request_id** — correlation token. Prefer [`Fn::fresh_request_id`] /
+  [`Fn::hop_fresh`] (per-flow, starts at 1). `0` is “unset”: `Send` / `Ask`
+  mint a fresh id at the hop boundary. `Ask` refuses a second in-flight
+  `Ask` that reuses a still-pending id.
 - **tag** — protocol discriminator (opaque to the VM)
 - **payload** — arbitrary [`Value`](../src/bytecode/value.rs) (nested scalars, blobs, etc.)
 
 **Authenticated sender (security S1):** bytecode `Send` / `Ask` overwrite
 `Message.sender` and attach `reply_cap` before delivery.
-The `make_msg` native has **no sender operand** (3-arg: request_id, tag,
-payload). A 4-arg legacy form discards the first register and still writes
-`sender = 0`. Only `Send` / `Ask` stamp identity — see
-[`security.md`](security.md).
+Host `Runtime::send` uses the same choke-point: `sender = FlowId::HOST`
+(`0`), `reply_cap = CapId::NONE` (host has no mailbox), and an unset
+`request_id` is minted. The `make_msg` native has **no sender operand**
+(3-arg: request_id, tag, payload). A 4-arg legacy form discards the first
+register and still writes `sender = 0` until the hop is authenticated —
+see [`security.md`](security.md).
 
 **FlowCap (security S6):** bytecode `Send` / `Ask` targets must be `Value::Cap`.
 `SelfPid` / `Spawn` return Caps. Reply with `msg_reply_cap`, not `msg_sender`.
@@ -52,6 +59,9 @@ by a matching hop; junk is queued behind the same lock.
 |--------|------|
 | `ReceiveMatch` `0x53` | `ra, rb` — tag from `r[b]` (`Int` in `0..=u16::MAX`) |
 | `ReceiveMatchImm` `0x54` | `ra, imm` — immediate tag |
+| `FreshRequestId` `0x5C` | `ra` — next per-flow correlation id |
+| `ReceiveMatchCorr` `0x5D` | `ra, rb, rc` — `tag == r[b]` and `request_id == r[c]` |
+| `ReceiveMatchCorrImm` `0x5E` | `ra, rb, imm` — immediate tag + `request_id` from `r[b]` |
 
 Sample: [`samples::selective_receive`](../src/samples.rs) (`TAG_JUNK` then `TAG_REQ`).
 
@@ -75,6 +85,10 @@ as `ReceiveTimeout`). If the **target exits** first, dest is a
 [`samples::ask_reply`](../src/samples.rs),
 [`samples::ask_timeout_expires`](../src/samples.rs),
 [`samples::ask_target_exits`](../src/samples.rs).
+
+**Cap in payload:** any `Value::Cap` the sender *holds* is reissued so the
+recipient becomes the new holder (`CapTable::delegate`). `NONE` is left
+alone. This is additive (the sender keeps their token).
 
 That is the deliberate difference vs classic actor runtimes that allow any value on send.
 

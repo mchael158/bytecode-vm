@@ -154,6 +154,11 @@ impl ChunkBuilder {
         self.emit(Instruction::abc(Opcode::SelfPid, dst, 0, 0));
     }
 
+    /// Write the next per-flow correlation id into `dst`.
+    pub fn emit_fresh_request_id(&mut self, dst: u8) {
+        self.emit(Instruction::abc(Opcode::FreshRequestId, dst, 0, 0));
+    }
+
     /// Fire-and-forget Atomic Hop: `r[target_cap_reg]` must be Cap; `r[msg_reg]` Message.
     pub fn emit_send(&mut self, target_cap_reg: u8, msg_reg: u8) {
         self.emit(Instruction::abc(Opcode::Send, target_cap_reg, msg_reg, 0));
@@ -175,6 +180,22 @@ impl ChunkBuilder {
     /// Selective Atomic Hop with an immediate `u16` tag.
     pub fn emit_receive_match_imm(&mut self, dst: u8, tag: u16) {
         self.emit(Instruction::a_imm(Opcode::ReceiveMatchImm, dst, i32::from(tag)));
+    }
+
+    /// Selective receive: `tag == r[tag_reg]` and `request_id == r[id_reg]`.
+    pub fn emit_receive_match_corr(&mut self, dst: u8, tag_reg: u8, id_reg: u8) {
+        self.emit(Instruction::abc(Opcode::ReceiveMatchCorr, dst, tag_reg, id_reg));
+    }
+
+    /// Selective receive with immediate tag and `request_id` from `id_reg`.
+    pub fn emit_receive_match_corr_imm(&mut self, dst: u8, tag: u16, id_reg: u8) {
+        self.emit(Instruction::new(
+            Opcode::ReceiveMatchCorrImm,
+            dst,
+            id_reg,
+            0,
+            i32::from(tag),
+        ));
     }
 
     /// Atomic request/reply hop: deliver `r[msg_reg]` to `r[target_cap_reg]` (Cap),
@@ -219,6 +240,14 @@ impl ChunkBuilder {
 
     pub fn emit_unlink(&mut self, link_reg: u8) {
         self.emit(Instruction::abc(Opcode::Unlink, link_reg, 0, 0));
+    }
+
+    pub fn emit_register_name(&mut self, name_reg: u8) {
+        self.emit(Instruction::abc(Opcode::RegisterName, name_reg, 0, 0));
+    }
+
+    pub fn emit_whereis(&mut self, dst: u8, name_reg: u8) {
+        self.emit(Instruction::abc(Opcode::Whereis, dst, name_reg, 0));
     }
 
     pub fn emit_trap(&mut self, code: i32) {

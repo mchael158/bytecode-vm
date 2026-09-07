@@ -144,6 +144,27 @@ pub enum Opcode {
     /// calls `Cap::attenuate` — the only derivation path.
     /// Append-only ABI slot (`0x5B`); `Trap` stays `0x60`.
     Delegate = 0x5B,
+    /// `FreshRequestId ra` → `r[a] =` next per-flow correlation id (`Int`).
+    ///
+    /// Starts at 1; `0` is reserved as “unset” so `Send` / `Ask` can mint.
+    /// Not a capability — uniqueness, not unpredictability.
+    /// Append-only ABI slot (`0x5C`); `Trap` stays `0x60`.
+    FreshRequestId = 0x5C,
+    /// `ReceiveMatchCorr ra, rb, rc` → wait for a hop with
+    /// `tag == r[b]` and `request_id == r[c]`. Non-matching hops stay queued.
+    /// Append-only ABI slot (`0x5D`); `Trap` stays `0x60`.
+    ReceiveMatchCorr = 0x5D,
+    /// `ReceiveMatchCorrImm ra, rb, imm` → like [`Self::ReceiveMatchCorr`]
+    /// with immediate tag (`imm` as `u16`) and `request_id` from `r[b]`.
+    /// Append-only ABI slot (`0x5E`); `Trap` stays `0x60`.
+    ReceiveMatchCorrImm = 0x5E,
+    /// `RegisterName ra` → publish `r[a]` (`Str`) as this flow's name.
+    /// Only the calling flow is registered. Requires `SEND` on self-authority
+    /// (confined spawn cannot squat names). Append-only (`0x62`).
+    RegisterName = 0x62,
+    /// `Whereis ra, rb` → look up `r[b]` (`Str`); write a **SEND** Cap for
+    /// the caller, or `Unit` if missing. Never a raw FlowId. (`0x63`)
+    Whereis = 0x63,
 
     // ---- diagnostics / safety ------------------------------------------
     /// `Trap imm` → deliberate fault (assertion failure, div-by-zero, bad
@@ -198,7 +219,12 @@ impl Opcode {
             0x59 => Unlink,
             0x5A => AskTimeout,
             0x5B => Delegate,
+            0x5C => FreshRequestId,
+            0x5D => ReceiveMatchCorr,
+            0x5E => ReceiveMatchCorrImm,
             0x60 => Trap,
+            0x62 => RegisterName,
+            0x63 => Whereis,
             0x61 => Nop,
             _ => return None,
         })
@@ -248,6 +274,11 @@ impl std::fmt::Display for Opcode {
             Opcode::Unlink => "Unlink",
             Opcode::AskTimeout => "AskTimeout",
             Opcode::Delegate => "Delegate",
+            Opcode::FreshRequestId => "FreshRequestId",
+            Opcode::ReceiveMatchCorr => "ReceiveMatchCorr",
+            Opcode::ReceiveMatchCorrImm => "ReceiveMatchCorrImm",
+            Opcode::RegisterName => "RegisterName",
+            Opcode::Whereis => "Whereis",
             Opcode::Trap => "Trap",
             Opcode::Nop => "Nop",
         };

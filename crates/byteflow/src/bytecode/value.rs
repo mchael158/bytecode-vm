@@ -17,9 +17,11 @@ pub const TAG_SYS_EXIT: u16 = 0xFF02;
 /// # Security
 ///
 /// - **`sender`**: FlowId stamped by the scheduler on bytecode `Send` / `Ask`
+///   and host [`crate::Runtime::send`] (`0` = [`crate::FlowId::HOST`])
 ///   (invariant **S1**). Not a capability.
-/// - **`reply_cap`**: [`CapId`] minted at the hop boundary with **SEND**-only
-///   rights, **holder = recipient**. [`CapId::NONE`] means “no reply grant”.
+/// - **`reply_cap`**: stable SEND-only [`CapId`] per `(recipient, sender)`
+///   pair (holder = recipient, reused across hops). Correlation is
+///   [`Self::request_id`]. [`CapId::NONE`] means “no reply grant”.
 ///
 /// See `docs/security.md`.
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +91,11 @@ impl Message {
     pub(crate) fn authenticate(mut self, sender: u64, reply_cap: CapId) -> Self {
         self.sender = sender;
         self.reply_cap = reply_cap;
+        self
+    }
+
+    pub(crate) fn with_payload(mut self, payload: Value) -> Self {
+        self.payload = Arc::new(payload);
         self
     }
 }

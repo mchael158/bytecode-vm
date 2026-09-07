@@ -1,5 +1,10 @@
 //! Named registry: `name → CapId` (address), never `name → FlowId`.
 //!
+//! Host `whereis` returns the **stored** Cap (the token passed to
+//! `register_name`). Bytecode `Whereis` remints a SEND Cap for the
+//! *caller* (`CapTable::mint_or_reuse`) so knowing a name is not an
+//! ambient grant of the registered token.
+//!
 //! Entries are swept when the **target** flow exits ([`Registry::unregister_flow`]).
 //! A revoked Cap cannot be registered; lookup after exit returns `None`.
 
@@ -73,6 +78,10 @@ impl Registry {
         self.by_name.get(&RegistryName::from(name)).map(|e| e.cap)
     }
 
+    pub fn target(&self, name: &str) -> Option<FlowId> {
+        self.by_name.get(&RegistryName::from(name)).map(|e| e.flow)
+    }
+
     pub fn unregister(&mut self, name: &str) -> bool {
         let key = RegistryName::from(name);
         match self.by_name.remove(&key) {
@@ -127,6 +136,10 @@ impl RegistryStore {
 
     pub fn whereis(&self, name: &str) -> Result<Option<CapId>, RuntimeError> {
         Ok(sync_lock::lock(&self.inner, "RegistryStore::whereis")?.whereis(name))
+    }
+
+    pub fn target(&self, name: &str) -> Result<Option<FlowId>, RuntimeError> {
+        Ok(sync_lock::lock(&self.inner, "RegistryStore::target")?.target(name))
     }
 
     pub fn unregister(&self, name: &str) -> Result<bool, RuntimeError> {

@@ -24,8 +24,16 @@ use super::oneshot;
 pub struct FlowId(pub(crate) u64);
 
 impl FlowId {
+    /// Embedder origin for host `Runtime::send`. Never spawned, never finalized.
+    pub const HOST: FlowId = FlowId(0);
+
     pub fn as_u64(self) -> u64 {
         self.0
+    }
+
+    #[inline]
+    pub fn is_host(self) -> bool {
+        self.0 == 0
     }
 }
 

@@ -8,7 +8,9 @@
 //! ```
 //!
 //! Every derived grant goes through [`Cap::attenuate`]. `mint` is the
-//! trusted-runtime root path (self Cap, spawn addressing, reply_cap).
+//! trusted-runtime root path (self Cap, spawn addressing). Hop `reply_cap`
+//! uses [`CapTable::mint_or_reuse`] — one live SEND token per
+//! `(holder, target)` pair.
 //!
 //! See `docs/security.md` (S6 / S7) and `docs/atomic-hop.md`.
 
@@ -53,6 +55,8 @@ pub enum CapError {
     WrongTarget,
     /// Mutex poison — fail closed (never `into_inner`).
     Unavailable,
+    /// A second in-flight `Ask` reused a `request_id` still pending.
+    DuplicateRequestId,
 }
 
 impl std::fmt::Display for CapError {
@@ -63,6 +67,9 @@ impl std::fmt::Display for CapError {
             CapError::InsufficientRights => f.write_str("capability lacks required rights"),
             CapError::WrongTarget => f.write_str("capability target is not a flow"),
             CapError::Unavailable => f.write_str("capability table unavailable (poisoned lock)"),
+            CapError::DuplicateRequestId => {
+                f.write_str("duplicate in-flight request_id")
+            }
         }
     }
 }
@@ -78,6 +85,11 @@ impl From<RuntimeError> for CapError {
 struct CapTableInner {
     entries: HashMap<CapId, Capability>,
     flow_cells: HashMap<u64, Arc<RevocationCell>>,
+    /// Stable reply address: `(holder, target) → CapId`.
+    ///
+    /// Hop `reply_cap` is an *address* (SEND back to the sender), not a
+    /// per-message ticket. Correlation stays on `Message.request_id`.
+    reply_index: HashMap<(FlowId, FlowId), CapId>,
 }
 
 /// Registry `CapId → Capability`, owned by one runtime's [`super::runtime::Shared`].
@@ -93,6 +105,7 @@ impl CapTable {
             inner: Mutex::new(CapTableInner {
                 entries: HashMap::new(),
                 flow_cells: HashMap::new(),
+                reply_index: HashMap::new(),
             }),
             native_cell: Arc::new(RevocationCell::new()),
             scheduler_cell: Arc::new(RevocationCell::new()),
@@ -147,10 +160,11 @@ impl CapTable {
         )
     }
 
-    /// Trusted root mint: `holder` may address `target` with `rights`.
+    /// Trusted root mint: always a **new** token.
     ///
-    /// Used for: self Cap (`SelfPid`), child addressing Cap (`Spawn`),
-    /// and per-hop `reply_cap` (holder = recipient, SEND-only back to sender).
+    /// Used for self Cap (`SelfPid`) and child addressing (`Spawn`). Hop
+    /// `reply_cap` must go through [`Self::mint_or_reuse`] so the table
+    /// stays O(pairs), not O(hops).
     pub fn mint(
         &self,
         holder: FlowId,
@@ -160,6 +174,63 @@ impl CapTable {
         let cell = self.bind_flow(target)?;
         let cap = Cap::root(CapTarget::Flow(target.as_u64()), rights, None, cell.as_ref());
         self.grant(holder, cap)
+    }
+
+    /// Reply-address mint: reuse the live SEND Cap for `(holder, target)`.
+    ///
+    /// [`FlowId`] is never reused (`next_flow_id` is monotonic), so a cached
+    /// pair cannot alias a later incarnation. Stale index entries are dropped
+    /// after an epoch / holder / target check — never trusted blindly.
+    ///
+    /// One lock for lookup + insert so reuse is atomic on the existing
+    /// global mutex (no CAS / retry).
+    pub fn mint_or_reuse(
+        &self,
+        holder: FlowId,
+        target: FlowId,
+        rights: CapRights,
+    ) -> Result<CapId, RuntimeError> {
+        let mut g = self.lock("CapTable::mint_or_reuse")?;
+        if let Some(&id) = g.reply_index.get(&(holder, target)) {
+            if Self::reply_cap_is_live(&g, id, holder, target, rights) {
+                return Ok(id);
+            }
+            g.reply_index.remove(&(holder, target));
+        }
+        let cell = g
+            .flow_cells
+            .entry(target.as_u64())
+            .or_insert_with(|| Arc::new(RevocationCell::new()))
+            .clone();
+        let cap = Cap::root(CapTarget::Flow(target.as_u64()), rights, None, cell.as_ref());
+        let id = Self::insert_fresh(&mut g.entries, Capability { holder, cap })?;
+        g.reply_index.insert((holder, target), id);
+        Ok(id)
+    }
+
+    fn reply_cap_is_live(
+        table: &CapTableInner,
+        id: CapId,
+        holder: FlowId,
+        target: FlowId,
+        rights: CapRights,
+    ) -> bool {
+        let Some(entry) = table.entries.get(&id) else {
+            return false;
+        };
+        if entry.holder != holder {
+            return false;
+        }
+        if entry.cap.target != CapTarget::Flow(target.as_u64()) {
+            return false;
+        }
+        if !entry.cap.rights.contains(rights) {
+            return false;
+        }
+        match table.flow_cells.get(&target.as_u64()) {
+            Some(cell) => entry.cap.is_valid(cell.as_ref()),
+            None => false,
+        }
     }
 
     /// Insert a Cap that was already produced by [`Cap::attenuate`] or
@@ -283,7 +354,27 @@ impl CapTable {
         g.entries.retain(|_, e| {
             e.holder != flow && e.cap.target != CapTarget::Flow(fid)
         });
+        g.reply_index.retain(|(h, t), _| *h != flow && *t != flow);
         Ok(before - g.entries.len())
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> Result<usize, RuntimeError> {
+        Ok(self.lock("CapTable::entry_count")?.entries.len())
+    }
+
+    #[cfg(test)]
+    fn reply_index_len(&self) -> Result<usize, RuntimeError> {
+        Ok(self.lock("CapTable::reply_index_len")?.reply_index.len())
+    }
+
+    #[cfg(test)]
+    fn reply_index_mentions(&self, flow: FlowId) -> Result<bool, RuntimeError> {
+        Ok(self
+            .lock("CapTable::reply_index_mentions")?
+            .reply_index
+            .keys()
+            .any(|(h, t)| *h == flow || *t == flow))
     }
 }
 
@@ -413,6 +504,83 @@ mod tests {
         let got = table.resolve(granted, child, CapRights::SEND)?;
         assert!(!got.rights().contains(CapRights::ADMIN));
         assert!(got.rights().contains(CapRights::SEND));
+        Ok(())
+    }
+
+    #[test]
+    fn mint_or_reuse_is_stable_per_pair() -> Result<(), Box<dyn std::error::Error>> {
+        let table = CapTable::new();
+        let holder = next_flow_id();
+        let target = next_flow_id();
+        let first = table.mint_or_reuse(holder, target, CapRights::SEND)?;
+        for _ in 0..1_000 {
+            let again = table.mint_or_reuse(holder, target, CapRights::SEND)?;
+            assert_eq!(again, first);
+        }
+        assert_eq!(table.entry_count()?, 1);
+        assert_eq!(table.reply_index_len()?, 1);
+        assert!(table.resolve(first, holder, CapRights::SEND).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn mint_or_reuse_distinct_pairs_are_independent() -> Result<(), Box<dyn std::error::Error>> {
+        let table = CapTable::new();
+        let a = next_flow_id();
+        let b = next_flow_id();
+        let ab = table.mint_or_reuse(b, a, CapRights::SEND)?;
+        let ba = table.mint_or_reuse(a, b, CapRights::SEND)?;
+        assert_ne!(ab, ba);
+        assert_eq!(table.entry_count()?, 2);
+        assert_eq!(table.reply_index_len()?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn revoke_flow_clears_reply_index_for_holder_and_target() -> Result<(), Box<dyn std::error::Error>> {
+        let table = CapTable::new();
+        let a = next_flow_id();
+        let b = next_flow_id();
+        let alive = next_flow_id();
+        let ab = table.mint_or_reuse(b, a, CapRights::SEND)?;
+        let ba = table.mint_or_reuse(a, b, CapRights::SEND)?;
+        let kept = table.mint_or_reuse(alive, b, CapRights::SEND)?;
+
+        table.revoke_flow(a)?;
+        assert!(!table.reply_index_mentions(a)?);
+        assert_eq!(
+            table.resolve(ab, b, CapRights::SEND),
+            Err(CapError::Unknown)
+        );
+        assert_eq!(
+            table.resolve(ba, a, CapRights::SEND),
+            Err(CapError::Unknown)
+        );
+        assert!(table.resolve(kept, alive, CapRights::SEND).is_ok());
+        assert!(!table.reply_index_mentions(a)?);
+        assert!(table.reply_index_mentions(b)?);
+
+        table.revoke_flow(b)?;
+        assert!(!table.reply_index_mentions(a)?);
+        assert!(!table.reply_index_mentions(b)?);
+        Ok(())
+    }
+
+    #[test]
+    fn mint_or_reuse_after_revoke_issues_a_fresh_id() -> Result<(), Box<dyn std::error::Error>> {
+        let table = CapTable::new();
+        let holder = next_flow_id();
+        let target = next_flow_id();
+        let old = table.mint_or_reuse(holder, target, CapRights::SEND)?;
+        table.revoke_flow(target)?;
+        assert!(!table.reply_index_mentions(target)?);
+        let fresh = table.mint_or_reuse(holder, target, CapRights::SEND)?;
+        assert_ne!(fresh, old);
+        assert_eq!(
+            table.resolve(old, holder, CapRights::SEND),
+            Err(CapError::Unknown)
+        );
+        assert!(table.resolve(fresh, holder, CapRights::SEND).is_ok());
         Ok(())
     }
 }

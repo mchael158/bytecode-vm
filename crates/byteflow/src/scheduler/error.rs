@@ -46,6 +46,8 @@ pub enum RuntimeError {
     EntropyFailed,
     /// CSPRNG produced colliding ids beyond the retry budget (should not happen).
     CapIdCollision,
+    /// `finalize_flow` was asked to tear down the reserved host FlowId.
+    CannotFinalizeHostFlow,
 }
 
 impl fmt::Display for RuntimeError {
@@ -68,6 +70,9 @@ impl fmt::Display for RuntimeError {
             }
             RuntimeError::CapIdCollision => {
                 write!(f, "could not allocate a unique capability id")
+            }
+            RuntimeError::CannotFinalizeHostFlow => {
+                write!(f, "cannot finalize reserved host flow")
             }
         }
     }

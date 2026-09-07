@@ -32,12 +32,13 @@
 //! ```
 //!
 //! - Bare `Int` / `Pid` / `Str` on `Send` → trap / [`SendError::NotAHop`]
-//! - Scheduler **stamps** `sender` (authenticated origin) and mints
-//!   `reply_cap` (SEND-only Cap back to the caller)
+//! - Scheduler **stamps** `sender` (authenticated origin) and attaches
+//!   `reply_cap` (stable SEND-only Cap back to the caller, reused per pair)
 //! - Reply with [`std_native_table`]'s `msg_reply_cap` — **not** `msg_sender`
 //!   (`Pid` is identity, not an address)
 //!
-//! Also: selective receive (`ReceiveMatch`), `Ask` / `AskTimeout` for correlated RPC.
+//! Also: selective receive (`ReceiveMatch` / `ReceiveMatchCorr`),
+//! `Ask` / `AskTimeout` for correlated RPC, [`Fn::fresh_request_id`].
 //!
 //! # FlowCap (addressing)
 //!
@@ -46,7 +47,11 @@
 //! | [`Value::Cap`] | Target of `Send` / `Ask`; from `SelfPid`, `Spawn`, or `reply_cap` |
 //! | [`Value::Pid`] | Identity inside a delivered hop (`msg_sender`) |
 //!
-//! Host [`Runtime::send`] still takes [`FlowId`] (trusted embedder path).
+//! Host [`Runtime::send`] still takes [`FlowId`] (trusted embedder path)
+//! and is stamped `sender = 0` / `reply_cap = NONE`.
+//!
+//! Named discovery: [`Fn::register_name`] / [`Fn::whereis`] — `whereis`
+//! returns a SEND Cap for the caller, never a raw FlowId.
 //!
 //! Caps resolve only for the **holder** with sufficient rights. Derive a
 //! weaker grant with [`Fn::delegate`] / [`Cap::attenuate`] — never by

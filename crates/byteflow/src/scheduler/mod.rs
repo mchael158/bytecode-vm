@@ -9,11 +9,12 @@
 //! The VM only validates types. This module owns delivery:
 //!
 //! 1. Resolve [`crate::Value::Cap`] → [`FlowId`] + rights ([`CapRights`])
-//! 2. Stamp `Message.sender` and mint `reply_cap` (SEND-only)
+//! 2. Stamp `Message.sender` and attach `reply_cap` (SEND-only, reused per pair)
 //! 3. Push into the target [`Mailbox`] (bounded; anti lost-wakeup under one mutex)
 //!
 //! [`crate::Value::Pid`] is identity inside hops, not an ambient address.
-//! Host [`Runtime::send`] takes [`FlowId`] directly (trusted).
+//! Host [`Runtime::send`] takes [`FlowId`] directly (trusted) and is stamped
+//! like a bytecode hop (`sender = 0`, `reply_cap = NONE`).
 //!
 //! See [`crate::docs::security`] and [`crate::docs::atomic_hop`].
 

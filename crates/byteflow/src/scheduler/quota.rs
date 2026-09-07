@@ -30,10 +30,9 @@ pub struct QuotaConfig {
     pub send_per_sec: i64,
 }
 
-impl Default for QuotaConfig {
-    fn default() -> Self {
-        // Generous so existing samples and tests keep passing. Tighten via
-        // `RuntimeConfig::quota` for sandboxed modules.
+impl QuotaConfig {
+    /// Current defaults: generous so samples and tests keep passing.
+    pub fn permissive() -> Self {
         Self {
             cpu_budget: 1_000_000_000,
             mem_limit: 64 * 1024 * 1024,
@@ -42,6 +41,25 @@ impl Default for QuotaConfig {
             send_burst: 50_000,
             send_per_sec: 50_000,
         }
+    }
+
+    /// Starting point for untrusted modules. Tune under real load before
+    /// using as a production default.
+    pub fn sandbox() -> Self {
+        Self {
+            cpu_budget: 50_000,
+            mem_limit: 16 * 1024 * 1024,
+            spawn_burst: 32,
+            spawn_per_sec: 32,
+            send_burst: 256,
+            send_per_sec: 64,
+        }
+    }
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self::permissive()
     }
 }
 
@@ -97,6 +115,14 @@ impl TokenBucket {
             }
         }
     }
+
+    /// ADMIN credit. May exceed capacity until the next refill caps it.
+    pub fn credit(&self, extra: i64) {
+        if extra <= 0 {
+            return;
+        }
+        self.tokens.fetch_add(extra, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,7 +150,7 @@ impl std::error::Error for QuotaError {}
 
 pub struct FlowQuota {
     cpu_budget: AtomicI64,
-    mem_limit: usize,
+    mem_limit: AtomicUsize,
     mem_used: AtomicUsize,
     spawn_bucket: TokenBucket,
     send_bucket: TokenBucket,
@@ -152,7 +178,7 @@ impl FlowQuota {
     ) -> Self {
         Self {
             cpu_budget: AtomicI64::new(cpu_budget),
-            mem_limit,
+            mem_limit: AtomicUsize::new(mem_limit),
             mem_used: AtomicUsize::new(0),
             spawn_bucket: TokenBucket::new(spawn_burst, spawn_per_sec),
             send_bucket: TokenBucket::new(send_burst, send_per_sec),
@@ -178,10 +204,11 @@ impl FlowQuota {
         loop {
             let cur = self.mem_used.load(Ordering::Relaxed);
             let next = cur.saturating_add(bytes);
-            if next > self.mem_limit {
+            let limit = self.mem_limit.load(Ordering::Relaxed);
+            if next > limit {
                 return Err(QuotaError::MemoryExhausted {
                     requested: bytes,
-                    limit: self.mem_limit,
+                    limit,
                 });
             }
             if self
@@ -227,6 +254,14 @@ impl FlowQuota {
     /// Reachable only after `check_admin` against `CapTarget::Scheduler`.
     pub fn top_up_cpu(&self, extra: i64) {
         self.cpu_budget.fetch_add(extra, Ordering::Relaxed);
+    }
+
+    pub fn top_up_mem(&self, extra: usize) {
+        self.mem_limit.fetch_add(extra, Ordering::Relaxed);
+    }
+
+    pub fn top_up_send(&self, extra: i64) {
+        self.send_bucket.credit(extra);
     }
 
     pub fn mem_used(&self) -> usize {
@@ -287,6 +322,25 @@ mod tests {
         assert!(q.alloc(60).is_ok());
         assert!(q.alloc(60).is_err());
         q.free(60);
+        assert!(q.alloc(60).is_ok());
+    }
+
+    #[test]
+    fn sandbox_is_tighter_than_permissive() {
+        let p = QuotaConfig::permissive();
+        let s = QuotaConfig::sandbox();
+        assert!(s.cpu_budget < p.cpu_budget);
+        assert!(s.mem_limit < p.mem_limit);
+        assert!(s.send_burst < p.send_burst);
+        assert_eq!(QuotaConfig::default().cpu_budget, p.cpu_budget);
+    }
+
+    #[test]
+    fn top_up_mem_raises_limit() {
+        let q = FlowQuota::new(1000, 100, 1, 1, 1, 1);
+        assert!(q.alloc(60).is_ok());
+        assert!(q.alloc(60).is_err());
+        q.top_up_mem(50);
         assert!(q.alloc(60).is_ok());
     }
 

@@ -1,9 +1,8 @@
 //! Atomic Hop: one [`byteflow::Value::Message`] per request/reply hop.
 //!
-//! This is the runnable counterpart of `samples::atomic_request_reply` and
-//! `docs/atomic-hop.md`. It wires the std native table (needed for
-//! `make_msg` / `msg_*` / `print`) and joins until the client returns
-//! payload `42`.
+//! Canonical Atomic Hop demo: server loop + two `Ask` clients
+//! (`samples::atomic_actors`). Minted `request_id`s, stable `reply_cap`,
+//! and a 72-sum join. See `docs/atomic-hop.md`.
 //!
 //! ```text
 //! cargo run -p byteflow-actors --example atomic_actors
@@ -19,7 +18,7 @@
 use byteflow::{samples, std_native_table, FlowOutcome, Runtime, RuntimeConfig, Value};
 
 fn main() {
-    let chunk = samples::atomic_request_reply();
+    let chunk = samples::atomic_actors();
     let rt = match Runtime::with_natives_and_config(
         chunk,
         std_native_table(),
@@ -52,8 +51,8 @@ fn main() {
     rt.shutdown();
 
     match outcome {
-        FlowOutcome::Completed(Value::Int(42)) => {
-            println!("atomic request-reply ok: payload=42");
+        FlowOutcome::Completed(Value::Int(72)) => {
+            println!("atomic actors ok: two clients × 8 Ask = 72");
             println!("{metrics}");
         }
         other => {

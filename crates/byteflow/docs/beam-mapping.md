@@ -10,7 +10,7 @@ BEAM — but many ideas rhyme once you map terminology.
 | process | **flow** | `FlowId`, `FlowHandle`, `FlowOutcome` |
 | `pid()` | **`hop_sender(msg)`** | Identity inside a *delivered* hop |
 | `pid()` as address | **`Value::Cap`** | `SelfPid` / `Spawn` return Caps, not Pids |
-| registered name | **`Runtime::register_name` / `whereis`** | Stores a **Cap**, not a FlowId. Swept on exit. |
+| registered name | **`Fn::register_name` / `Fn::whereis`** (also host `Runtime::*`) | Stores a **Cap**, not a FlowId. Bytecode `whereis` remints SEND for the caller. Swept on exit. |
 
 **Key difference:** on BEAM, a Pid is both identity and delivery address. In
 Byteflow, **Cap = address**, **Pid = identity** inside `Message.sender`.
@@ -77,7 +77,7 @@ Sample: [`samples::server_loop`](../src/samples.rs).
 | **links** | `Runtime::link` / `Fn::link` — abnormal exit kills the peer |
 | **monitors** `{'DOWN', ...}` | `Runtime::monitor` / `Fn::monitor` → `TAG_SYS_DOWN` hop |
 | **OTP supervisor strategies** | Host `Supervisor` + `RestartStrategy` (`OneForOne` / `OneForAll` / `RestForOne`) |
-| **`register` / `whereis`** | `Runtime::register_name` / `whereis` (Cap, not FlowId) |
+| **`register` / `whereis`** | `Fn::register_name` / `Fn::whereis` (and host `Runtime::*`). Cap, not FlowId |
 | **`exit(Pid, kill)`** | `Runtime::kill` (cooperative) or `Runtime::admin_kill` (ADMIN Cap) |
 | **capability pass** | `Fn::delegate` / `Cap::attenuate` (AND of rights + native mask) |
 | **confined spawn** | `Fn::spawn_confined` (child rights `NONE`) |
@@ -122,7 +122,7 @@ receive             →  receive() / receive_match_imm(TAG)
 call                →  ask(cap, hop(...)) / ask_timeout(cap, hop, ms)
 reply               →  send_reply(req, TAG_REP, payload)
 spawn               →  spawn(fn) → Cap; spawn_confined(fn) → Cap with rights NONE
-register/whereis    →  Runtime::register_name / whereis; ChildSpec.name also registers
+register/whereis    →  Fn::register_name / whereis (Cap reminted for caller); host Runtime::*; ChildSpec.name also registers
 link/monitor        →  Fn::link / Fn::monitor (need LINK / MONITOR on the addressing Cap)
 delegate            →  Fn::delegate(cap, rights) → weaker Cap
 ```

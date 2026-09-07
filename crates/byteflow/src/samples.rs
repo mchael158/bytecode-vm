@@ -8,12 +8,15 @@
 //! |--------|--------|
 //! | [`add_forty_two`] | Scalar VM path (no natives) |
 //! | [`ping_pong`] | Cap spawn + Atomic Hop round-trip |
-//! | [`atomic_request_reply`] | Tagged REQ/REP + `print` |
+//! | [`atomic_request_reply`] | Tagged REQ/REP + correlated receive |
+//! | [`atomic_actors`] | Server loop + two `Ask` clients + minted `request_id` |
+//! | [`cap_in_payload`] | Cap in hop payload is reissued to the recipient |
 //! | [`selective_receive`] | `ReceiveMatch` FIFO skip |
 //! | [`ask_reply`] | `Ask` RPC hop |
 //! | [`ask_timeout_expires`] | `AskTimeout` writes `Unit` when the server stays silent |
 //! | [`ask_target_exits`] | `Ask` dest is `TAG_SYS_EXIT` when the server dies first |
 //! | [`server_loop`] | BEAM-style receive → handle → reply loop |
+//! | [`named_service`] | Bytecode `register_name` / `whereis` (Cap, not FlowId) |
 //! | [`forged_sender_send`] / [`forged_sender_ask`] | S1: forged `make_msg` sender dies |
 //! | [`boom`] | Immediate trap (supervisor demos) |
 //! | [`monitor_down`] | Monitor → [`crate::TAG_SYS_DOWN`] on child exit |
@@ -62,11 +65,11 @@ pub fn ping_pong() -> Chunk {
     });
     p.function("main", 0, |f| {
         let child = f.spawn(pong, 0);
-        let req_id = f.load_i32(1);
         let payload = f.load_i32(1);
-        let req = f.hop(req_id, TAG_PING, payload);
+        let req = f.hop_fresh(TAG_PING, payload);
+        let rid = f.hop_request_id(req);
         f.send(child, req);
-        let reply = f.receive();
+        let reply = f.receive_match_corr_imm(TAG_PONG as u16, rid);
         let out = f.hop_payload(reply);
         f.return_(out);
     });
@@ -86,12 +89,12 @@ pub fn atomic_request_reply() -> Chunk {
     });
     p.function("main", 0, |f| {
         let server_cap = f.spawn(server, 0);
-        let req_id = f.load_i32(1);
         let payload = f.load_i32(41);
-        let req = f.hop(req_id, TAG_REQ, payload);
+        let req = f.hop_fresh(TAG_REQ, payload);
+        let rid = f.hop_request_id(req);
         f.native1_on(req, N_PRINT);
         f.send(server_cap, req);
-        let reply = f.receive();
+        let reply = f.receive_match_corr_imm(TAG_REP as u16, rid);
         f.native1_on(reply, N_PRINT);
         let out = f.hop_payload(reply);
         f.return_(out);
@@ -145,9 +148,8 @@ pub fn ask_reply() -> Chunk {
     });
     p.function("main", 0, |f| {
         let server_cap = f.spawn(server, 0);
-        let req_id = f.load_i32(1);
         let payload = f.load_i32(41);
-        let req = f.hop(req_id, TAG_REQ, payload);
+        let req = f.hop_fresh(TAG_REQ, payload);
         let reply = f.ask(server_cap, req);
         let out = f.hop_payload(reply);
         f.return_(out);
@@ -211,9 +213,126 @@ pub fn server_loop() -> Chunk {
     });
     p.function("main", 0, |f| {
         let server_cap = f.spawn(server, 0);
-        let req_id = f.load_i32(1);
         let payload = f.load_i32(41);
-        let req = f.hop(req_id, TAG_REQ, payload);
+        let req = f.hop_fresh(TAG_REQ, payload);
+        f.send(server_cap, req);
+        let reply = f.receive_match_imm(TAG_REP as u16);
+        let out = f.hop_payload(reply);
+        f.return_(out);
+    });
+    p.build()
+}
+
+/// Server publishes `"svc"`; client loops `whereis` until it gets a SEND Cap
+/// (not ASK — use `Send` + `Receive`, not `Ask`). Returns `42` (41 + 1).
+/// Discovery never exposes a raw FlowId.
+pub fn named_service() -> Chunk {
+    let mut p = Program::new("named-service");
+    let server = p.function("server", 0, |f| {
+        let name = f.load_str("svc");
+        f.register_name(name);
+        let loop_lbl = f.label();
+        f.bind(loop_lbl);
+        let req = f.receive_match_imm(TAG_REQ as u16);
+        let payload = f.hop_payload(req);
+        f.add_imm(payload, 1);
+        f.send_reply(req, TAG_REP, payload);
+        f.jump(loop_lbl);
+    });
+    p.function("main", 0, |f| {
+        let _server = f.spawn(server, 0);
+        let name = f.load_str("svc");
+        let retry = f.label();
+        let miss = f.label();
+        f.bind(retry);
+        let cap = f.whereis(name);
+        f.branch_if_falsy(cap, miss);
+        let payload = f.load_i32(41);
+        let req = f.hop_fresh(TAG_REQ, payload);
+        f.send(cap, req);
+        let reply = f.receive_match_imm(TAG_REP as u16);
+        let out = f.hop_payload(reply);
+        f.return_(out);
+        f.bind(miss);
+        // Sleep (not Yield): Yield re-queues on the local worker deque and
+        // can starve the injector, so the server would never register.
+        let ms = f.load_i32(1);
+        f.sleep(ms);
+        f.jump(retry);
+    });
+    p.build()
+}
+
+/// Canonical Atomic Hop actor demo: one server loop, two clients, each
+/// doing `N` `Ask`s with minted `request_id`s. Main waits for both DONE
+/// hops and returns the sum of the client accumulators (`2 * 36 = 72`).
+pub fn atomic_actors() -> Chunk {
+    const N: i32 = 8;
+    let mut p = Program::new("atomic-actors");
+    let server = p.function("server", 0, |f| {
+        let loop_lbl = f.label();
+        f.bind(loop_lbl);
+        let req = f.receive_match_imm(TAG_REQ as u16);
+        let payload = f.hop_payload(req);
+        f.add_imm(payload, 1);
+        f.send_reply(req, TAG_REP, payload);
+        f.jump(loop_lbl);
+    });
+    let client = p.function("client", 2, |f| {
+        let server_cap = f.reg(0);
+        let parent_cap = f.reg(1);
+        let acc = f.load_i32(0);
+        let i = f.load_i32(0);
+        let n = f.load_i32(N);
+        f.while_lt(i, n, |f| {
+            let req = f.hop_fresh(TAG_REQ, i);
+            let reply = f.ask(server_cap, req);
+            let got = f.hop_payload(reply);
+            let sum = f.add(acc, got);
+            f.mov(acc, sum);
+            f.add_imm(i, 1);
+        });
+        let done = f.hop_fresh(TAG_REP, acc);
+        f.send(parent_cap, done);
+        f.return_(acc);
+    });
+    p.function("main", 0, |f| {
+        let server_cap = f.spawn(server, 0);
+        let me = f.self_cap();
+        let w1 = f.window(3);
+        f.mov(w1.at(1), server_cap);
+        f.mov(w1.at(2), me);
+        f.spawn_at(w1.at(0), client, 2);
+        let w2 = f.window(3);
+        f.mov(w2.at(1), server_cap);
+        f.mov(w2.at(2), me);
+        f.spawn_at(w2.at(0), client, 2);
+        let a = f.receive_match_imm(TAG_REP as u16);
+        let b = f.receive_match_imm(TAG_REP as u16);
+        let pa = f.hop_payload(a);
+        let pb = f.hop_payload(b);
+        let out = f.add(pa, pb);
+        f.return_(out);
+    });
+    p.build()
+}
+
+/// Server receives a Cap in the payload and sends `42` back through it.
+/// Exercises hop-time reissue (holder becomes the recipient).
+pub fn cap_in_payload() -> Chunk {
+    let mut p = Program::new("cap-in-payload");
+    let server = p.function("server", 0, |f| {
+        let msg = f.receive();
+        let dest = f.hop_payload(msg);
+        let payload = f.load_i32(42);
+        let reply = f.hop_fresh(TAG_REP, payload);
+        f.send(dest, reply);
+        f.exit(payload);
+    });
+    p.function("main", 0, |f| {
+        let server_cap = f.spawn(server, 0);
+        let me = f.self_cap();
+        let req = f.hop_fresh(TAG_REQ, me);
         f.send(server_cap, req);
         let reply = f.receive_match_imm(TAG_REP as u16);
         let out = f.hop_payload(reply);
@@ -329,8 +448,8 @@ pub fn boom() -> Chunk {
 mod tests {
     use super::*;
     use crate::{
-        bytecode::CapId, decode, encode, std_native_table, verify, FlowOutcome, Runtime,
-        RuntimeConfig, Value,
+        bytecode::CapId, decode, encode, std_native_table, verify, FlowOutcome, Message,
+        QuotaConfig, Runtime, RuntimeConfig, Value,
     };
 
     fn tiny(chunk: Chunk) -> Result<Runtime, crate::SpawnError> {
@@ -400,6 +519,41 @@ mod tests {
             "got {outcome:?}"
         );
         assert!(sent >= 1);
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_actors_two_clients_sum_72() -> Result<(), Box<dyn std::error::Error>> {
+        let chunk = atomic_actors();
+        assert!(verify(&chunk).is_ok());
+        let bytes = encode(&chunk);
+        let chunk = decode(&bytes)?;
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
+        let sent = rt.metrics().messages_sent;
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Completed(Value::Int(72))),
+            "got {outcome:?}"
+        );
+        // 8 Ask + 8 reply per client, plus 2 DONE hops.
+        assert!(sent >= 34);
+        Ok(())
+    }
+
+    #[test]
+    fn cap_in_payload_reissues_holder() -> Result<(), Box<dyn std::error::Error>> {
+        let chunk = cap_in_payload();
+        assert!(verify(&chunk).is_ok());
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Completed(Value::Int(42))),
+            "got {outcome:?}"
+        );
         Ok(())
     }
 
@@ -687,6 +841,136 @@ mod tests {
         let err = rt.register_name("svc", CapId::from_raw(99_999));
         rt.shutdown();
         assert_eq!(err, Err(crate::LifecycleError::InvalidCapability));
+        Ok(())
+    }
+
+    #[test]
+    fn bytecode_register_name_joins() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = Program::new("reg-self");
+        p.function("main", 0, |f| {
+            let name = f.load_str("svc");
+            f.register_name(name);
+            let z = f.load_i32(1);
+            f.return_(z);
+        });
+        let rt = tiny(p.build())?;
+        let outcome = rt.spawn(0, &[])?.join();
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Completed(Value::Int(1))),
+            "host-spawned flow must be able to register_name, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn named_service_whereis_returns_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let chunk = named_service();
+        assert!(verify(&chunk).is_ok());
+        let rt = tiny_natives(chunk)?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt
+            .spawn(idx, &[])?
+            .join_timeout(std::time::Duration::from_secs(2))
+            .ok_or("named_service timed out")?;
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Completed(Value::Int(42))),
+            "named whereis should yield a usable SEND Cap, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn confined_spawn_cannot_register_name() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = Program::new("confined-reg");
+        let child = p.function("child", 0, |f| {
+            let name = f.load_str("stolen");
+            f.register_name(name);
+            // Stay alive so a successful register would remain visible.
+            // Sleep does not require RECV (a confined child has no RECV).
+            let ms = f.load_i32(5_000);
+            f.sleep(ms);
+            let z = f.load_i32(1);
+            f.return_(z);
+        });
+        p.function("main", 0, |f| {
+            let _c = f.spawn_confined(child, 0);
+            let ms = f.load_i32(80);
+            f.sleep(ms);
+            let name = f.load_str("stolen");
+            let cap = f.whereis(name);
+            let ok = f.label();
+            f.branch_if_falsy(cap, ok);
+            let one = f.load_i32(1);
+            f.return_(one);
+            f.bind(ok);
+            let zero = f.load_i32(0);
+            f.return_(zero);
+        });
+        let rt = tiny(p.build())?;
+        let idx = rt.function_index("main").ok_or("main")?;
+        let outcome = rt.spawn(idx, &[])?.join();
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Completed(Value::Int(0))),
+            "confined child must not publish a name, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn heap_quota_charges_str_on_register_store() -> Result<(), Box<dyn std::error::Error>> {
+        let mut p = Program::new("heap-str");
+        p.function("main", 0, |f| {
+            let s = f.load_str("x".repeat(200));
+            f.return_(s);
+        });
+        let mut quota = QuotaConfig::permissive();
+        quota.mem_limit = 64;
+        let rt = Runtime::with_config(
+            p.build(),
+            RuntimeConfig {
+                workers: 1,
+                quantum: 10_000,
+                mailbox: crate::MailboxConfig::DEFAULT,
+                quota,
+                ..Default::default()
+            },
+        )?;
+        let outcome = rt.spawn(0, &[])?.join();
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Failed(_)),
+            "200-byte Str must exceed 64-byte heap quota, got {outcome:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn host_send_stamps_sender_zero_and_mints_request_id() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut p = Program::new("host-send");
+        p.function("main", 0, |f| {
+            let msg = f.receive();
+            let sender = f.hop_sender(msg);
+            let rid = f.hop_request_id(msg);
+            let miss = f.label();
+            f.branch_if_falsy(rid, miss);
+            f.return_(sender);
+            f.bind(miss);
+            let neg = f.load_i32(-1);
+            f.return_(neg);
+        });
+        let rt = tiny_natives(p.build())?;
+        let h = rt.spawn(0, &[])?;
+        rt.send(h.id(), Value::Message(Message::request(0, 1, 0)))?;
+        let outcome = h.join();
+        rt.shutdown();
+        assert!(
+            matches!(outcome, FlowOutcome::Completed(Value::Pid(0))),
+            "host send must stamp sender=0 (Pid) and mint request_id, got {outcome:?}"
+        );
         Ok(())
     }
 

@@ -680,6 +680,11 @@ fn is_effect_opcode(op: Opcode) -> bool {
             | Opcode::Link
             | Opcode::Unlink
             | Opcode::Delegate
+            | Opcode::FreshRequestId
+            | Opcode::ReceiveMatchCorr
+            | Opcode::ReceiveMatchCorrImm
+            | Opcode::RegisterName
+            | Opcode::Whereis
             | Opcode::Trap
             | Opcode::Halt
     )

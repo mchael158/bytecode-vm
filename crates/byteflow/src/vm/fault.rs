@@ -52,6 +52,8 @@ pub enum Fault {
     /// Broken VM invariant (e.g. empty frame stack while running). Category D
     /// in the error model — surfaced as a Flow fault, never as `unwrap`.
     Invariant(&'static str),
+    /// Per-flow heap quota refused a `Str` / `Bytes` register write.
+    QuotaExceeded(String),
 }
 
 impl fmt::Display for Fault {
@@ -83,6 +85,7 @@ impl fmt::Display for Fault {
             Fault::NativeDenied(msg) => write!(f, "{msg}"),
             Fault::Explicit(code) => write!(f, "explicit trap (code {code})"),
             Fault::Invariant(msg) => write!(f, "vm invariant broken: {msg}"),
+            Fault::QuotaExceeded(msg) => write!(f, "{msg}"),
         }
     }
 }

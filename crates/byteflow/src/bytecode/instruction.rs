@@ -56,7 +56,12 @@ impl fmt::Display for Instruction {
             Opcode::Call | Opcode::CallNative => {
                 write!(f, "{} r{}, fn[{}], argc={}", self.op, self.a, self.imm, self.b)
             }
-            Opcode::Return | Opcode::Exit | Opcode::Sleep | Opcode::Receive | Opcode::SelfPid => {
+            Opcode::Return
+            | Opcode::Exit
+            | Opcode::Sleep
+            | Opcode::Receive
+            | Opcode::SelfPid
+            | Opcode::FreshRequestId => {
                 write!(f, "{} r{}", self.op, self.a)
             }
             Opcode::Spawn => write!(
@@ -69,6 +74,16 @@ impl fmt::Display for Instruction {
                 write!(f, "{} r{}, r{}", self.op, self.a, self.b)
             }
             Opcode::ReceiveMatchImm => write!(f, "{} r{}, tag={}", self.op, self.a, self.imm),
+            Opcode::ReceiveMatchCorr => write!(
+                f,
+                "{} r{}, tag=r{}, id=r{}",
+                self.op, self.a, self.b, self.c
+            ),
+            Opcode::ReceiveMatchCorrImm => write!(
+                f,
+                "{} r{}, tag={}, id=r{}",
+                self.op, self.a, self.imm, self.b
+            ),
             Opcode::Ask => write!(
                 f,
                 "{} r{}, r{}, r{}",
@@ -82,8 +97,11 @@ impl fmt::Display for Instruction {
             Opcode::Monitor | Opcode::Link => {
                 write!(f, "{} r{}, r{}", self.op, self.a, self.b)
             }
-            Opcode::Demonitor | Opcode::Unlink => write!(f, "{} r{}", self.op, self.a),
-            | Opcode::Delegate => write!(
+            Opcode::Demonitor | Opcode::Unlink | Opcode::RegisterName => {
+                write!(f, "{} r{}", self.op, self.a)
+            }
+            Opcode::Whereis => write!(f, "{} r{}, r{}", self.op, self.a, self.b),
+            Opcode::Delegate => write!(
                 f,
                 "{} r{}, r{}, rights={:#x}, native=r{}",
                 self.op, self.a, self.b, self.imm as u32, self.c

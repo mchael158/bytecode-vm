@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bytecode::{CapId, Value};
@@ -36,11 +37,13 @@ pub enum VmResult {
     SelfPid { dest_reg: u8 },
     /// `Send` — Atomic Hop to a **capability** target (requires SEND).
     Send { target_cap: CapId, message: Value },
-    /// `Receive` / `ReceiveTimeout` / `ReceiveMatch` / `ReceiveMatchImm`.
+    /// `Receive` / `ReceiveTimeout` / `ReceiveMatch` / `ReceiveMatchImm` /
+    /// `ReceiveMatchCorr` / `ReceiveMatchCorrImm`.
     Receive {
         dest_reg: u8,
         timeout: Option<Duration>,
         match_tag: Option<u16>,
+        match_request_id: Option<u64>,
     },
     /// `Ask` / `AskTimeout` — RPC hop to a **capability** target (requires ASK).
     Ask {
@@ -57,6 +60,10 @@ pub enum VmResult {
     Link { dest_reg: u8, target_cap: CapId },
     /// `Unlink ra` — drop link whose id is `r[a]` (Int).
     Unlink { link_reg: u8 },
+    /// `RegisterName ra` — publish `r[a]` (`Str`) as this flow's name.
+    RegisterName { name: Arc<str> },
+    /// `Whereis ra, rb` — resolve `r[b]` (`Str`) to a SEND Cap or Unit.
+    Whereis { dest_reg: u8, name: Arc<str> },
     /// `Delegate ra, rb` — attenuate Cap `r[b]` into `r[a]`.
     Delegate {
         dest_reg: u8,

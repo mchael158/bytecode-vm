@@ -399,6 +399,33 @@ impl<'a> Fn<'a> {
         msg
     }
 
+    /// Next per-flow correlation id (`Int`, starts at 1).
+    pub fn fresh_request_id(&mut self) -> Reg {
+        let dst = self.local();
+        self.b.emit_fresh_request_id(dst.0);
+        dst
+    }
+
+    /// Wait for `tag == tag_reg` and `request_id == id_reg` (FIFO skip).
+    pub fn receive_match_corr(&mut self, tag: Reg, request_id: Reg) -> Reg {
+        let msg = self.local();
+        self.b.emit_receive_match_corr(msg.0, tag.0, request_id.0);
+        msg
+    }
+
+    /// Wait for immediate `tag` and `request_id == id_reg` (FIFO skip).
+    pub fn receive_match_corr_imm(&mut self, tag: u16, request_id: Reg) -> Reg {
+        let msg = self.local();
+        self.b.emit_receive_match_corr_imm(msg.0, tag, request_id.0);
+        msg
+    }
+
+    /// Build a hop with a freshly minted `request_id`.
+    pub fn hop_fresh(&mut self, tag: i32, payload: Reg) -> Reg {
+        let req_id = self.fresh_request_id();
+        self.hop(req_id, tag, payload)
+    }
+
     /// RPC hop: deliver `msg` to `target_cap`, wait for correlated reply.
     ///
     /// If the target exits first, dest is a [`crate::TAG_SYS_EXIT`] hop
@@ -440,6 +467,26 @@ impl<'a> Fn<'a> {
         self.b.emit_unlink(link.0);
     }
 
+    /// Load a UTF-8 constant into a new local.
+    pub fn load_str(&mut self, s: impl AsRef<str>) -> Reg {
+        let konst = self.b.const_(Value::str(s));
+        let reg = self.local();
+        self.b.emit_load_const(reg.0, konst);
+        reg
+    }
+
+    /// Publish `name` (`Str`) as this flow. Requires `SEND` on self-authority.
+    pub fn register_name(&mut self, name: Reg) {
+        self.b.emit_register_name(name.0);
+    }
+
+    /// Look up `name` (`Str`): SEND Cap for the caller, or `Unit`.
+    pub fn whereis(&mut self, name: Reg) -> Reg {
+        let dst = self.local();
+        self.b.emit_whereis(dst.0, name.0);
+        dst
+    }
+
     pub fn trap(&mut self, code: i32) {
         self.b.emit_trap(code);
     }
@@ -478,8 +525,9 @@ impl<'a> Fn<'a> {
 
     /// Build an outgoing Atomic Hop (`request_id`, `tag`, `payload`).
     ///
-    /// The scheduler overwrites `sender` and mints `reply_cap` on [`Self::send`]
-    /// / [`Self::ask`] — do not forge a sender (see [`crate::docs::security`]).
+    /// The scheduler overwrites `sender` and attaches `reply_cap` on [`Self::send`]
+    /// / [`Self::ask`]. Prefer [`Self::hop_fresh`] so `request_id` is unique.
+    /// Do not forge a sender (see [`crate::docs::security`]).
     pub fn hop(&mut self, request_id: Reg, tag: i32, payload: Reg) -> Reg {
         self.make_msg(
             crate::natives::std_native::MAKE_MSG,

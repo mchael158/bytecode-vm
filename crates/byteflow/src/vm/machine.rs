@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bytecode::{Chunk, Instruction, Opcode, Value};
+use crate::scheduler::FlowQuota;
 
 use super::fault::Fault;
 use super::frame::Frame;
@@ -30,6 +31,11 @@ pub struct Vm {
     /// Lifetime instruction counter, exposed for `FlowMetrics` (design
     /// notes §26).
     instructions_executed: u64,
+    /// Next `Message.request_id` for [`Opcode::FreshRequestId`] and for
+    /// hops that still carry `0` (“unset”) at the Send/Ask boundary.
+    next_request_id: u64,
+    /// Interim heap charge for `Str`/`Bytes` written into registers.
+    quota: Option<Arc<FlowQuota>>,
 }
 
 impl Vm {
@@ -74,7 +80,33 @@ impl Vm {
             native_gate,
             frames: vec![frame],
             instructions_executed: 0,
+            next_request_id: 1,
+            quota: None,
         })
+    }
+
+    /// Attach the flow's quota so register stores of `Str`/`Bytes` charge heap.
+    ///
+    /// Interim: charge on write, never release until the flow exits. Same
+    /// `Arc` rewritten into the same slot is not charged twice.
+    pub fn set_quota(&mut self, quota: Arc<FlowQuota>) -> Result<(), Fault> {
+        for frame in &self.frames {
+            for slot in &frame.registers {
+                charge_heap_value(&quota, slot)?;
+            }
+        }
+        self.quota = Some(quota);
+        Ok(())
+    }
+
+    /// Mint a per-flow correlation id. Never returns `0`.
+    pub fn fresh_request_id(&mut self) -> u64 {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        if id == 0 {
+            return self.fresh_request_id();
+        }
+        id
     }
 
     pub fn instructions_executed(&self) -> u64 {
@@ -186,6 +218,7 @@ impl Vm {
 
     #[inline]
     fn set_reg(&mut self, reg: u8, value: Value) -> Result<(), Fault> {
+        self.charge_register_store(reg, &value)?;
         let frame = self.current()?;
         let len = frame.registers.len() as u8;
         match frame.registers.get_mut(reg as usize) {
@@ -194,6 +227,26 @@ impl Vm {
                 Ok(())
             }
             None => Err(Fault::RegisterOutOfRange { reg, frame_size: len }),
+        }
+    }
+
+    #[inline]
+    fn peek_reg(&self, reg: u8) -> Option<&Value> {
+        self.frames.last()?.registers.get(reg as usize)
+    }
+
+    /// Interim heap charge: `Str` / `Bytes` only. Hop payloads are charged
+    /// at `Send` / `Ask`. Overwrites of the same `Arc` in the same slot
+    /// are skipped; other copies super-count until the flow exits.
+    fn charge_register_store(&self, reg: u8, value: &Value) -> Result<(), Fault> {
+        let Some(quota) = self.quota.as_ref() else {
+            return Ok(());
+        };
+        match (value, self.peek_reg(reg)) {
+            (Value::Str(s), Some(Value::Str(old))) if Arc::ptr_eq(s, old) => Ok(()),
+            (Value::Bytes(b), Some(Value::Bytes(old))) if Arc::ptr_eq(b, old) => Ok(()),
+            (Value::Str(_) | Value::Bytes(_), _) => charge_heap_value(quota, value),
+            _ => Ok(()),
         }
     }
 
@@ -503,6 +556,7 @@ impl Vm {
                         dest_reg: instr.a,
                         timeout: None,
                         match_tag: None,
+                        match_request_id: None,
                     };
                 }
                 Opcode::ReceiveTimeout => {
@@ -515,6 +569,7 @@ impl Vm {
                         dest_reg: instr.a,
                         timeout: Some(Duration::from_millis(ms)),
                         match_tag: None,
+                        match_request_id: None,
                     };
                 }
                 Opcode::ReceiveMatch => {
@@ -527,6 +582,7 @@ impl Vm {
                         dest_reg: instr.a,
                         timeout: None,
                         match_tag: Some(tag),
+                        match_request_id: None,
                     };
                 }
                 Opcode::ReceiveMatchImm => {
@@ -543,6 +599,51 @@ impl Vm {
                         dest_reg: instr.a,
                         timeout: None,
                         match_tag: Some(tag),
+                        match_request_id: None,
+                    };
+                }
+                Opcode::FreshRequestId => {
+                    let id = self.fresh_request_id();
+                    trap!(self.set_reg(instr.a, Value::Int(id as i64)));
+                }
+                Opcode::ReceiveMatchCorr => {
+                    let tag_v = trap!(self.get_reg(instr.b));
+                    let tag = match tag_from_value(&tag_v) {
+                        Ok(t) => t,
+                        Err(f) => return VmResult::Trap(f),
+                    };
+                    let id_v = trap!(self.get_reg(instr.c));
+                    let rid = match request_id_from_value(&id_v) {
+                        Ok(id) => id,
+                        Err(f) => return VmResult::Trap(f),
+                    };
+                    return VmResult::Receive {
+                        dest_reg: instr.a,
+                        timeout: None,
+                        match_tag: Some(tag),
+                        match_request_id: Some(rid),
+                    };
+                }
+                Opcode::ReceiveMatchCorrImm => {
+                    let tag = match u16::try_from(instr.imm) {
+                        Ok(t) if instr.imm >= 0 => t,
+                        _ => {
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "tag u16",
+                                got: "imm-out-of-range",
+                            })
+                        }
+                    };
+                    let id_v = trap!(self.get_reg(instr.b));
+                    let rid = match request_id_from_value(&id_v) {
+                        Ok(id) => id,
+                        Err(f) => return VmResult::Trap(f),
+                    };
+                    return VmResult::Receive {
+                        dest_reg: instr.a,
+                        timeout: None,
+                        match_tag: Some(tag),
+                        match_request_id: Some(rid),
                     };
                 }
                 Opcode::Ask => {
@@ -651,6 +752,37 @@ impl Vm {
                         link_reg: instr.a,
                     };
                 }
+                Opcode::RegisterName => {
+                    let name = trap!(self.get_reg(instr.a));
+                    match name {
+                        Value::Str(s) => {
+                            return VmResult::RegisterName { name: s };
+                        }
+                        other => {
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "str",
+                                got: other.type_name(),
+                            })
+                        }
+                    }
+                }
+                Opcode::Whereis => {
+                    let name = trap!(self.get_reg(instr.b));
+                    match name {
+                        Value::Str(s) => {
+                            return VmResult::Whereis {
+                                dest_reg: instr.a,
+                                name: s,
+                            };
+                        }
+                        other => {
+                            return VmResult::Trap(Fault::TypeMismatch {
+                                expected: "str",
+                                got: other.type_name(),
+                            })
+                        }
+                    }
+                }
                 Opcode::Delegate => {
                     let src = trap!(self.get_reg(instr.b));
                     let src_cap = match src.as_cap() {
@@ -743,7 +875,22 @@ fn reg_at(base: u8, offset: u16) -> Result<u8, Fault> {
     }
 }
 
-#[inline]
+/// Charge `Str` / `Bytes` length against the flow heap quota.
+/// Empty buffers are free. Fail-closed: the store does not happen on error.
+fn charge_heap_value(quota: &FlowQuota, value: &Value) -> Result<(), Fault> {
+    let bytes = match value {
+        Value::Str(s) => s.len(),
+        Value::Bytes(b) => b.len(),
+        _ => return Ok(()),
+    };
+    if bytes == 0 {
+        return Ok(());
+    }
+    quota
+        .alloc(bytes)
+        .map_err(|e| Fault::QuotaExceeded(e.to_string()))
+}
+
 fn as_f64(v: &Value) -> Result<f64, Fault> {
     match v {
         Value::Int(i) => Ok(*i as f64),
@@ -760,6 +907,22 @@ fn tag_from_value(v: &Value) -> Result<u16, Fault> {
         Some(_) => Err(Fault::TypeMismatch {
             expected: "tag u16",
             got: "int-out-of-range",
+        }),
+        None => Err(Fault::TypeMismatch {
+            expected: "int",
+            got: v.type_name(),
+        }),
+    }
+}
+
+/// Decode a `request_id` from a register (`Int` in `0..=i64::MAX`).
+#[inline]
+fn request_id_from_value(v: &Value) -> Result<u64, Fault> {
+    match v.as_int() {
+        Some(i) if i >= 0 => Ok(i as u64),
+        Some(_) => Err(Fault::TypeMismatch {
+            expected: "request_id u64",
+            got: "negative-int",
         }),
         None => Err(Fault::TypeMismatch {
             expected: "int",

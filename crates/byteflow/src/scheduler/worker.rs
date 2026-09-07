@@ -4,7 +4,8 @@
 //! # Authenticated Atomic Hop + capabilities
 //!
 //! Before mailbox delivery, outgoing hops are stamped (`Message.sender`) and
-//! granted a **SEND**-only `reply_cap`. `Send` / `Ask` resolve
+//! granted a **SEND**-only `reply_cap` (stable per recipient→sender pair).
+//! `Send` / `Ask` resolve
 //! [`Value::Cap`] through [`CapTable`](super::capability::CapTable); raw
 //! [`Value::Pid`] is not an address.
 
@@ -26,6 +27,7 @@ use super::mailbox::{Delivery, ParkSender, WaitFilter};
 use super::metrics::RuntimeMetrics;
 use super::monitor::{FlowExitReason, MonitorRef};
 use super::process::{Flow, FlowId, FlowOutcome, PendingSend};
+use super::registry::RegistryName;
 use super::runtime::{flow_id_from_u64, spawn_on, wake_workers, BytecodeSpawn, Shared};
 use super::sync_lock;
 
@@ -40,13 +42,100 @@ fn authenticate_outgoing_message(
     shared: &Shared,
     sender: FlowId,
     recipient: FlowId,
-    message: Message,
+    mut message: Message,
+    vm: &mut crate::vm::Vm,
 ) -> Result<Message, CapError> {
+    if message.request_id == 0 {
+        message.request_id = vm.fresh_request_id();
+    }
+    let payload = reissue_caps_in_value(shared, sender, recipient, (*message.payload).clone())?;
     let reply = shared
         .caps
-        .mint(recipient, sender, CapRights::SEND)
+        .mint_or_reuse(recipient, sender, CapRights::SEND)
         .map_err(CapError::from)?;
-    Ok(message.authenticate(sender.as_u64(), reply))
+    Ok(message.with_payload(payload).authenticate(sender.as_u64(), reply))
+}
+
+/// Host `Runtime::send`: same choke-point as bytecode hops.
+///
+/// The embedder is not a flow — it has no mailbox — so `reply_cap` stays
+/// [`CapId::NONE`]. `sender` is always [`FlowId::HOST`]. Caps in the payload
+/// are reissued with the host's trusted path (`reissue_for`), not `delegate`.
+pub(crate) fn authenticate_host_outgoing_message(
+    shared: &Shared,
+    recipient: FlowId,
+    mut message: Message,
+) -> Result<Message, CapError> {
+    if message.request_id == 0 {
+        let rid = shared
+            .host_next_request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        message.request_id = if rid == 0 { 1 } else { rid };
+    }
+    let payload = reissue_caps_from_host(shared, recipient, (*message.payload).clone())?;
+    Ok(message
+        .with_payload(payload)
+        .authenticate(FlowId::HOST.as_u64(), CapId::NONE))
+}
+
+/// Host is trusted: re-issue live Caps to `recipient` without a holder check.
+fn reissue_caps_from_host(
+    shared: &Shared,
+    recipient: FlowId,
+    value: Value,
+) -> Result<Value, CapError> {
+    match value {
+        Value::Cap(id) if id.is_none() => Ok(Value::Cap(id)),
+        Value::Cap(id) => {
+            let new_id = shared.caps.reissue_for(id, recipient)?;
+            Ok(Value::Cap(new_id))
+        }
+        Value::Message(m) => {
+            let inner = (*m.payload).clone();
+            let new_inner = reissue_caps_from_host(shared, recipient, inner)?;
+            Ok(Value::Message(m.with_payload(new_inner)))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Re-issue every `Value::Cap` the sender holds so `recipient` becomes holder.
+/// Nested hops are walked. `CapId::NONE` is left alone. Additive — original
+/// tokens stay valid (same reason reply_cap is not one-shot).
+fn reissue_caps_in_value(
+    shared: &Shared,
+    sender: FlowId,
+    recipient: FlowId,
+    value: Value,
+) -> Result<Value, CapError> {
+    match value {
+        Value::Cap(id) if id.is_none() => Ok(Value::Cap(id)),
+        Value::Cap(id) => {
+            let new_id = shared.caps.delegate(id, sender, recipient)?;
+            Ok(Value::Cap(new_id))
+        }
+        Value::Message(m) => {
+            let inner = (*m.payload).clone();
+            let new_inner = reissue_caps_in_value(shared, sender, recipient, inner)?;
+            Ok(Value::Message(m.with_payload(new_inner)))
+        }
+        other => Ok(other),
+    }
+}
+
+fn receive_filter(match_tag: Option<u16>, match_request_id: Option<u64>) -> WaitFilter {
+    match (match_tag, match_request_id) {
+        (Some(tag), Some(rid)) => WaitFilter::TaggedCorrelation {
+            tag,
+            expect_request_id: rid,
+        },
+        (Some(tag), None) => WaitFilter::Tag(tag),
+        (None, Some(rid)) => WaitFilter::Correlation {
+            expect_request_id: rid,
+            expect_sender: None,
+        },
+        (None, None) => WaitFilter::Any,
+    }
 }
 
 /// Resolve `CapId` for `holder`. Returns target [`FlowId`].
@@ -330,7 +419,13 @@ fn drive_process(
                     finish_failed(shared, *flow, e.to_string());
                     return;
                 }
-                let stamped = match authenticate_outgoing_message(shared, flow.id, target, msg) {
+                let stamped = match authenticate_outgoing_message(
+                    shared,
+                    flow.id,
+                    target,
+                    msg,
+                    &mut flow.vm,
+                ) {
                     Ok(m) => Value::Message(m),
                     Err(e) => {
                         flow.quota.free(hop_cost);
@@ -369,16 +464,14 @@ fn drive_process(
                 dest_reg,
                 timeout,
                 match_tag,
+                match_request_id,
             } => {
                 if !flow.authority.rights.contains(CapRights::RECV) {
                     finish_failed(shared, *flow, "receive denied: flow lacks RECV right".into());
                     return;
                 }
                 flow.last_receive_dest = Some(dest_reg);
-                let filter = match match_tag {
-                    None => WaitFilter::Any,
-                    Some(tag) => WaitFilter::Tag(tag),
-                };
+                let filter = receive_filter(match_tag, match_request_id);
                 match flow.mailbox.try_pop_filter(filter) {
                     Ok(Some(msg)) => {
                         flow.metrics
@@ -436,8 +529,13 @@ fn drive_process(
                     finish_failed(shared, *flow, e.to_string());
                     return;
                 }
-                let stamped_msg = match authenticate_outgoing_message(shared, flow.id, target, req_msg)
-                {
+                let stamped_msg = match authenticate_outgoing_message(
+                    shared,
+                    flow.id,
+                    target,
+                    req_msg,
+                    &mut flow.vm,
+                ) {
                     Ok(m) => m,
                     Err(e) => {
                         flow.quota.free(hop_cost);
@@ -615,6 +713,80 @@ fn drive_process(
                     }
                 }
             }
+            VmResult::RegisterName { name } => {
+                if !flow.authority.rights.contains(CapRights::SEND) {
+                    finish_failed(
+                        shared,
+                        *flow,
+                        "register_name denied: flow lacks SEND right".into(),
+                    );
+                    return;
+                }
+                if name.is_empty() {
+                    finish_failed(shared, *flow, "register_name: name must be non-empty".into());
+                    return;
+                }
+                let cap = match shared
+                    .caps
+                    .mint(flow.id, flow.id, CapRights::ADDRESSING)
+                {
+                    Ok(id) => id,
+                    Err(e) => {
+                        finish_failed(shared, *flow, e.to_string());
+                        return;
+                    }
+                };
+                match shared
+                    .registry
+                    .register(RegistryName::from(name.as_ref()), cap, flow.id)
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        finish_failed(shared, *flow, e.to_string());
+                        return;
+                    }
+                    Err(e) => {
+                        finish_failed(shared, *flow, e.to_string());
+                        return;
+                    }
+                }
+            }
+            VmResult::Whereis { dest_reg, name } => {
+                let target = match shared.registry.target(name.as_ref()) {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        let _ = flow.vm.resume_with(dest_reg, Value::Unit);
+                        continue;
+                    }
+                    Err(e) => {
+                        finish_failed(shared, *flow, e.to_string());
+                        return;
+                    }
+                };
+                match shared.directory.lookup(target) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        let _ = flow.vm.resume_with(dest_reg, Value::Unit);
+                        continue;
+                    }
+                    Err(e) => {
+                        finish_failed(shared, *flow, e.to_string());
+                        return;
+                    }
+                }
+                match shared
+                    .caps
+                    .mint_or_reuse(flow.id, target, CapRights::SEND)
+                {
+                    Ok(cap) => {
+                        let _ = flow.vm.resume_with(dest_reg, Value::Cap(cap));
+                    }
+                    Err(e) => {
+                        finish_failed(shared, *flow, e.to_string());
+                        return;
+                    }
+                }
+            }
             VmResult::Delegate {
                 dest_reg,
                 src_cap,
@@ -765,14 +937,26 @@ fn park_ask(
     target: FlowId,
 ) {
     let asker = flow.id;
-    if let Err(e) = shared.ask_waits.insert(asker, target) {
-        report_fault(e);
-        finish_failed(
-            shared,
-            *flow,
-            "ask-wait index".into(),
-        );
-        return;
+    let rid = match filter {
+        WaitFilter::Correlation {
+            expect_request_id, ..
+        } => expect_request_id,
+        WaitFilter::TaggedCorrelation {
+            expect_request_id, ..
+        } => expect_request_id,
+        _ => 0,
+    };
+    match shared.ask_waits.insert(asker, target, rid) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            finish_failed(shared, *flow, CapError::DuplicateRequestId.to_string());
+            return;
+        }
+        Err(e) => {
+            report_fault(e);
+            finish_failed(shared, *flow, "ask-wait index".into());
+            return;
+        }
     }
     let mailbox = flow.mailbox.clone();
     match mailbox.park_filter(flow, filter) {

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -121,6 +121,9 @@ pub struct Shared {
     pub(crate) kill_signals: super::finalize::KillSignals,
     pub(crate) waiting_send_at: super::finalize::WaitingSendIndex,
     pub(crate) ask_waits: super::finalize::AskWaitIndex,
+    /// Correlation ids for host `Runtime::send` when `request_id == 0`.
+    /// Starts at 1; `0` stays the unset sentinel.
+    pub(crate) host_next_request_id: AtomicU64,
     /// Shared trace JIT state (`feature = "jit"`).
     #[cfg(feature = "jit")]
     pub(crate) jit: Option<std::sync::Arc<crate::jit::JitRuntime>>,
@@ -233,6 +236,7 @@ impl Runtime {
             kill_signals: super::finalize::KillSignals::new(),
             waiting_send_at: super::finalize::WaitingSendIndex::new(),
             ask_waits: super::finalize::AskWaitIndex::new(),
+            host_next_request_id: AtomicU64::new(1),
             #[cfg(feature = "jit")]
             jit,
         });
@@ -332,15 +336,17 @@ impl Runtime {
     ///
     /// This path takes a [`FlowId`] directly — **no Cap required**. The host
     /// is trusted; bytecode must use `Value::Cap` via `Opcode::Send` /
-    /// `Ask`. Host-injected messages are not re-stamped (`sender` /
-    /// `reply_cap` stay as built). Bare scalars are rejected
-    /// ([`SendError::NotAHop`]).
+    /// `Ask`. The hop still goes through the same authentication choke-point
+    /// as bytecode: `sender` is stamped [`FlowId::HOST`] (`0`), `request_id`
+    /// is minted when unset, and payload Caps are reissued to the recipient.
+    /// The host has no mailbox, so `reply_cap` is [`crate::bytecode::CapId::NONE`].
+    /// Bare scalars are rejected ([`SendError::NotAHop`]).
     pub fn send(&self, target: FlowId, message: Value) -> Result<(), SendError> {
-        if message.as_message().is_none() {
+        let Some(msg) = message.as_message().cloned() else {
             return Err(SendError::NotAHop {
                 got: message.type_name(),
             });
-        }
+        };
         let mailbox = match self.shared.directory.lookup(target) {
             Ok(Some(m)) => m,
             Ok(None) => return Err(SendError::NoSuchFlow(target)),
@@ -349,14 +355,18 @@ impl Runtime {
                 return Err(SendError::NoSuchFlow(target));
             }
         };
-        match mailbox.push(message.clone()) {
+        let stamped = match worker::authenticate_host_outgoing_message(&self.shared, target, msg) {
+            Ok(m) => Value::Message(m),
+            Err(_) => return Err(SendError::Capability),
+        };
+        match mailbox.push(stamped.clone()) {
             Ok(Ok(Delivery::Queued | Delivery::QueuedDropOldest | Delivery::DroppedNewest)) => {
                 Ok(())
             }
             Ok(Ok(Delivery::Handoff(mut flow))) => {
                 let _ = self.shared.ask_waits.remove_asker(flow.id);
                 if let Some(dest) = flow.last_receive_dest {
-                    let _ = flow.vm.resume_with(dest, message);
+                    let _ = flow.vm.resume_with(dest, stamped);
                 }
                 self.shared.injector.push(flow);
                 wake_workers(&self.shared);
@@ -576,6 +586,42 @@ impl Runtime {
         Ok(())
     }
 
+    /// Raise `target`'s heap limit. Requires a live ADMIN scheduler cap.
+    pub fn admin_top_up_mem(
+        &self,
+        holder: FlowId,
+        cap: crate::bytecode::CapId,
+        target: FlowId,
+        extra: usize,
+    ) -> Result<(), super::error::LifecycleError> {
+        self.require_admin(holder, cap)?;
+        let quota = match self.shared.quotas.get(target) {
+            Ok(Some(q)) => q,
+            Ok(None) => return Err(super::error::LifecycleError::NoSuchFlow(target)),
+            Err(e) => return Err(self.unavailable(e)),
+        };
+        quota.top_up_mem(extra);
+        Ok(())
+    }
+
+    /// Credit `target`'s send bucket. Requires a live ADMIN scheduler cap.
+    pub fn admin_top_up_send(
+        &self,
+        holder: FlowId,
+        cap: crate::bytecode::CapId,
+        target: FlowId,
+        extra: i64,
+    ) -> Result<(), super::error::LifecycleError> {
+        self.require_admin(holder, cap)?;
+        let quota = match self.shared.quotas.get(target) {
+            Ok(Some(q)) => q,
+            Ok(None) => return Err(super::error::LifecycleError::NoSuchFlow(target)),
+            Err(e) => return Err(self.unavailable(e)),
+        };
+        quota.top_up_send(extra);
+        Ok(())
+    }
+
     fn require_admin(
         &self,
         holder: FlowId,
@@ -674,6 +720,8 @@ pub enum SendError {
         flow: FlowId,
         reason: MailboxFullReason,
     },
+    /// Host hop authentication failed (payload Cap reissue).
+    Capability,
 }
 
 impl std::fmt::Display for SendError {
@@ -685,6 +733,9 @@ impl std::fmt::Display for SendError {
             }
             SendError::MailboxFull { flow, reason } => {
                 write!(f, "mailbox full for {flow} ({reason})")
+            }
+            SendError::Capability => {
+                write!(f, "host send could not reissue a capability in the hop")
             }
         }
     }
@@ -759,13 +810,14 @@ pub(crate) fn spawn_on(
         shared.caps.native_cell(),
         natives.len(),
     );
-    let vm = Vm::with_native_gate(chunk.clone(), natives.clone(), gate, function, args.as_slice())?;
+    let quota = Arc::new(super::quota::FlowQuota::from_config(shared.quota));
+    let mut vm = Vm::with_native_gate(chunk.clone(), natives.clone(), gate, function, args.as_slice())?;
+    vm.set_quota(Arc::clone(&quota))?;
     let mailbox = Arc::new(Mailbox::with_config(shared.mailbox));
     if let Err(e) = shared.directory.register(id, mailbox.clone()) {
         super::error::report_fault(e);
         return Err(SpawnError::Unavailable);
     }
-    let quota = Arc::new(super::quota::FlowQuota::from_config(shared.quota));
     if let Err(e) = shared.quotas.insert(id, Arc::clone(&quota)) {
         super::error::report_fault(e);
         return Err(SpawnError::Unavailable);

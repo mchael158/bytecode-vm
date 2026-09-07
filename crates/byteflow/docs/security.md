@@ -160,9 +160,12 @@ receiver MUST observe `sender = actual_sender_flow` and never
 `sender = victim_flow`. Current `make_msg` is 3-arg and never accepts a
 sender at all.
 
-Host-side [`Runtime::send`](../src/scheduler/runtime.rs) remains a **trusted**
-injection path: the host may choose `sender` (including `0` for non-flow
-origins). Only bytecode-driven `Send` / `Ask` are re-stamped.
+Host-side [`Runtime::send`](../src/scheduler/runtime.rs) is a **trusted**
+injection path (takes a [`FlowId`](crate::FlowId), no Cap required) but
+uses the same authentication choke-point as bytecode hops: `sender` is
+stamped [`FlowId::HOST`](crate::FlowId) (`0`), an unset `request_id` is
+minted, and payload Caps are reissued to the recipient (`reissue_for`).
+The host has no mailbox, so `reply_cap` is [`CapId::NONE`](crate::CapId).
 
 ---
 
@@ -250,13 +253,26 @@ be the registered **holder** with sufficient rights.
 [`Value::Pid`](crate::Value::Pid) remains for **identity** inside authenticated messages
 (`Message.sender` / `msg_sender`). It is **not** an ambient address.
 
-Outgoing hops mint `Message.reply_cap` with **SEND**-only rights so a
-receiver can answer without knowing or forging a Pid address.
+Outgoing hops attach `Message.reply_cap` with **SEND**-only rights so a
+receiver can answer without knowing or forging a Pid address. The token is
+stable per `(recipient, sender)` pair (`mint_or_reuse`); a long ping-pong
+must not grow the capability table. [`FlowId`](crate::FlowId) is never
+reused, so the reverse index cannot alias a later incarnation.
 
 `SelfPid` and bytecode `Spawn` write a Cap (`SEND|ASK`) into the destination
 register — not a raw Pid.
 
-Host `Runtime::send(FlowId, …)` remains a trusted host path (no Cap required).
+A `Value::Cap` in a hop payload is reissued to the recipient only if the
+sender is the current holder (`CapTable::delegate`). Knowing a token is
+not enough to pass it on.
+
+Host `Runtime::send(FlowId, …)` remains a trusted host path (no Cap required)
+but is stamped like any other hop (`sender = 0`, `reply_cap = NONE`).
+
+Bytecode `whereis` returns a freshly minted/reused **SEND** Cap for the
+caller — never a raw FlowId. `register_name` only publishes the calling
+flow and requires `SEND` on self-authority. Host `whereis` still returns
+the Cap stored at registration (not reissued).
 
 Cap tables are **per-runtime**: a token minted in Runtime A never resolves in
 Runtime B.
@@ -372,8 +388,11 @@ The following remain known limitations:
 
 Per-flow [`QuotaConfig`](crate::QuotaConfig) (CPU, heap, spawn/send rate)
 and [`NativeMask`](crate::NativeMask) allowlists are enforced as of 0.9.2.
-Defaults are generous so existing samples keep passing; sandboxed modules
-must tighten `RuntimeConfig::quota` and spawn rights. There is still no
+[`QuotaConfig::permissive`](crate::QuotaConfig::permissive) is the default;
+[`QuotaConfig::sandbox`](crate::QuotaConfig::sandbox) is a starting point
+for untrusted modules (tune under load). `Str` / `Bytes` written into
+registers charge heap (interim: no release until the flow exits). Hop
+payloads are still charged at `Send` / `Ask`. There is still no
 runtime-wide byte cap across all flows.
 
 Capability security prevents unauthorized access but does not automatically

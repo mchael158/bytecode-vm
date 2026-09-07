@@ -70,6 +70,8 @@ pub(crate) enum WaitFilter {
         expect_request_id: u64,
         expect_sender: Option<u64>,
     },
+    /// Fire-and-forget correlated receive: tag + request_id, any sender.
+    TaggedCorrelation { tag: u16, expect_request_id: u64 },
 }
 
 impl WaitFilter {
@@ -93,6 +95,13 @@ impl WaitFilter {
                     };
                     id_ok && sender_ok
                 }
+                None => false,
+            },
+            Self::TaggedCorrelation {
+                tag,
+                expect_request_id,
+            } => match value.as_message() {
+                Some(m) => m.tag == tag && m.request_id == expect_request_id,
                 None => false,
             },
         }
@@ -677,6 +686,28 @@ mod tests {
         assert_eq!(hop_payload_int(hop_msg(&got)?), 42);
         let left = mb.try_pop()?.ok_or("leftover")?;
         assert_eq!(hop_msg(&left)?.request_id, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn tagged_correlation_skips_wrong_id_and_tag() -> TestResult {
+        let mb = Mailbox::new();
+        mb.push(hop(10, 1, 1, 7))??;
+        mb.push(hop(10, 2, 2, 9))??;
+        mb.push(hop(10, 1, 2, 42))??;
+        assert!(mb
+            .try_pop_filter(WaitFilter::TaggedCorrelation {
+                tag: 99,
+                expect_request_id: 1,
+            })?
+            .is_none());
+        let got = mb
+            .try_pop_filter(WaitFilter::TaggedCorrelation {
+                tag: 2,
+                expect_request_id: 1,
+            })?
+            .ok_or("tag=2 id=1")?;
+        assert_eq!(hop_payload_int(hop_msg(&got)?), 42);
         Ok(())
     }
 

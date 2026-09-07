@@ -77,6 +77,10 @@ impl WaitingSendIndex {
 ///
 /// When the target exits, [`take_waiters_of`] lets finalize resume those
 /// waiters with [`crate::TAG_SYS_EXIT`] instead of leaving them parked forever.
+/// The asker already has an in-flight `Ask` (`request_id` still pending).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DuplicateAsk;
+
 pub struct AskWaitIndex {
     inner: Mutex<AskWaitInner>,
 }
@@ -84,6 +88,7 @@ pub struct AskWaitIndex {
 struct AskWaitInner {
     by_asker: HashMap<FlowId, FlowId>,
     by_target: HashMap<FlowId, HashSet<FlowId>>,
+    request_ids: HashMap<FlowId, u64>,
 }
 
 impl AskWaitIndex {
@@ -92,26 +97,30 @@ impl AskWaitIndex {
             inner: Mutex::new(AskWaitInner {
                 by_asker: HashMap::new(),
                 by_target: HashMap::new(),
+                request_ids: HashMap::new(),
             }),
         }
     }
 
-    pub fn insert(&self, asker: FlowId, target: FlowId) -> Result<(), RuntimeError> {
+    pub fn insert(
+        &self,
+        asker: FlowId,
+        target: FlowId,
+        request_id: u64,
+    ) -> Result<Result<(), DuplicateAsk>, RuntimeError> {
         let mut g = sync_lock::lock(&self.inner, "AskWaitIndex::insert")?;
-        if let Some(old) = g.by_asker.insert(asker, target) {
-            if let Some(set) = g.by_target.get_mut(&old) {
-                set.remove(&asker);
-                if set.is_empty() {
-                    g.by_target.remove(&old);
-                }
-            }
+        if g.request_ids.contains_key(&asker) {
+            return Ok(Err(DuplicateAsk));
         }
+        g.request_ids.insert(asker, request_id);
+        g.by_asker.insert(asker, target);
         g.by_target.entry(target).or_default().insert(asker);
-        Ok(())
+        Ok(Ok(()))
     }
 
     pub fn remove_asker(&self, asker: FlowId) -> Result<Option<FlowId>, RuntimeError> {
         let mut g = sync_lock::lock(&self.inner, "AskWaitIndex::remove_asker")?;
+        g.request_ids.remove(&asker);
         let Some(target) = g.by_asker.remove(&asker) else {
             return Ok(None);
         };
@@ -131,6 +140,7 @@ impl AskWaitIndex {
         };
         for asker in &set {
             g.by_asker.remove(asker);
+            g.request_ids.remove(asker);
         }
         Ok(set.into_iter().collect())
     }
@@ -162,6 +172,12 @@ pub(crate) fn finalize_flow(
 fn finalize_one(shared: &Shared, mut pending: PendingExit, work: &mut Vec<PendingExit>) {
     let id = pending.flow.id;
     let reason = pending.reason;
+
+    // Host FlowId is never spawned; refuse so a bug cannot revoke host Caps.
+    if id.is_host() {
+        report_fault(RuntimeError::CannotFinalizeHostFlow);
+        return;
+    }
 
     log::info(format!(
         "finalize flow#{id} reason={reason} outcome={:?}",

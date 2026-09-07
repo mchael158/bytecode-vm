@@ -142,7 +142,7 @@ fn cmd_demo(name: &str) -> Result<(), ()> {
     let chunk = demo_chunk(name)?;
     // Atomic Hop demos (`ping-pong`) need make_msg / msg_*; `add` does not.
     let natives = match name {
-        "ping-pong" | "ping_pong" | "atomic" | "atomic-request-reply"
+        "ping-pong" | "ping_pong" | "atomic" | "atomic-actors" | "atomic-request-reply"
         | "selective" | "selective-receive" | "ask" | "ask-reply"
         | "ask-timeout" | "server-loop" | "server" | "monitor" | "monitor-down"
         | "ask-exit" | "ask-target-exits" => std_native_table(),
@@ -154,7 +154,8 @@ fn cmd_demo(name: &str) -> Result<(), ()> {
 fn demo_chunk(name: &str) -> Result<byteflow::Chunk, ()> {
     match name {
         "ping-pong" | "ping_pong" => Ok(ping_pong()),
-        "atomic" | "atomic-request-reply" => Ok(samples::atomic_request_reply()),
+        "atomic" | "atomic-actors" => Ok(samples::atomic_actors()),
+        "atomic-request-reply" => Ok(samples::atomic_request_reply()),
         "selective" | "selective-receive" => Ok(samples::selective_receive()),
         "ask" | "ask-reply" => Ok(samples::ask_reply()),
         "ask-timeout" => Ok(samples::ask_timeout_expires()),

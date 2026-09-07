@@ -151,7 +151,7 @@ cargo run --example atomic_actors
 ```
 
 See [`docs/atomic-hop.md`](docs/atomic-hop.md). Built-in samples:
-`byteflow::samples::{ping_pong, atomic_request_reply, add_forty_two, boom}`.
+`byteflow::samples::{ping_pong, atomic_actors, atomic_request_reply, add_forty_two, boom}`.
 
 Hop-heavy code uses helpers such as `make_msg`, `native1_from`, `send`, `receive`, and `ask` on [`Fn`](https://docs.rs/byteflow-actors/latest/byteflow/struct.Fn.html) — see [`samples/ping_pong.rs`](examples/ping_pong.rs) or `byteflow::samples::ping_pong()`.
 
@@ -214,7 +214,8 @@ byteflow run    <file.bf> [function]
 - **Atomic Hop:** only `Value::Message` may cross `Send`.
 - **FlowCap (ABI v5):** 128-bit CSPRNG `CapId`; holder + rights resolution; [`Cap::attenuate`](https://docs.rs/byteflow-actors/latest/byteflow/struct.Cap.html) is the only grant path (`Fn::delegate`, confined spawn).
 - **Natives (S7):** `CALL_NATIVE` is gated by `CapRights::NATIVE` + [`NativeMask`](https://docs.rs/byteflow-actors/latest/byteflow/struct.NativeMask.html) before the table is indexed.
-- **Quotas:** per-flow CPU / heap / spawn-send buckets via [`QuotaConfig`](https://docs.rs/byteflow-actors/latest/byteflow/struct.QuotaConfig.html) (`RuntimeConfig::quota`). Distinct from the scheduler quantum.
+- **Quotas:** per-flow CPU / heap / spawn-send buckets via [`QuotaConfig`](https://docs.rs/byteflow-actors/latest/byteflow/struct.QuotaConfig.html) (`RuntimeConfig::quota`). Default is [`permissive`](https://docs.rs/byteflow-actors/latest/byteflow/struct.QuotaConfig.html#method.permissive); [`sandbox`](https://docs.rs/byteflow-actors/latest/byteflow/struct.QuotaConfig.html#method.sandbox) is the isolation starting point. `Str`/`Bytes` in registers charge heap (interim, no release until exit). Distinct from the scheduler quantum.
+- **Registry:** bytecode `register_name` / `whereis` — lookup returns a SEND Cap, never a FlowId.
 - **`make_msg`:** 3-arg (`request_id`, `tag`, `payload`); `sender` is stamped only on `Send` / `Ask`.
 - **Security:** authenticated hop sender + FlowCap + Phase 3 gates — see [`docs/security.md`](docs/security.md).
 

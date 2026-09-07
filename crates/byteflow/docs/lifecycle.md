@@ -45,8 +45,11 @@ next quantum). `Normal` (clean `return` / `Exit`) only drops the link.
 ## Registry
 
 `register_name(name, CapId)` stores a **Cap**, never a FlowId.
-`whereis` returns that Cap. Finalize unregisters every name for the dead
-flow.
+Host `whereis` returns that stored Cap. Bytecode `Whereis` mints a
+**SEND** Cap for the *caller* (`mint_or_reuse`) so discovery does not
+bypass the holder model. Finalize unregisters every name for the dead
+flow. Bytecode `RegisterName` only publishes the calling flow and
+requires `SEND` on self-authority.
 
 ## Ask vs target death
 
@@ -87,6 +90,9 @@ is checked on every host and bytecode `spawn`. Over the cap →
 
 Each flow also carries a [`FlowQuota`](../src/scheduler/quota.rs) from
 [`RuntimeConfig::quota`](../src/scheduler/runtime.rs): remaining CPU
-(distinct from the scheduler *quantum*), heap charge, and spawn/send token
-buckets. Exhaustion fails closed (`QuotaError`). An ADMIN Cap can
-[`Runtime::admin_top_up_cpu`](../src/scheduler/runtime.rs).
+(distinct from the scheduler *quantum*), heap charge (`Str`/`Bytes` on
+register store, interim — no release until exit), and spawn/send token
+buckets. Default is [`QuotaConfig::permissive`](../src/scheduler/quota.rs);
+[`QuotaConfig::sandbox`](../src/scheduler/quota.rs) is the isolation
+starting point. Exhaustion fails closed (`QuotaError`). An ADMIN Cap can
+top up CPU, heap limit, or the send bucket.

@@ -152,8 +152,14 @@ fn confined_child_cannot_call_natives() -> Result<(), Box<dyn std::error::Error>
 
 #[test]
 fn admin_kill_requires_scheduler_cap() -> Result<(), Box<dyn std::error::Error>> {
-    let chunk = samples::add_forty_two();
-    let rt = Runtime::with_config(chunk, tiny_config())?;
+    let mut p = Program::new("admin-kill-victim");
+    p.function("main", 0, |f| {
+        let ms = f.load_i32(200);
+        f.sleep(ms);
+        let z = f.load_i32(42);
+        f.return_(z);
+    });
+    let rt = Runtime::with_config(p.build(), tiny_config())?;
     let victim = rt.spawn(0, &[])?;
     let holder = rt.spawn(0, &[])?;
     let ordinary = rt.mint_cap(holder.id())?;
@@ -185,6 +191,8 @@ fn admin_top_up_cpu_uses_shared_quota_table() -> Result<(), Box<dyn std::error::
     let h = rt.spawn(0, &[])?;
     let admin = rt.mint_admin_cap(h.id())?;
     rt.admin_top_up_cpu(h.id(), admin, h.id(), 1_000)?;
+    rt.admin_top_up_mem(h.id(), admin, h.id(), 4096)?;
+    rt.admin_top_up_send(h.id(), admin, h.id(), 32)?;
     let _ = h.join();
     rt.shutdown();
     Ok(())
